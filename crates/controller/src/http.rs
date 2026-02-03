@@ -10,7 +10,7 @@ use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
 use ulid::Ulid;
 
-use crate::config::ControllerConfig;
+use crate::config::{ControllerConfig, ControllerEngine};
 
 #[derive(Clone)]
 pub struct AppState {
@@ -78,16 +78,32 @@ async fn run(
     );
 
     let session = create_session(&state, &principal_id, &request_id, &budget).await?;
-    let loop_result = run_context_loop(
-        &state,
-        &principal_id,
-        &request_id,
-        &session.session_token,
-        &session.session.session_id,
-        &query,
-        &budget,
-    )
-    .await?;
+    let loop_result = match state.config.controller_engine {
+        ControllerEngine::Baseline => {
+            run_context_loop(
+                &state,
+                &principal_id,
+                &request_id,
+                &session.session_token,
+                &session.session.session_id,
+                &query,
+                &budget,
+            )
+            .await?
+        }
+        ControllerEngine::Rlm => {
+            run_context_loop_rlm(
+                &state,
+                &principal_id,
+                &request_id,
+                &session.session_token,
+                &session.session.session_id,
+                &query,
+                &budget,
+            )
+            .await?
+        }
+    };
 
     let response_text = response_text_for_terminal_mode(loop_result.terminal_mode);
     let claim_map = build_claim_map(&response_text, loop_result.terminal_mode);
@@ -707,6 +723,50 @@ async fn run_context_loop(
     })
 }
 
+#[cfg(feature = "rlm")]
+async fn run_context_loop_rlm(
+    state: &AppState,
+    principal_id: &str,
+    request_id: &str,
+    session_token: &str,
+    session_id: &str,
+    query: &str,
+    budget: &Budget,
+) -> Result<ContextLoopResult, (StatusCode, Json<ErrorResponse>)> {
+    tracing::warn!(
+        "rlm engine selected; integration is vendored but not wired yet (delegating to baseline loop)"
+    );
+    run_context_loop(
+        state,
+        principal_id,
+        request_id,
+        session_token,
+        session_id,
+        query,
+        budget,
+    )
+    .await
+}
+
+#[cfg(not(feature = "rlm"))]
+async fn run_context_loop_rlm(
+    _state: &AppState,
+    _principal_id: &str,
+    _request_id: &str,
+    _session_token: &str,
+    _session_id: &str,
+    _query: &str,
+    _budget: &Budget,
+) -> Result<ContextLoopResult, (StatusCode, Json<ErrorResponse>)> {
+    Err(json_error(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "ERR_RLM_FEATURE_DISABLED",
+        "rlm controller engine is not enabled in this build".to_string(),
+        TerminalMode::InsufficientEvidence,
+        false,
+    ))
+}
+
 fn extract_principal_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     let principal_id = headers
         .get("x-pecr-principal-id")
@@ -885,6 +945,7 @@ mod tests {
             config: ControllerConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("bind addr must parse"),
                 gateway_url: format!("http://{}", gateway_addr),
+                controller_engine: crate::config::ControllerEngine::Baseline,
                 model_provider: crate::config::ModelProvider::Mock,
                 budget_defaults: budget,
                 auth_mode: crate::config::AuthMode::Local,

@@ -7,6 +7,7 @@ use pecr_contracts::Budget;
 pub struct ControllerConfig {
     pub bind_addr: SocketAddr,
     pub gateway_url: String,
+    pub controller_engine: ControllerEngine,
     pub model_provider: ModelProvider,
     pub budget_defaults: Budget,
     pub auth_mode: AuthMode,
@@ -22,6 +23,12 @@ pub enum ModelProvider {
 pub enum AuthMode {
     Local,
     Oidc,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ControllerEngine {
+    Baseline,
+    Rlm,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +94,29 @@ impl ControllerConfig {
         }
 
         let gateway_url = require_nonempty(kv, "PECR_GATEWAY_URL")?;
+        let controller_engine = parse_controller_engine(kv.get("PECR_CONTROLLER_ENGINE"))?;
+
+        #[cfg(not(feature = "rlm"))]
+        if controller_engine == ControllerEngine::Rlm {
+            return Err(StartupError {
+                code: "ERR_RLM_FEATURE_DISABLED",
+                message:
+                    "PECR_CONTROLLER_ENGINE=rlm requires building pecr-controller with feature rlm"
+                        .to_string(),
+            });
+        }
+
+        if controller_engine == ControllerEngine::Rlm {
+            let sandbox_ack = parse_bool(kv.get("PECR_RLM_SANDBOX_ACK")).unwrap_or(false);
+            if !sandbox_ack {
+                return Err(StartupError {
+                    code: "ERR_RLM_REQUIRES_SANDBOX_ACK",
+                    message: "rlm engine requires PECR_RLM_SANDBOX_ACK=1 to confirm a sandboxed execution environment"
+                        .to_string(),
+                });
+            }
+        }
+
         let model_provider = parse_model_provider(kv.get("PECR_MODEL_PROVIDER"))?;
         if model_provider == ModelProvider::External {
             return Err(StartupError {
@@ -111,6 +141,7 @@ impl ControllerConfig {
         Ok(Self {
             bind_addr,
             gateway_url,
+            controller_engine,
             model_provider,
             budget_defaults,
             auth_mode,
@@ -217,6 +248,22 @@ fn parse_model_provider(value: Option<&String>) -> Result<ModelProvider, Startup
     }
 }
 
+fn parse_controller_engine(value: Option<&String>) -> Result<ControllerEngine, StartupError> {
+    let engine = value
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("baseline");
+
+    match engine {
+        "baseline" => Ok(ControllerEngine::Baseline),
+        "rlm" => Ok(ControllerEngine::Rlm),
+        _ => Err(StartupError {
+            code: "ERR_INVALID_CONFIG",
+            message: "PECR_CONTROLLER_ENGINE must be baseline or rlm".to_string(),
+        }),
+    }
+}
+
 fn parse_auth_mode(value: Option<&String>) -> Result<AuthMode, StartupError> {
     let mode = value
         .map(|s| s.trim())
@@ -283,5 +330,31 @@ mod tests {
         );
         let err = ControllerConfig::from_kv(&env).unwrap_err();
         assert_eq!(err.code, "ERR_NONLOCAL_BIND_REQUIRES_AUTH");
+    }
+
+    #[test]
+    fn invalid_controller_engine_fails() {
+        let mut env = minimal_ok_env();
+        env.insert("PECR_CONTROLLER_ENGINE".to_string(), "nope".to_string());
+        let err = ControllerConfig::from_kv(&env).unwrap_err();
+        assert_eq!(err.code, "ERR_INVALID_CONFIG");
+    }
+
+    #[cfg(not(feature = "rlm"))]
+    #[test]
+    fn rlm_engine_requires_feature_flag() {
+        let mut env = minimal_ok_env();
+        env.insert("PECR_CONTROLLER_ENGINE".to_string(), "rlm".to_string());
+        let err = ControllerConfig::from_kv(&env).unwrap_err();
+        assert_eq!(err.code, "ERR_RLM_FEATURE_DISABLED");
+    }
+
+    #[cfg(feature = "rlm")]
+    #[test]
+    fn rlm_engine_requires_sandbox_ack() {
+        let mut env = minimal_ok_env();
+        env.insert("PECR_CONTROLLER_ENGINE".to_string(), "rlm".to_string());
+        let err = ControllerConfig::from_kv(&env).unwrap_err();
+        assert_eq!(err.code, "ERR_RLM_REQUIRES_SANDBOX_ACK");
     }
 }
