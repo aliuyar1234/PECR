@@ -20,6 +20,7 @@ use sha2::Digest;
 use similar::TextDiff;
 use sqlx::{PgPool, Row};
 use tokio::sync::RwLock;
+use tracing::Instrument;
 use ulid::Ulid;
 
 use crate::config::{GatewayConfig, StartupError};
@@ -131,6 +132,7 @@ async fn create_session(
 ) -> Result<(HeaderMap, Json<CreateSessionResponse>), (StatusCode, Json<ErrorResponse>)> {
     let principal_id = extract_principal_id(&headers)?;
     let request_id = extract_request_id(&headers);
+    let trace_id = extract_trace_id(&headers);
 
     let Json(req) = req.map_err(|_| {
         json_error(
@@ -153,127 +155,206 @@ async fn create_session(
     })?;
 
     let session_id = Ulid::new().to_string();
-    let trace_id = Ulid::new().to_string();
     let policy_snapshot_id = Ulid::new().to_string();
 
-    let mut policy_snapshot = PolicySnapshot {
-        policy_snapshot_hash: String::new(),
-        principal_id: principal_id.clone(),
-        tenant_id: "local".to_string(),
-        principal_roles: Vec::new(),
-        principal_attrs_hash: canonical::hash_canonical_json(&serde_json::json!({})),
-        policy_bundle_hash: state.config.policy_bundle_hash.clone(),
-        as_of_time: state.config.as_of_time_default.clone(),
-        evaluated_at: state.config.as_of_time_default.clone(),
-    };
-    policy_snapshot.policy_snapshot_hash = policy_snapshot.compute_hash();
-
-    let budget_hash = sha256_hex(&serde_json::to_vec(&req.budget).unwrap_or_else(|_| Vec::new()));
-    let decision = state
-        .opa
-        .decide(
-            serde_json::json!({
-                "action": "create_session",
-                "principal_id": principal_id.as_str(),
-                "policy_snapshot_hash": policy_snapshot.policy_snapshot_hash.as_str(),
-                "policy_bundle_hash": state.config.policy_bundle_hash.as_str(),
-                "as_of_time": state.config.as_of_time_default.as_str(),
-                "budget_hash": budget_hash,
-                "request_id": request_id.as_str(),
-            }),
-            Some(OpaCacheKey::create_session(
-                &policy_snapshot.policy_snapshot_hash,
-            )),
-        )
-        .await
-        .map_err(|err| opa_error_response(&err))?;
-
-    if !decision.allow {
-        return Err(json_error(
-            StatusCode::FORBIDDEN,
-            "ERR_POLICY_DENIED",
-            "policy denied".to_string(),
-            TerminalMode::InsufficientPermission,
-            false,
-        ));
-    }
-
-    let session_token = Ulid::new().to_string();
-    let session_token_expires_at =
-        Instant::now() + Duration::from_secs(state.config.session_token_ttl_secs);
-
-    tracing::info!(
+    let span = tracing::info_span!(
+        "session.create",
         trace_id = %trace_id,
         request_id = %request_id,
         session_id = %session_id,
         principal_id = %principal_id,
-        "gateway.create_session"
+        policy_snapshot_id = %policy_snapshot_id,
+        policy_snapshot_hash = tracing::field::Empty,
+        latency_ms = tracing::field::Empty,
+        outcome = tracing::field::Empty,
     );
+    let started = Instant::now();
 
-    state
-        .ledger
-        .create_session(
-            &session_id,
-            &trace_id,
-            &principal_id,
-            &req.budget,
-            &policy_snapshot_id,
-            &policy_snapshot,
-        )
+    async move {
+        let mut policy_snapshot = PolicySnapshot {
+            policy_snapshot_hash: String::new(),
+            principal_id: principal_id.clone(),
+            tenant_id: "local".to_string(),
+            principal_roles: Vec::new(),
+            principal_attrs_hash: canonical::hash_canonical_json(&serde_json::json!({})),
+            policy_bundle_hash: state.config.policy_bundle_hash.clone(),
+            as_of_time: state.config.as_of_time_default.clone(),
+            evaluated_at: state.config.as_of_time_default.clone(),
+        };
+        policy_snapshot.policy_snapshot_hash = policy_snapshot.compute_hash();
+        tracing::Span::current().record(
+            "policy_snapshot_hash",
+            policy_snapshot.policy_snapshot_hash.as_str(),
+        );
+
+        let budget_hash =
+            sha256_hex(&serde_json::to_vec(&req.budget).unwrap_or_else(|_| Vec::new()));
+
+        let policy_span = tracing::info_span!(
+            "policy.evaluate",
+            trace_id = %trace_id,
+            request_id = %request_id,
+            session_id = %session_id,
+            principal_id = %principal_id,
+            policy_snapshot_id = %policy_snapshot_id,
+            policy_snapshot_hash = %policy_snapshot.policy_snapshot_hash,
+            action = "create_session",
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+
+        let decision = async {
+            let started = Instant::now();
+            let decision = state
+                .opa
+                .decide(
+                    serde_json::json!({
+                        "action": "create_session",
+                        "principal_id": principal_id.as_str(),
+                        "policy_snapshot_hash": policy_snapshot.policy_snapshot_hash.as_str(),
+                        "policy_bundle_hash": state.config.policy_bundle_hash.as_str(),
+                        "as_of_time": state.config.as_of_time_default.as_str(),
+                        "budget_hash": budget_hash,
+                        "request_id": request_id.as_str(),
+                    }),
+                    Some(OpaCacheKey::create_session(
+                        &policy_snapshot.policy_snapshot_hash,
+                    )),
+                )
+                .await;
+
+            let latency_ms = started.elapsed().as_millis() as u64;
+            tracing::Span::current().record("latency_ms", latency_ms);
+
+            match decision {
+                Ok(decision) => {
+                    let outcome = if decision.allow { "allow" } else { "deny" };
+                    tracing::Span::current().record("outcome", outcome);
+                    Ok(decision)
+                }
+                Err(err) => {
+                    tracing::Span::current().record("outcome", "error");
+                    Err(err)
+                }
+            }
+        }
+        .instrument(policy_span)
         .await
-        .map_err(|_| {
+        .map_err(|err| opa_error_response(&err))?;
+
+        if !decision.allow {
+            return Err(json_error(
+                StatusCode::FORBIDDEN,
+                "ERR_POLICY_DENIED",
+                "policy denied".to_string(),
+                TerminalMode::InsufficientPermission,
+                false,
+            ));
+        }
+
+        let session_token = Ulid::new().to_string();
+        let session_token_expires_at =
+            Instant::now() + Duration::from_secs(state.config.session_token_ttl_secs);
+
+        tracing::info!(
+            trace_id = %trace_id,
+            request_id = %request_id,
+            session_id = %session_id,
+            principal_id = %principal_id,
+            "gateway.create_session"
+        );
+
+        let ledger_span = tracing::info_span!(
+            "ledger.append",
+            trace_id = %trace_id,
+            request_id = %request_id,
+            session_id = %session_id,
+            event_type = "SESSION_CREATED",
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+
+        async {
+            let started = Instant::now();
+            state
+                .ledger
+                .create_session(
+                    &session_id,
+                    &trace_id,
+                    &principal_id,
+                    &req.budget,
+                    &policy_snapshot_id,
+                    &policy_snapshot,
+                )
+                .await
+                .map_err(|_| {
+                    json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ERR_LEDGER_UNAVAILABLE",
+                        "ledger unavailable".to_string(),
+                        TerminalMode::SourceUnavailable,
+                        true,
+                    )
+                })?;
+
+            let latency_ms = started.elapsed().as_millis() as u64;
+            tracing::Span::current().record("latency_ms", latency_ms);
+            tracing::Span::current().record("outcome", "ok");
+            Ok::<_, (StatusCode, Json<ErrorResponse>)>(())
+        }
+        .instrument(ledger_span)
+        .await?;
+
+        let session = Session {
+            session_id: session_id.clone(),
+            trace_id: trace_id.clone(),
+            principal_id: principal_id.clone(),
+            tenant_id: policy_snapshot.tenant_id.clone(),
+            policy_snapshot_id: policy_snapshot_id.clone(),
+            policy_snapshot_hash: policy_snapshot.policy_snapshot_hash.clone(),
+            budget: req.budget.clone(),
+            session_token: session_token.clone(),
+            session_token_expires_at,
+            operator_calls_used: 0,
+            bytes_used: 0,
+            evidence_unit_ids: HashSet::new(),
+            finalized: false,
+        };
+
+        state
+            .sessions
+            .write()
+            .await
+            .insert(session_id.clone(), session);
+
+        let mut resp_headers = HeaderMap::new();
+        let token_value = axum::http::HeaderValue::from_str(&session_token).map_err(|_| {
             json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ERR_LEDGER_UNAVAILABLE",
-                "ledger unavailable".to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ERR_INTERNAL",
+                "failed to issue session token".to_string(),
                 TerminalMode::SourceUnavailable,
-                true,
+                false,
             )
         })?;
+        resp_headers.insert("x-pecr-session-token", token_value);
 
-    let session = Session {
-        session_id: session_id.clone(),
-        trace_id: trace_id.clone(),
-        principal_id: principal_id.clone(),
-        tenant_id: policy_snapshot.tenant_id.clone(),
-        policy_snapshot_id: policy_snapshot_id.clone(),
-        policy_snapshot_hash: policy_snapshot.policy_snapshot_hash.clone(),
-        budget: req.budget.clone(),
-        session_token: session_token.clone(),
-        session_token_expires_at,
-        operator_calls_used: 0,
-        bytes_used: 0,
-        evidence_unit_ids: HashSet::new(),
-        finalized: false,
-    };
+        let latency_ms = started.elapsed().as_millis() as u64;
+        tracing::Span::current().record("latency_ms", latency_ms);
+        tracing::Span::current().record("outcome", "ok");
 
-    state
-        .sessions
-        .write()
-        .await
-        .insert(session_id.clone(), session);
-
-    let mut resp_headers = HeaderMap::new();
-    let token_value = axum::http::HeaderValue::from_str(&session_token).map_err(|_| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ERR_INTERNAL",
-            "failed to issue session token".to_string(),
-            TerminalMode::SourceUnavailable,
-            false,
-        )
-    })?;
-    resp_headers.insert("x-pecr-session-token", token_value);
-
-    Ok((
-        resp_headers,
-        Json(CreateSessionResponse {
-            session_id,
-            trace_id,
-            policy_snapshot_id,
-            budget: req.budget,
-        }),
-    ))
+        Ok((
+            resp_headers,
+            Json(CreateSessionResponse {
+                session_id,
+                trace_id,
+                policy_snapshot_id,
+                budget: req.budget,
+            }),
+        ))
+    }
+    .instrument(span)
+    .await
 }
 
 #[derive(Debug, Deserialize)]
@@ -587,7 +668,41 @@ async fn call_operator(
         op_name.as_str(),
         &params_hash,
     );
-    let decision = match state.opa.decide(opa_input, Some(cache_key)).await {
+    let policy_span = tracing::info_span!(
+        "policy.evaluate",
+        trace_id = %session.trace_id,
+        request_id = %request_id,
+        session_id = %session.session_id,
+        principal_id = %principal_id,
+        policy_snapshot_id = %session.policy_snapshot_id,
+        policy_snapshot_hash = %session.policy_snapshot_hash,
+        operator_name = %op_name,
+        action = "operator_call",
+        latency_ms = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    );
+
+    let decision = match async {
+        let started = Instant::now();
+        let res = state.opa.decide(opa_input, Some(cache_key)).await;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        tracing::Span::current().record("latency_ms", latency_ms);
+
+        match &res {
+            Ok(decision) => {
+                let outcome = if decision.allow { "allow" } else { "deny" };
+                tracing::Span::current().record("outcome", outcome);
+            }
+            Err(_) => {
+                tracing::Span::current().record("outcome", "error");
+            }
+        }
+
+        res
+    }
+    .instrument(policy_span)
+    .await
+    {
         Ok(decision) => decision,
         Err(err) => {
             state
@@ -689,260 +804,551 @@ async fn call_operator(
         ));
     }
 
-    let (status, error_code, response, evidence_emitted) = match op_name.as_str() {
-        "search" => {
-            let refs = search_from_fs(
-                &state.config.fs_corpus_path,
-                &state.config.as_of_time_default,
-                &session.policy_snapshot_hash,
-                &req.params,
-            )?;
-            (
-                StatusCode::OK,
-                None,
-                OperatorCallResponse {
-                    terminal_mode: TerminalMode::Supported,
-                    result: serde_json::json!({ "refs": refs }),
-                },
-                Vec::new(),
-            )
-        }
-        "list_versions" => {
-            let versions = list_versions_from_fs(
-                &state.fs_versions,
-                &state.config.fs_corpus_path,
-                &state.config.as_of_time_default,
-                &req.params,
-            )
-            .await?;
-            (
-                StatusCode::OK,
-                None,
-                OperatorCallResponse {
-                    terminal_mode: TerminalMode::Supported,
-                    result: serde_json::json!({ "versions": versions }),
-                },
-                Vec::new(),
-            )
-        }
-        "diff" => {
-            let evidence = diff_from_fs(
-                &state.fs_versions,
-                &state.config.fs_corpus_path,
-                &state.config.as_of_time_default,
-                state.config.fs_diff_max_bytes,
-                &session.policy_snapshot_id,
-                &session.policy_snapshot_hash,
-                &req.params,
-            )
-            .await?;
-            let result = serde_json::to_value(&evidence).unwrap_or_else(|_| serde_json::json!([]));
-            (
-                StatusCode::OK,
-                None,
-                OperatorCallResponse {
-                    terminal_mode: TerminalMode::Supported,
-                    result,
-                },
-                evidence,
-            )
-        }
-        "fetch_span" => {
-            let evidence = fetch_span_from_fs(
-                &state.config.fs_corpus_path,
-                &state.config.as_of_time_default,
-                &session.policy_snapshot_id,
-                &session.policy_snapshot_hash,
-                &req.params,
-            )?;
-            let result = serde_json::to_value(&evidence).unwrap_or_else(|_| serde_json::json!({}));
-            (
-                StatusCode::OK,
-                None,
-                OperatorCallResponse {
-                    terminal_mode: TerminalMode::Supported,
-                    result,
-                },
-                vec![evidence],
-            )
-        }
-        "fetch_rows" => {
-            let tenant_id = session.tenant_id.clone();
-            let policy_snapshot_id = session.policy_snapshot_id.clone();
-            let policy_snapshot_hash = session.policy_snapshot_hash.clone();
-
-            let evidence = fetch_rows_from_pg_safeview(
-                &state.pg_pool,
-                &state.config,
-                &tenant_id,
-                &policy_snapshot_id,
-                &policy_snapshot_hash,
-                &req.params,
-            )
-            .await?;
-
-            let result = serde_json::to_value(&evidence).unwrap_or_else(|_| serde_json::json!([]));
-            (
-                StatusCode::OK,
-                None,
-                OperatorCallResponse {
-                    terminal_mode: TerminalMode::Supported,
-                    result,
-                },
-                evidence,
-            )
-        }
-        "aggregate" => {
-            let tenant_id = session.tenant_id.clone();
-            let policy_snapshot_id = session.policy_snapshot_id.clone();
-            let policy_snapshot_hash = session.policy_snapshot_hash.clone();
-
-            let evidence = aggregate_from_pg_safeview(
-                &state.pg_pool,
-                &state.config,
-                &tenant_id,
-                &policy_snapshot_id,
-                &policy_snapshot_hash,
-                &req.params,
-            )
-            .await?;
-
-            let result = serde_json::to_value(&evidence).unwrap_or_else(|_| serde_json::json!({}));
-            (
-                StatusCode::OK,
-                None,
-                OperatorCallResponse {
-                    terminal_mode: TerminalMode::Supported,
-                    result,
-                },
-                vec![evidence],
-            )
-        }
-        _ => (
-            StatusCode::NOT_IMPLEMENTED,
-            Some("ERR_INTERNAL"),
-            OperatorCallResponse {
-                terminal_mode: TerminalMode::SourceUnavailable,
-                result: serde_json::json!({"message":"operator execution not implemented yet"}),
-            },
-            Vec::new(),
+    let operator_span = match op_name.as_str() {
+        "search" => tracing::info_span!(
+            "operator.search",
+            trace_id = %session.trace_id,
+            request_id = %request_id,
+            session_id = %session.session_id,
+            principal_id = %principal_id,
+            policy_snapshot_id = %session.policy_snapshot_id,
+            policy_snapshot_hash = %session.policy_snapshot_hash,
+            operator_name = "search",
+            params_hash = %params_hash,
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            operator_calls_used = tracing::field::Empty,
+            bytes_used = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        "fetch_span" => tracing::info_span!(
+            "operator.fetch_span",
+            trace_id = %session.trace_id,
+            request_id = %request_id,
+            session_id = %session.session_id,
+            principal_id = %principal_id,
+            policy_snapshot_id = %session.policy_snapshot_id,
+            policy_snapshot_hash = %session.policy_snapshot_hash,
+            operator_name = "fetch_span",
+            params_hash = %params_hash,
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            operator_calls_used = tracing::field::Empty,
+            bytes_used = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        "fetch_rows" => tracing::info_span!(
+            "operator.fetch_rows",
+            trace_id = %session.trace_id,
+            request_id = %request_id,
+            session_id = %session.session_id,
+            principal_id = %principal_id,
+            policy_snapshot_id = %session.policy_snapshot_id,
+            policy_snapshot_hash = %session.policy_snapshot_hash,
+            operator_name = "fetch_rows",
+            params_hash = %params_hash,
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            operator_calls_used = tracing::field::Empty,
+            bytes_used = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        "aggregate" => tracing::info_span!(
+            "operator.aggregate",
+            trace_id = %session.trace_id,
+            request_id = %request_id,
+            session_id = %session.session_id,
+            principal_id = %principal_id,
+            policy_snapshot_id = %session.policy_snapshot_id,
+            policy_snapshot_hash = %session.policy_snapshot_hash,
+            operator_name = "aggregate",
+            params_hash = %params_hash,
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            operator_calls_used = tracing::field::Empty,
+            bytes_used = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        "list_versions" => tracing::info_span!(
+            "operator.list_versions",
+            trace_id = %session.trace_id,
+            request_id = %request_id,
+            session_id = %session.session_id,
+            principal_id = %principal_id,
+            policy_snapshot_id = %session.policy_snapshot_id,
+            policy_snapshot_hash = %session.policy_snapshot_hash,
+            operator_name = "list_versions",
+            params_hash = %params_hash,
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            operator_calls_used = tracing::field::Empty,
+            bytes_used = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        "diff" => tracing::info_span!(
+            "operator.diff",
+            trace_id = %session.trace_id,
+            request_id = %request_id,
+            session_id = %session.session_id,
+            principal_id = %principal_id,
+            policy_snapshot_id = %session.policy_snapshot_id,
+            policy_snapshot_hash = %session.policy_snapshot_hash,
+            operator_name = "diff",
+            params_hash = %params_hash,
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            operator_calls_used = tracing::field::Empty,
+            bytes_used = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        _ => tracing::info_span!(
+            "operator.unknown",
+            trace_id = %session.trace_id,
+            request_id = %request_id,
+            session_id = %session.session_id,
+            principal_id = %principal_id,
+            policy_snapshot_id = %session.policy_snapshot_id,
+            policy_snapshot_hash = %session.policy_snapshot_hash,
+            operator_name = %op_name,
+            params_hash = %params_hash,
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            operator_calls_used = tracing::field::Empty,
+            bytes_used = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
         ),
     };
 
-    let store_payload = matches!(
-        state.config.evidence_payload_store_mode,
-        crate::config::EvidencePayloadStoreMode::PayloadEnabled
-    );
-    for evidence in &evidence_emitted {
-        state
-            .ledger
-            .insert_evidence_unit(
-                &session.trace_id,
-                &session.session_id,
-                evidence,
-                store_payload,
-            )
-            .await
-            .map_err(|_| {
-                json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ERR_LEDGER_UNAVAILABLE",
-                    "ledger unavailable".to_string(),
-                    TerminalMode::SourceUnavailable,
-                    true,
+    async {
+        let started = Instant::now();
+
+        let (status, error_code, response, evidence_emitted) = match op_name.as_str() {
+            "search" => {
+                let adapter_span = tracing::info_span!(
+                    "adapter.fs_corpus",
+                    trace_id = %session.trace_id,
+                    request_id = %request_id,
+                    session_id = %session.session_id,
+                    source_system = "fs_corpus",
+                    operator_name = "search",
+                    latency_ms = tracing::field::Empty,
+                    outcome = tracing::field::Empty,
+                );
+                let adapter_started = Instant::now();
+                let refs = adapter_span.in_scope(|| {
+                    search_from_fs(
+                        &state.config.fs_corpus_path,
+                        &state.config.as_of_time_default,
+                        &session.policy_snapshot_hash,
+                        &req.params,
+                    )
+                })?;
+                let latency_ms = adapter_started.elapsed().as_millis() as u64;
+                adapter_span.record("latency_ms", latency_ms);
+                adapter_span.record("outcome", "ok");
+
+                (
+                    StatusCode::OK,
+                    None,
+                    OperatorCallResponse {
+                        terminal_mode: TerminalMode::Supported,
+                        result: serde_json::json!({ "refs": refs }),
+                    },
+                    Vec::new(),
                 )
-            })?;
+            }
+            "list_versions" => {
+                let adapter_span = tracing::info_span!(
+                    "adapter.fs_corpus",
+                    trace_id = %session.trace_id,
+                    request_id = %request_id,
+                    session_id = %session.session_id,
+                    source_system = "fs_corpus",
+                    operator_name = "list_versions",
+                    latency_ms = tracing::field::Empty,
+                    outcome = tracing::field::Empty,
+                );
+                let versions = async {
+                    let started = Instant::now();
+                    let versions = list_versions_from_fs(
+                        &state.fs_versions,
+                        &state.config.fs_corpus_path,
+                        &state.config.as_of_time_default,
+                        &req.params,
+                    )
+                    .await?;
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    tracing::Span::current().record("latency_ms", latency_ms);
+                    tracing::Span::current().record("outcome", "ok");
+                    Ok::<_, ApiError>(versions)
+                }
+                .instrument(adapter_span)
+                .await?;
 
-        state
-            .ledger
-            .append_event(
-                &session.trace_id,
-                &session.session_id,
-                "EVIDENCE_EMITTED",
-                &principal_id,
-                &session.policy_snapshot_id,
-                serde_json::json!({
-                    "evidence_unit_id": evidence.evidence_unit_id.as_str(),
-                    "content_hash": evidence.content_hash.as_str(),
-                    "source_system": evidence.source_system.as_str(),
-                    "object_id": evidence.object_id.as_str(),
-                    "version_id": evidence.version_id.as_str(),
-                    "op_name": op_name.as_str(),
-                    "request_id": request_id,
-                }),
-            )
-            .await
-            .map_err(|_| {
-                json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ERR_LEDGER_UNAVAILABLE",
-                    "ledger unavailable".to_string(),
-                    TerminalMode::SourceUnavailable,
-                    true,
+                (
+                    StatusCode::OK,
+                    None,
+                    OperatorCallResponse {
+                        terminal_mode: TerminalMode::Supported,
+                        result: serde_json::json!({ "versions": versions }),
+                    },
+                    Vec::new(),
                 )
-            })?;
-    }
+            }
+            "diff" => {
+                let adapter_span = tracing::info_span!(
+                    "adapter.fs_corpus",
+                    trace_id = %session.trace_id,
+                    request_id = %request_id,
+                    session_id = %session.session_id,
+                    source_system = "fs_corpus",
+                    operator_name = "diff",
+                    latency_ms = tracing::field::Empty,
+                    outcome = tracing::field::Empty,
+                );
+                let evidence = async {
+                    let started = Instant::now();
+                    let evidence = diff_from_fs(
+                        &state.fs_versions,
+                        &state.config.fs_corpus_path,
+                        &state.config.as_of_time_default,
+                        state.config.fs_diff_max_bytes,
+                        &session.policy_snapshot_id,
+                        &session.policy_snapshot_hash,
+                        &req.params,
+                    )
+                    .await?;
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    tracing::Span::current().record("latency_ms", latency_ms);
+                    tracing::Span::current().record("outcome", "ok");
+                    Ok::<_, ApiError>(evidence)
+                }
+                .instrument(adapter_span)
+                .await?;
 
-    for evidence in &evidence_emitted {
-        session
-            .evidence_unit_ids
-            .insert(evidence.evidence_unit_id.clone());
-    }
+                let result =
+                    serde_json::to_value(&evidence).unwrap_or_else(|_| serde_json::json!([]));
+                (
+                    StatusCode::OK,
+                    None,
+                    OperatorCallResponse {
+                        terminal_mode: TerminalMode::Supported,
+                        result,
+                    },
+                    evidence,
+                )
+            }
+            "fetch_span" => {
+                let adapter_span = tracing::info_span!(
+                    "adapter.fs_corpus",
+                    trace_id = %session.trace_id,
+                    request_id = %request_id,
+                    session_id = %session.session_id,
+                    source_system = "fs_corpus",
+                    operator_name = "fetch_span",
+                    latency_ms = tracing::field::Empty,
+                    outcome = tracing::field::Empty,
+                );
+                let adapter_started = Instant::now();
+                let evidence = adapter_span.in_scope(|| {
+                    fetch_span_from_fs(
+                        &state.config.fs_corpus_path,
+                        &state.config.as_of_time_default,
+                        &session.policy_snapshot_id,
+                        &session.policy_snapshot_hash,
+                        &req.params,
+                    )
+                })?;
+                let latency_ms = adapter_started.elapsed().as_millis() as u64;
+                adapter_span.record("latency_ms", latency_ms);
+                adapter_span.record("outcome", "ok");
 
-    let result_bytes = serde_json::to_vec(&response.result)
-        .map(|v| v.len() as u64)
-        .unwrap_or(0);
-    let next_operator_calls_used = session.operator_calls_used.saturating_add(1);
-    let next_bytes_used = session
-        .bytes_used
-        .saturating_add(params_bytes + result_bytes);
+                let result =
+                    serde_json::to_value(&evidence).unwrap_or_else(|_| serde_json::json!({}));
+                (
+                    StatusCode::OK,
+                    None,
+                    OperatorCallResponse {
+                        terminal_mode: TerminalMode::Supported,
+                        result,
+                    },
+                    vec![evidence],
+                )
+            }
+            "fetch_rows" => {
+                let tenant_id = session.tenant_id.clone();
+                let policy_snapshot_id = session.policy_snapshot_id.clone();
+                let policy_snapshot_hash = session.policy_snapshot_hash.clone();
 
-    state
-        .ledger
-        .append_event(
-            &session.trace_id,
-            &session.session_id,
-            "OPERATOR_CALL",
-            &principal_id,
-            &session.policy_snapshot_id,
-            serde_json::json!({
-                "op_name": op_name.as_str(),
-                "params_hash": params_hash,
-                "params_bytes": params_bytes,
-                "result_bytes": result_bytes,
-                "terminal_mode": response.terminal_mode.as_str(),
-                "outcome": if error_code.is_none() { "success" } else { "error" },
-                "error_code": error_code,
-                "operator_calls_used": next_operator_calls_used,
-                "bytes_used": next_bytes_used,
-                "request_id": request_id,
-            }),
-        )
-        .await
-        .map_err(|_| {
-            json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ERR_LEDGER_UNAVAILABLE",
-                "ledger unavailable".to_string(),
+                let adapter_span = tracing::info_span!(
+                    "adapter.pg_safeview",
+                    trace_id = %session.trace_id,
+                    request_id = %request_id,
+                    session_id = %session.session_id,
+                    source_system = "pg_safeview",
+                    operator_name = "fetch_rows",
+                    latency_ms = tracing::field::Empty,
+                    outcome = tracing::field::Empty,
+                );
+
+                let evidence = async {
+                    let started = Instant::now();
+                    let evidence = fetch_rows_from_pg_safeview(
+                        &state.pg_pool,
+                        &state.config,
+                        &tenant_id,
+                        &policy_snapshot_id,
+                        &policy_snapshot_hash,
+                        &req.params,
+                    )
+                    .await?;
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    tracing::Span::current().record("latency_ms", latency_ms);
+                    tracing::Span::current().record("outcome", "ok");
+                    Ok::<_, ApiError>(evidence)
+                }
+                .instrument(adapter_span)
+                .await?;
+
+                let result =
+                    serde_json::to_value(&evidence).unwrap_or_else(|_| serde_json::json!([]));
+                (
+                    StatusCode::OK,
+                    None,
+                    OperatorCallResponse {
+                        terminal_mode: TerminalMode::Supported,
+                        result,
+                    },
+                    evidence,
+                )
+            }
+            "aggregate" => {
+                let tenant_id = session.tenant_id.clone();
+                let policy_snapshot_id = session.policy_snapshot_id.clone();
+                let policy_snapshot_hash = session.policy_snapshot_hash.clone();
+
+                let adapter_span = tracing::info_span!(
+                    "adapter.pg_safeview",
+                    trace_id = %session.trace_id,
+                    request_id = %request_id,
+                    session_id = %session.session_id,
+                    source_system = "pg_safeview",
+                    operator_name = "aggregate",
+                    latency_ms = tracing::field::Empty,
+                    outcome = tracing::field::Empty,
+                );
+
+                let evidence = async {
+                    let started = Instant::now();
+                    let evidence = aggregate_from_pg_safeview(
+                        &state.pg_pool,
+                        &state.config,
+                        &tenant_id,
+                        &policy_snapshot_id,
+                        &policy_snapshot_hash,
+                        &req.params,
+                    )
+                    .await?;
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    tracing::Span::current().record("latency_ms", latency_ms);
+                    tracing::Span::current().record("outcome", "ok");
+                    Ok::<_, ApiError>(evidence)
+                }
+                .instrument(adapter_span)
+                .await?;
+
+                let result =
+                    serde_json::to_value(&evidence).unwrap_or_else(|_| serde_json::json!({}));
+                (
+                    StatusCode::OK,
+                    None,
+                    OperatorCallResponse {
+                        terminal_mode: TerminalMode::Supported,
+                        result,
+                    },
+                    vec![evidence],
+                )
+            }
+            _ => (
+                StatusCode::NOT_IMPLEMENTED,
+                Some("ERR_INTERNAL"),
+                OperatorCallResponse {
+                    terminal_mode: TerminalMode::SourceUnavailable,
+                    result: serde_json::json!({"message":"operator execution not implemented yet"}),
+                },
+                Vec::new(),
+            ),
+        };
+
+        let result_bytes = serde_json::to_vec(&response.result)
+            .map(|v| v.len() as u64)
+            .unwrap_or(0);
+
+        let ledger_span = tracing::info_span!(
+            "ledger.append",
+            trace_id = %session.trace_id,
+            request_id = %request_id,
+            session_id = %session.session_id,
+            event_type = "OPERATOR_CALL",
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+
+        async {
+            let started = Instant::now();
+            let store_payload = matches!(
+                state.config.evidence_payload_store_mode,
+                crate::config::EvidencePayloadStoreMode::PayloadEnabled
+            );
+            for evidence in &evidence_emitted {
+                state
+                    .ledger
+                    .insert_evidence_unit(
+                        &session.trace_id,
+                        &session.session_id,
+                        evidence,
+                        store_payload,
+                    )
+                    .await
+                    .map_err(|_| {
+                        json_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "ERR_LEDGER_UNAVAILABLE",
+                            "ledger unavailable".to_string(),
+                            TerminalMode::SourceUnavailable,
+                            true,
+                        )
+                    })?;
+
+                state
+                    .ledger
+                    .append_event(
+                        &session.trace_id,
+                        &session.session_id,
+                        "EVIDENCE_EMITTED",
+                        &principal_id,
+                        &session.policy_snapshot_id,
+                        serde_json::json!({
+                            "evidence_unit_id": evidence.evidence_unit_id.as_str(),
+                            "content_hash": evidence.content_hash.as_str(),
+                            "source_system": evidence.source_system.as_str(),
+                            "object_id": evidence.object_id.as_str(),
+                            "version_id": evidence.version_id.as_str(),
+                            "op_name": op_name.as_str(),
+                            "request_id": request_id,
+                        }),
+                    )
+                    .await
+                    .map_err(|_| {
+                        json_error(
+                            StatusCode::SERVICE_UNAVAILABLE,
+                            "ERR_LEDGER_UNAVAILABLE",
+                            "ledger unavailable".to_string(),
+                            TerminalMode::SourceUnavailable,
+                            true,
+                        )
+                    })?;
+            }
+
+            for evidence in &evidence_emitted {
+                session
+                    .evidence_unit_ids
+                    .insert(evidence.evidence_unit_id.clone());
+            }
+
+            let next_operator_calls_used = session.operator_calls_used.saturating_add(1);
+            let next_bytes_used = session
+                .bytes_used
+                .saturating_add(params_bytes + result_bytes);
+
+            state
+                .ledger
+                .append_event(
+                    &session.trace_id,
+                    &session.session_id,
+                    "OPERATOR_CALL",
+                    &principal_id,
+                    &session.policy_snapshot_id,
+                    serde_json::json!({
+                        "op_name": op_name.as_str(),
+                        "params_hash": params_hash,
+                        "params_bytes": params_bytes,
+                        "result_bytes": result_bytes,
+                        "terminal_mode": response.terminal_mode.as_str(),
+                        "outcome": if error_code.is_none() { "success" } else { "error" },
+                        "error_code": error_code,
+                        "operator_calls_used": next_operator_calls_used,
+                        "bytes_used": next_bytes_used,
+                        "request_id": request_id,
+                    }),
+                )
+                .await
+                .map_err(|_| {
+                    json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ERR_LEDGER_UNAVAILABLE",
+                        "ledger unavailable".to_string(),
+                        TerminalMode::SourceUnavailable,
+                        true,
+                    )
+                })?;
+
+            session.operator_calls_used = next_operator_calls_used;
+            session.bytes_used = next_bytes_used;
+
+            tracing::Span::current().record("latency_ms", started.elapsed().as_millis() as u64);
+            tracing::Span::current().record("outcome", "ok");
+
+            Ok::<_, ApiError>(())
+        }
+        .instrument(ledger_span)
+        .await?;
+
+        let latency_ms = started.elapsed().as_millis() as u64;
+        let terminal_mode = response.terminal_mode.as_str();
+        let operator_calls_used = session.operator_calls_used;
+        let bytes_used = session.bytes_used;
+        let outcome = if status == StatusCode::OK {
+            "ok"
+        } else {
+            "error"
+        };
+
+        tracing::Span::current().record("latency_ms", latency_ms);
+        tracing::Span::current().record("result_bytes", result_bytes);
+        tracing::Span::current().record("terminal_mode", terminal_mode);
+        tracing::Span::current().record("operator_calls_used", operator_calls_used);
+        tracing::Span::current().record("bytes_used", bytes_used);
+        tracing::Span::current().record("outcome", outcome);
+
+        if status == StatusCode::OK {
+            Ok(Json(response))
+        } else {
+            Err(json_error(
+                status,
+                error_code.unwrap_or("ERR_INTERNAL"),
+                "operator execution not implemented yet".to_string(),
                 TerminalMode::SourceUnavailable,
-                true,
-            )
-        })?;
-
-    session.operator_calls_used = next_operator_calls_used;
-    session.bytes_used = next_bytes_used;
-
-    if status == StatusCode::OK {
-        Ok(Json(response))
-    } else {
-        Err(json_error(
-            status,
-            error_code.unwrap_or("ERR_INTERNAL"),
-            "operator execution not implemented yet".to_string(),
-            TerminalMode::SourceUnavailable,
-            false,
-        ))
+                false,
+            ))
+        }
     }
+    .instrument(operator_span)
+    .await
 }
 
 #[derive(Debug, Serialize)]
@@ -2650,7 +3056,41 @@ async fn finalize(
         "request_id": request_id.as_str(),
     });
     let cache_key = OpaCacheKey::finalize(&session.policy_snapshot_hash);
-    let decision = match state.opa.decide(opa_input, Some(cache_key)).await {
+    let policy_span = tracing::info_span!(
+        "policy.evaluate",
+        trace_id = %session.trace_id,
+        request_id = %request_id,
+        session_id = %session.session_id,
+        principal_id = %principal_id,
+        policy_snapshot_id = %session.policy_snapshot_id,
+        policy_snapshot_hash = %session.policy_snapshot_hash,
+        operator_name = "finalize",
+        action = "finalize",
+        latency_ms = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    );
+
+    let decision = match async {
+        let started = Instant::now();
+        let res = state.opa.decide(opa_input, Some(cache_key)).await;
+        let latency_ms = started.elapsed().as_millis() as u64;
+        tracing::Span::current().record("latency_ms", latency_ms);
+
+        match &res {
+            Ok(decision) => {
+                let outcome = if decision.allow { "allow" } else { "deny" };
+                tracing::Span::current().record("outcome", outcome);
+            }
+            Err(_) => {
+                tracing::Span::current().record("outcome", "error");
+            }
+        }
+
+        res
+    }
+    .instrument(policy_span)
+    .await
+    {
         Ok(decision) => decision,
         Err(err) => {
             state
@@ -2725,58 +3165,106 @@ async fn finalize(
         ));
     }
 
-    let FinalizeRequest {
-        claim_map,
-        response_text,
-        session_id: _,
-    } = req;
-    let claim_map = finalize_gate(session, claim_map)?;
-
-    tracing::info!(
+    let finalize_span = tracing::info_span!(
+        "finalize.compile",
         trace_id = %session.trace_id,
         request_id = %request_id,
         session_id = %session.session_id,
         principal_id = %principal_id,
-        "gateway.finalize"
+        policy_snapshot_id = %session.policy_snapshot_id,
+        policy_snapshot_hash = %session.policy_snapshot_hash,
+        terminal_mode = tracing::field::Empty,
+        coverage_observed = tracing::field::Empty,
+        latency_ms = tracing::field::Empty,
+        outcome = tracing::field::Empty,
     );
 
-    let budget_counters = serde_json::json!({
-        "operator_calls_used": session.operator_calls_used,
-        "bytes_used": session.bytes_used,
-        "max_operator_calls": session.budget.max_operator_calls,
-        "max_bytes": session.budget.max_bytes,
-    });
+    async move {
+        let started = Instant::now();
 
-    state
-        .ledger
-        .record_finalize_result(FinalizeResultRecord {
-            trace_id: &session.trace_id,
-            session_id: &session.session_id,
-            principal_id: &principal_id,
-            policy_snapshot_id: &session.policy_snapshot_id,
-            claim_map: &claim_map,
-            budget_counters: &budget_counters,
-            request_id: &request_id,
-        })
-        .await
-        .map_err(|_| {
-            json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ERR_LEDGER_UNAVAILABLE",
-                "ledger unavailable".to_string(),
-                TerminalMode::SourceUnavailable,
-                true,
-            )
-        })?;
+        let FinalizeRequest {
+            claim_map,
+            response_text,
+            session_id: _,
+        } = req;
+        let claim_map = finalize_gate(session, claim_map)?;
 
-    session.finalized = true;
+        let terminal_mode = claim_map.terminal_mode.as_str();
+        tracing::Span::current().record("terminal_mode", terminal_mode);
+        tracing::Span::current().record("coverage_observed", claim_map.coverage_observed);
 
-    Ok(Json(FinalizeResponse {
-        terminal_mode: claim_map.terminal_mode,
-        trace_id: session.trace_id.clone(),
-        claim_map,
-        response_text,
-    }))
+        tracing::info!(
+            trace_id = %session.trace_id,
+            request_id = %request_id,
+            session_id = %session.session_id,
+            principal_id = %principal_id,
+            "gateway.finalize"
+        );
+
+        let budget_counters = serde_json::json!({
+            "operator_calls_used": session.operator_calls_used,
+            "bytes_used": session.bytes_used,
+            "max_operator_calls": session.budget.max_operator_calls,
+            "max_bytes": session.budget.max_bytes,
+        });
+
+        let ledger_span = tracing::info_span!(
+            "ledger.append",
+            trace_id = %session.trace_id,
+            request_id = %request_id,
+            session_id = %session.session_id,
+            event_type = "FINALIZE_RESULT",
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+
+        async {
+            let started = Instant::now();
+            state
+                .ledger
+                .record_finalize_result(FinalizeResultRecord {
+                    trace_id: &session.trace_id,
+                    session_id: &session.session_id,
+                    principal_id: &principal_id,
+                    policy_snapshot_id: &session.policy_snapshot_id,
+                    claim_map: &claim_map,
+                    budget_counters: &budget_counters,
+                    request_id: &request_id,
+                })
+                .await
+                .map_err(|_| {
+                    json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ERR_LEDGER_UNAVAILABLE",
+                        "ledger unavailable".to_string(),
+                        TerminalMode::SourceUnavailable,
+                        true,
+                    )
+                })?;
+
+            let latency_ms = started.elapsed().as_millis() as u64;
+            tracing::Span::current().record("latency_ms", latency_ms);
+            tracing::Span::current().record("outcome", "ok");
+            Ok::<_, ApiError>(())
+        }
+        .instrument(ledger_span)
+        .await?;
+
+        session.finalized = true;
+
+        let latency_ms = started.elapsed().as_millis() as u64;
+        tracing::Span::current().record("latency_ms", latency_ms);
+        tracing::Span::current().record("outcome", "ok");
+
+        Ok(Json(FinalizeResponse {
+            terminal_mode: claim_map.terminal_mode,
+            trace_id: session.trace_id.clone(),
+            claim_map,
+            response_text,
+        }))
+    }
+    .instrument(finalize_span)
+    .await
 }
 
 fn extract_principal_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
@@ -2825,6 +3313,17 @@ fn extract_request_id(headers: &HeaderMap) -> String {
         .map(|v| v.trim())
         .filter(|v| !v.is_empty())
         .and_then(sanitize_request_id)
+        .unwrap_or_else(|| Ulid::new().to_string())
+}
+
+fn extract_trace_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-pecr-trace-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<Ulid>().ok())
+        .map(|u| u.to_string())
         .unwrap_or_else(|| Ulid::new().to_string())
 }
 

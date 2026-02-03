@@ -8,6 +8,7 @@ use pecr_contracts::{
 };
 use serde::{Deserialize, Serialize};
 use std::time::{Duration, Instant};
+use tracing::Instrument;
 use ulid::Ulid;
 
 use crate::config::{ControllerConfig, ControllerEngine};
@@ -56,6 +57,7 @@ async fn run(
 ) -> Result<Json<RunResponse>, (StatusCode, Json<ErrorResponse>)> {
     let principal_id = extract_principal_id(&headers)?;
     let request_id = extract_request_id(&headers);
+    let trace_id = extract_trace_id(&headers);
     let budget = req
         .budget
         .unwrap_or_else(|| state.config.budget_defaults.clone());
@@ -71,60 +73,65 @@ async fn run(
         )
     })?;
 
-    tracing::info!(
+    let span = tracing::info_span!(
+        "controller.run",
+        trace_id = %trace_id,
         request_id = %request_id,
-        principal_id = %principal_id,
-        "controller.run"
+        principal_id = %principal_id
     );
+    async move {
+        let session =
+            create_session(&state, &principal_id, &request_id, &trace_id, &budget).await?;
 
-    let session = create_session(&state, &principal_id, &request_id, &budget).await?;
-    let loop_result = match state.config.controller_engine {
-        ControllerEngine::Baseline => {
-            run_context_loop(
-                &state,
-                &principal_id,
-                &request_id,
-                &session.session_token,
-                &session.session.session_id,
-                &query,
-                &budget,
-            )
-            .await?
+        let ctx = GatewayCallContext {
+            principal_id: &principal_id,
+            request_id: &request_id,
+            trace_id: &trace_id,
+            session_token: &session.session_token,
+            session_id: &session.session.session_id,
+        };
+
+        let loop_result = match state.config.controller_engine {
+            ControllerEngine::Baseline => run_context_loop(&state, ctx, &query, &budget).await?,
+            ControllerEngine::Rlm => run_context_loop_rlm(&state, ctx, &query, &budget).await?,
+        };
+
+        let finalize_span = tracing::info_span!(
+            "finalize.compile",
+            trace_id = %trace_id,
+            request_id = %request_id,
+            session_id = %session.session.session_id,
+            terminal_mode = %loop_result.terminal_mode.as_str(),
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        );
+
+        let finalized = async {
+            let finalize_started = Instant::now();
+
+            let response_text = response_text_for_terminal_mode(loop_result.terminal_mode);
+            let claim_map = build_claim_map(&response_text, loop_result.terminal_mode);
+
+            let finalized = finalize_session(&state, ctx, response_text, claim_map).await?;
+
+            let latency_ms = finalize_started.elapsed().as_millis() as u64;
+            tracing::Span::current().record("latency_ms", latency_ms);
+            tracing::Span::current().record("outcome", "ok");
+
+            Ok::<_, (StatusCode, Json<ErrorResponse>)>(finalized)
         }
-        ControllerEngine::Rlm => {
-            run_context_loop_rlm(
-                &state,
-                &principal_id,
-                &request_id,
-                &session.session_token,
-                &session.session.session_id,
-                &query,
-                &budget,
-            )
-            .await?
-        }
-    };
+        .instrument(finalize_span)
+        .await?;
 
-    let response_text = response_text_for_terminal_mode(loop_result.terminal_mode);
-    let claim_map = build_claim_map(&response_text, loop_result.terminal_mode);
-
-    let finalized = finalize_session(
-        &state,
-        &principal_id,
-        &request_id,
-        &session.session_token,
-        &session.session.session_id,
-        response_text,
-        claim_map,
-    )
-    .await?;
-
-    Ok(Json(RunResponse {
-        terminal_mode: finalized.terminal_mode,
-        trace_id: finalized.trace_id,
-        claim_map: finalized.claim_map,
-        response_text: finalized.response_text,
-    }))
+        Ok(Json(RunResponse {
+            terminal_mode: finalized.terminal_mode,
+            trace_id: finalized.trace_id,
+            claim_map: finalized.claim_map,
+            response_text: finalized.response_text,
+        }))
+    }
+    .instrument(span)
+    .await
 }
 
 fn response_text_for_terminal_mode(terminal_mode: TerminalMode) -> String {
@@ -238,94 +245,127 @@ async fn create_session(
     state: &AppState,
     principal_id: &str,
     request_id: &str,
+    trace_id: &str,
     budget: &Budget,
 ) -> Result<CreatedSession, (StatusCode, Json<ErrorResponse>)> {
-    let url = format!(
-        "{}/v1/sessions",
-        state.config.gateway_url.trim_end_matches('/')
+    let span = tracing::info_span!(
+        "session.create",
+        trace_id = %trace_id,
+        request_id = %request_id,
+        principal_id = %principal_id,
+        session_id = tracing::field::Empty,
+        policy_snapshot_id = tracing::field::Empty,
+        latency_ms = tracing::field::Empty,
+        outcome = tracing::field::Empty,
     );
-    let response = state
-        .http
-        .post(url)
-        .header("x-pecr-principal-id", principal_id)
-        .header("x-pecr-request-id", request_id)
-        .json(&CreateSessionRequest {
-            budget: budget.clone(),
-        })
-        .send()
-        .await
-        .map_err(|_| {
-            json_error(
+    let started = Instant::now();
+    async move {
+        let url = format!(
+            "{}/v1/sessions",
+            state.config.gateway_url.trim_end_matches('/')
+        );
+        let response = state
+            .http
+            .post(url)
+            .header("x-pecr-principal-id", principal_id)
+            .header("x-pecr-request-id", request_id)
+            .header("x-pecr-trace-id", trace_id)
+            .json(&CreateSessionRequest {
+                budget: budget.clone(),
+            })
+            .send()
+            .await
+            .map_err(|_| {
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "ERR_SOURCE_UNAVAILABLE",
+                    "gateway request failed".to_string(),
+                    TerminalMode::SourceUnavailable,
+                    true,
+                )
+            })?;
+
+        if !response.status().is_success() {
+            return Err(json_error(
                 StatusCode::BAD_GATEWAY,
                 "ERR_SOURCE_UNAVAILABLE",
-                "gateway request failed".to_string(),
+                "gateway returned non-success status".to_string(),
                 TerminalMode::SourceUnavailable,
                 true,
-            )
-        })?;
+            ));
+        }
 
-    if !response.status().is_success() {
-        return Err(json_error(
-            StatusCode::BAD_GATEWAY,
-            "ERR_SOURCE_UNAVAILABLE",
-            "gateway returned non-success status".to_string(),
-            TerminalMode::SourceUnavailable,
-            true,
-        ));
-    }
+        let session_token = response
+            .headers()
+            .get("x-pecr-session-token")
+            .and_then(|v| v.to_str().ok())
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string())
+            .ok_or_else(|| {
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "ERR_INTERNAL",
+                    "gateway did not return a session token".to_string(),
+                    TerminalMode::SourceUnavailable,
+                    false,
+                )
+            })?;
 
-    let session_token = response
-        .headers()
-        .get("x-pecr-session-token")
-        .and_then(|v| v.to_str().ok())
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string())
-        .ok_or_else(|| {
-            json_error(
+        let created = response
+            .json::<CreateSessionResponse>()
+            .await
+            .map_err(|_| {
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "ERR_INTERNAL",
+                    "failed to parse gateway response".to_string(),
+                    TerminalMode::SourceUnavailable,
+                    false,
+                )
+            })?;
+
+        tracing::info!(
+            request_id = %request_id,
+            trace_id = %created.trace_id,
+            policy_snapshot_id = %created.policy_snapshot_id,
+            principal_id = %principal_id,
+            "controller.gateway_session_created"
+        );
+
+        tracing::Span::current().record("session_id", created.session_id.as_str());
+        tracing::Span::current().record("policy_snapshot_id", created.policy_snapshot_id.as_str());
+        let latency_ms = started.elapsed().as_millis() as u64;
+        tracing::Span::current().record("latency_ms", latency_ms);
+        tracing::Span::current().record("outcome", "ok");
+
+        if created.trace_id != trace_id {
+            return Err(json_error(
                 StatusCode::BAD_GATEWAY,
                 "ERR_INTERNAL",
-                "gateway did not return a session token".to_string(),
+                "gateway returned mismatched trace_id".to_string(),
                 TerminalMode::SourceUnavailable,
                 false,
-            )
-        })?;
+            ));
+        }
 
-    let created = response
-        .json::<CreateSessionResponse>()
-        .await
-        .map_err(|_| {
-            json_error(
+        if created.budget != *budget {
+            return Err(json_error(
                 StatusCode::BAD_GATEWAY,
                 "ERR_INTERNAL",
-                "failed to parse gateway response".to_string(),
+                "gateway returned mismatched budget".to_string(),
                 TerminalMode::SourceUnavailable,
                 false,
-            )
-        })?;
+            ));
+        }
 
-    tracing::info!(
-        request_id = %request_id,
-        trace_id = %created.trace_id,
-        policy_snapshot_id = %created.policy_snapshot_id,
-        principal_id = %principal_id,
-        "controller.gateway_session_created"
-    );
-
-    if created.budget != *budget {
-        return Err(json_error(
-            StatusCode::BAD_GATEWAY,
-            "ERR_INTERNAL",
-            "gateway returned mismatched budget".to_string(),
-            TerminalMode::SourceUnavailable,
-            false,
-        ));
+        Ok(CreatedSession {
+            session: created,
+            session_token,
+        })
     }
-
-    Ok(CreatedSession {
-        session: created,
-        session_token,
-    })
+    .instrument(span)
+    .await
 }
 
 #[derive(Debug, Serialize)]
@@ -345,10 +385,7 @@ struct FinalizeResponse {
 
 async fn finalize_session(
     state: &AppState,
-    principal_id: &str,
-    request_id: &str,
-    session_token: &str,
-    session_id: &str,
+    ctx: GatewayCallContext<'_>,
     response_text: String,
     claim_map: ClaimMap,
 ) -> Result<FinalizeResponse, (StatusCode, Json<ErrorResponse>)> {
@@ -359,11 +396,12 @@ async fn finalize_session(
     let response = state
         .http
         .post(url)
-        .header("x-pecr-principal-id", principal_id)
-        .header("x-pecr-request-id", request_id)
-        .header("x-pecr-session-token", session_token)
+        .header("x-pecr-principal-id", ctx.principal_id)
+        .header("x-pecr-request-id", ctx.request_id)
+        .header("x-pecr-trace-id", ctx.trace_id)
+        .header("x-pecr-session-token", ctx.session_token)
         .json(&FinalizeRequest {
-            session_id: session_id.to_string(),
+            session_id: ctx.session_id.to_string(),
             response_text,
             claim_map,
         })
@@ -389,7 +427,7 @@ async fn finalize_session(
         ));
     }
 
-    response.json::<FinalizeResponse>().await.map_err(|_| {
+    let finalized = response.json::<FinalizeResponse>().await.map_err(|_| {
         json_error(
             StatusCode::BAD_GATEWAY,
             "ERR_INTERNAL",
@@ -397,7 +435,19 @@ async fn finalize_session(
             TerminalMode::SourceUnavailable,
             false,
         )
-    })
+    })?;
+
+    if finalized.trace_id != ctx.trace_id {
+        return Err(json_error(
+            StatusCode::BAD_GATEWAY,
+            "ERR_INTERNAL",
+            "gateway returned mismatched trace_id".to_string(),
+            TerminalMode::SourceUnavailable,
+            false,
+        ));
+    }
+
+    Ok(finalized)
 }
 
 #[derive(Debug, Serialize)]
@@ -458,6 +508,7 @@ fn remaining_wallclock(budget: &Budget, started_at: Instant) -> Option<Duration>
 struct GatewayCallContext<'a> {
     principal_id: &'a str,
     request_id: &'a str,
+    trace_id: &'a str,
     session_token: &'a str,
     session_id: &'a str,
 }
@@ -469,107 +520,240 @@ async fn call_operator(
     params: serde_json::Value,
     timeout: Duration,
 ) -> Result<OperatorCallOutcome, (StatusCode, Json<ErrorResponse>)> {
-    let url = format!(
-        "{}/v1/operators/{}",
-        state.config.gateway_url.trim_end_matches('/'),
-        op_name
-    );
+    let params_bytes = serde_json::to_vec(&params)
+        .map(|v| v.len() as u64)
+        .unwrap_or(0);
 
-    let send_fut = async {
-        let response = state
-            .http
-            .post(url)
-            .header("x-pecr-principal-id", ctx.principal_id)
-            .header("x-pecr-request-id", ctx.request_id)
-            .header("x-pecr-session-token", ctx.session_token)
-            .json(&OperatorCallRequest {
-                session_id: ctx.session_id.to_string(),
-                params,
-            })
-            .send()
-            .await
-            .map_err(|_| {
+    let span = match op_name {
+        "search" => tracing::info_span!(
+            "operator.search",
+            trace_id = %ctx.trace_id,
+            request_id = %ctx.request_id,
+            session_id = %ctx.session_id,
+            principal_id = %ctx.principal_id,
+            operator_name = "search",
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            status_code = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        "fetch_span" => tracing::info_span!(
+            "operator.fetch_span",
+            trace_id = %ctx.trace_id,
+            request_id = %ctx.request_id,
+            session_id = %ctx.session_id,
+            principal_id = %ctx.principal_id,
+            operator_name = "fetch_span",
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            status_code = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        "fetch_rows" => tracing::info_span!(
+            "operator.fetch_rows",
+            trace_id = %ctx.trace_id,
+            request_id = %ctx.request_id,
+            session_id = %ctx.session_id,
+            principal_id = %ctx.principal_id,
+            operator_name = "fetch_rows",
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            status_code = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        "aggregate" => tracing::info_span!(
+            "operator.aggregate",
+            trace_id = %ctx.trace_id,
+            request_id = %ctx.request_id,
+            session_id = %ctx.session_id,
+            principal_id = %ctx.principal_id,
+            operator_name = "aggregate",
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            status_code = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        "list_versions" => tracing::info_span!(
+            "operator.list_versions",
+            trace_id = %ctx.trace_id,
+            request_id = %ctx.request_id,
+            session_id = %ctx.session_id,
+            principal_id = %ctx.principal_id,
+            operator_name = "list_versions",
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            status_code = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        "diff" => tracing::info_span!(
+            "operator.diff",
+            trace_id = %ctx.trace_id,
+            request_id = %ctx.request_id,
+            session_id = %ctx.session_id,
+            principal_id = %ctx.principal_id,
+            operator_name = "diff",
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            status_code = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        "redact" => tracing::info_span!(
+            "operator.redact",
+            trace_id = %ctx.trace_id,
+            request_id = %ctx.request_id,
+            session_id = %ctx.session_id,
+            principal_id = %ctx.principal_id,
+            operator_name = "redact",
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            status_code = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+        _ => tracing::info_span!(
+            "operator.unknown",
+            trace_id = %ctx.trace_id,
+            request_id = %ctx.request_id,
+            session_id = %ctx.session_id,
+            principal_id = %ctx.principal_id,
+            operator_name = %op_name,
+            params_bytes,
+            result_bytes = tracing::field::Empty,
+            status_code = tracing::field::Empty,
+            terminal_mode = tracing::field::Empty,
+            latency_ms = tracing::field::Empty,
+            outcome = tracing::field::Empty,
+        ),
+    };
+    let started = Instant::now();
+    async move {
+        let url = format!(
+            "{}/v1/operators/{}",
+            state.config.gateway_url.trim_end_matches('/'),
+            op_name
+        );
+
+        let send_fut = async {
+            let response = state
+                .http
+                .post(url)
+                .header("x-pecr-principal-id", ctx.principal_id)
+                .header("x-pecr-request-id", ctx.request_id)
+                .header("x-pecr-trace-id", ctx.trace_id)
+                .header("x-pecr-session-token", ctx.session_token)
+                .json(&OperatorCallRequest {
+                    session_id: ctx.session_id.to_string(),
+                    params,
+                })
+                .send()
+                .await
+                .map_err(|_| {
+                    json_error(
+                        StatusCode::BAD_GATEWAY,
+                        "ERR_SOURCE_UNAVAILABLE",
+                        "gateway request failed".to_string(),
+                        TerminalMode::SourceUnavailable,
+                        true,
+                    )
+                })?;
+
+            let status = response.status();
+            let bytes = response.bytes().await.map_err(|_| {
                 json_error(
                     StatusCode::BAD_GATEWAY,
                     "ERR_SOURCE_UNAVAILABLE",
-                    "gateway request failed".to_string(),
+                    "gateway response read failed".to_string(),
                     TerminalMode::SourceUnavailable,
                     true,
                 )
             })?;
 
-        let status = response.status();
-        let bytes = response.bytes().await.map_err(|_| {
-            json_error(
-                StatusCode::BAD_GATEWAY,
-                "ERR_SOURCE_UNAVAILABLE",
-                "gateway response read failed".to_string(),
-                TerminalMode::SourceUnavailable,
-                true,
-            )
-        })?;
+            Ok::<_, (StatusCode, Json<ErrorResponse>)>((status, bytes))
+        };
 
-        Ok::<_, (StatusCode, Json<ErrorResponse>)>((status, bytes))
-    };
+        let timed = tokio::time::timeout(timeout, send_fut).await;
+        let (status, bytes) = match timed {
+            Ok(res) => res?,
+            Err(_) => {
+                let latency_ms = started.elapsed().as_millis() as u64;
+                tracing::Span::current().record("latency_ms", latency_ms);
+                tracing::Span::current().record("outcome", "timeout");
+                return Ok(OperatorCallOutcome {
+                    terminal_mode_hint: TerminalMode::SourceUnavailable,
+                    body: None,
+                    bytes_len: 0,
+                });
+            }
+        };
 
-    let timed = tokio::time::timeout(timeout, send_fut).await;
-    let (status, bytes) = match timed {
-        Ok(res) => res?,
-        Err(_) => {
+        let bytes_len = bytes.len();
+        let status_code = status.as_u16();
+        let result_bytes = bytes_len as u64;
+        tracing::Span::current().record("status_code", status_code);
+        tracing::Span::current().record("result_bytes", result_bytes);
+
+        if status.is_success() {
+            let body = serde_json::from_slice::<OperatorCallResponse>(&bytes).map_err(|_| {
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "ERR_INTERNAL",
+                    "failed to parse gateway response".to_string(),
+                    TerminalMode::SourceUnavailable,
+                    false,
+                )
+            })?;
+
+            let terminal_mode = body.terminal_mode.as_str();
+            let latency_ms = started.elapsed().as_millis() as u64;
+            tracing::Span::current().record("terminal_mode", terminal_mode);
+            tracing::Span::current().record("latency_ms", latency_ms);
+            tracing::Span::current().record("outcome", "ok");
+
             return Ok(OperatorCallOutcome {
-                terminal_mode_hint: TerminalMode::SourceUnavailable,
-                body: None,
-                bytes_len: 0,
+                terminal_mode_hint: body.terminal_mode,
+                body: Some(body),
+                bytes_len,
             });
         }
-    };
 
-    let bytes_len = bytes.len();
+        let terminal_mode_hint = serde_json::from_slice::<GatewayErrorResponse>(&bytes)
+            .map_or(TerminalMode::SourceUnavailable, |e| e.terminal_mode_hint);
+        let terminal_mode = terminal_mode_hint.as_str();
+        let latency_ms = started.elapsed().as_millis() as u64;
+        tracing::Span::current().record("terminal_mode", terminal_mode);
+        tracing::Span::current().record("latency_ms", latency_ms);
+        tracing::Span::current().record("outcome", "error");
 
-    if status.is_success() {
-        let body = serde_json::from_slice::<OperatorCallResponse>(&bytes).map_err(|_| {
-            json_error(
-                StatusCode::BAD_GATEWAY,
-                "ERR_INTERNAL",
-                "failed to parse gateway response".to_string(),
-                TerminalMode::SourceUnavailable,
-                false,
-            )
-        })?;
-
-        return Ok(OperatorCallOutcome {
-            terminal_mode_hint: body.terminal_mode,
-            body: Some(body),
+        Ok(OperatorCallOutcome {
+            terminal_mode_hint,
+            body: None,
             bytes_len,
-        });
+        })
     }
-
-    let terminal_mode_hint = serde_json::from_slice::<GatewayErrorResponse>(&bytes)
-        .map_or(TerminalMode::SourceUnavailable, |e| e.terminal_mode_hint);
-
-    Ok(OperatorCallOutcome {
-        terminal_mode_hint,
-        body: None,
-        bytes_len,
-    })
+    .instrument(span)
+    .await
 }
 
 async fn run_context_loop(
     state: &AppState,
-    principal_id: &str,
-    request_id: &str,
-    session_token: &str,
-    session_id: &str,
+    ctx: GatewayCallContext<'_>,
     query: &str,
     budget: &Budget,
 ) -> Result<ContextLoopResult, (StatusCode, Json<ErrorResponse>)> {
     let loop_start = Instant::now();
-    let ctx = GatewayCallContext {
-        principal_id,
-        request_id,
-        session_token,
-        session_id,
-    };
 
     let mut terminal_mode = TerminalMode::InsufficientEvidence;
     let mut operator_calls_used: u32 = 0;
@@ -704,8 +888,10 @@ async fn run_context_loop(
     }
 
     tracing::info!(
-        request_id = %request_id,
-        principal_id = %principal_id,
+        request_id = %ctx.request_id,
+        trace_id = %ctx.trace_id,
+        principal_id = %ctx.principal_id,
+        session_id = %ctx.session_id,
         terminal_mode = %terminal_mode.as_str(),
         operator_calls_used,
         depth_used,
@@ -726,35 +912,20 @@ async fn run_context_loop(
 #[cfg(feature = "rlm")]
 async fn run_context_loop_rlm(
     state: &AppState,
-    principal_id: &str,
-    request_id: &str,
-    session_token: &str,
-    session_id: &str,
+    ctx: GatewayCallContext<'_>,
     query: &str,
     budget: &Budget,
 ) -> Result<ContextLoopResult, (StatusCode, Json<ErrorResponse>)> {
     tracing::warn!(
         "rlm engine selected; integration is vendored but not wired yet (delegating to baseline loop)"
     );
-    run_context_loop(
-        state,
-        principal_id,
-        request_id,
-        session_token,
-        session_id,
-        query,
-        budget,
-    )
-    .await
+    run_context_loop(state, ctx, query, budget).await
 }
 
 #[cfg(not(feature = "rlm"))]
 async fn run_context_loop_rlm(
     _state: &AppState,
-    _principal_id: &str,
-    _request_id: &str,
-    _session_token: &str,
-    _session_id: &str,
+    _ctx: GatewayCallContext<'_>,
     _query: &str,
     _budget: &Budget,
 ) -> Result<ContextLoopResult, (StatusCode, Json<ErrorResponse>)> {
@@ -794,6 +965,17 @@ fn extract_request_id(headers: &HeaderMap) -> String {
         .map(|v| v.trim())
         .filter(|v| !v.is_empty())
         .and_then(sanitize_request_id)
+        .unwrap_or_else(|| Ulid::new().to_string())
+}
+
+fn extract_trace_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-pecr-trace-id")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .and_then(|v| v.parse::<Ulid>().ok())
+        .map(|u| u.to_string())
         .unwrap_or_else(|| Ulid::new().to_string())
 }
 
@@ -968,17 +1150,16 @@ mod tests {
         };
 
         let state = controller_state(gateway_addr, budget.clone());
-        let result = run_context_loop(
-            &state,
-            "dev",
-            "req_test_calls",
-            "token",
-            "session",
-            "query",
-            &budget,
-        )
-        .await
-        .expect("context loop should succeed");
+        let ctx = GatewayCallContext {
+            principal_id: "dev",
+            request_id: "req_test_calls",
+            trace_id: "trace_test_calls",
+            session_token: "token",
+            session_id: "session",
+        };
+        let result = run_context_loop(&state, ctx, "query", &budget)
+            .await
+            .expect("context loop should succeed");
 
         shutdown.send(()).ok();
         let _ = task.await;
@@ -1001,17 +1182,16 @@ mod tests {
         };
 
         let state = controller_state(gateway_addr, budget.clone());
-        let result = run_context_loop(
-            &state,
-            "dev",
-            "req_test_depth",
-            "token",
-            "session",
-            "query",
-            &budget,
-        )
-        .await
-        .expect("context loop should succeed");
+        let ctx = GatewayCallContext {
+            principal_id: "dev",
+            request_id: "req_test_depth",
+            trace_id: "trace_test_depth",
+            session_token: "token",
+            session_id: "session",
+        };
+        let result = run_context_loop(&state, ctx, "query", &budget)
+            .await
+            .expect("context loop should succeed");
 
         shutdown.send(()).ok();
         let _ = task.await;
@@ -1035,17 +1215,16 @@ mod tests {
         };
 
         let state = controller_state(gateway_addr, budget.clone());
-        let result = run_context_loop(
-            &state,
-            "dev",
-            "req_test_wallclock",
-            "token",
-            "session",
-            "query",
-            &budget,
-        )
-        .await
-        .expect("context loop should succeed");
+        let ctx = GatewayCallContext {
+            principal_id: "dev",
+            request_id: "req_test_wallclock",
+            trace_id: "trace_test_wallclock",
+            session_token: "token",
+            session_id: "session",
+        };
+        let result = run_context_loop(&state, ctx, "query", &budget)
+            .await
+            .expect("context loop should succeed");
 
         shutdown.send(()).ok();
         let _ = task.await;
@@ -1069,17 +1248,16 @@ mod tests {
         };
 
         let state = controller_state(gateway_addr, budget.clone());
-        let result = run_context_loop(
-            &state,
-            "dev",
-            "req_test_plan",
-            "token",
-            "session",
-            "query",
-            &budget,
-        )
-        .await
-        .expect("context loop should succeed");
+        let ctx = GatewayCallContext {
+            principal_id: "dev",
+            request_id: "req_test_plan",
+            trace_id: "trace_test_plan",
+            session_token: "token",
+            session_id: "session",
+        };
+        let result = run_context_loop(&state, ctx, "query", &budget)
+            .await
+            .expect("context loop should succeed");
 
         shutdown.send(()).ok();
         let _ = task.await;
