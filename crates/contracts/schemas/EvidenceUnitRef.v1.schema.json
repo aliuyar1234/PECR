@@ -1,0 +1,12 @@
+{
+  "$id": "pecr.schemas.EvidenceUnitRef.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["evidence_unit_id", "source_system", "object_id", "version_id"],
+  "properties": {
+    "evidence_unit_id": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "source_system": { "type": "string", "minLength": 1 },
+    "object_id": { "type": "string", "minLength": 1 },
+    "version_id": { "type": "string", "minLength": 1 }
+  }
+}

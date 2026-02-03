@@ -1,0 +1,5 @@
+Restricted fixture document (restricted_1).
+
+This file simulates restricted content. It includes a unique canary string:
+PECR_CANARY_RESTRICTED_ALPHA_6b3b91c2a7b44a9f
+

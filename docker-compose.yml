@@ -1,0 +1,75 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: pecr
+      POSTGRES_PASSWORD: pecr
+      POSTGRES_DB: pecr
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pecr -d pecr"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d:ro
+
+  opa:
+    image: openpolicyagent/opa:latest
+    command:
+      [
+        "run",
+        "--server",
+        "--addr=0.0.0.0:8181",
+        "--bundle",
+        "/bundle",
+        "--log-format=json",
+      ]
+    volumes:
+      - ./opa/bundle:/bundle:ro
+
+  gateway:
+    build:
+      context: .
+      dockerfile: docker/gateway.Dockerfile
+    environment:
+      RUST_LOG: info
+      PECR_BIND_ADDR: 0.0.0.0:8080
+      PECR_DEV_ALLOW_NONLOCAL_BIND: "1"
+      PECR_DB_URL: postgres://pecr:pecr@postgres:5432/pecr
+      PECR_OPA_URL: http://opa:8181
+      PECR_POLICY_BUNDLE_HASH: a4dffeeec94957dbf4d56b4f0ee920204c44a16e125628d298b1fa03366d254f
+      PECR_CACHE_MAX_ENTRIES: "0"
+      PECR_CACHE_TTL_MS: "0"
+      PECR_EVIDENCE_PAYLOAD_STORE_MODE: metadata-only
+      PECR_AUTH_MODE: local
+      PECR_FS_CORPUS_PATH: /fixtures/fs_corpus
+      PECR_AS_OF_TIME_DEFAULT: "1970-01-01T00:00:00Z"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8080:8080"
+    volumes:
+      - ./fixtures:/fixtures:ro
+
+  controller:
+    build:
+      context: .
+      dockerfile: docker/controller.Dockerfile
+    environment:
+      RUST_LOG: info
+      PECR_CONTROLLER_BIND_ADDR: 0.0.0.0:8081
+      PECR_DEV_ALLOW_NONLOCAL_BIND: "1"
+      PECR_GATEWAY_URL: http://gateway:8080
+      PECR_MODEL_PROVIDER: mock
+      PECR_BUDGET_DEFAULTS: '{"max_operator_calls":10,"max_bytes":1048576,"max_wallclock_ms":10000,"max_recursion_depth":5,"max_parallelism":4}'
+      PECR_AUTH_MODE: local
+    depends_on:
+      gateway:
+        condition: service_started
+    ports:
+      - "127.0.0.1:8081:8081"
+
+volumes:
+  postgres_data:

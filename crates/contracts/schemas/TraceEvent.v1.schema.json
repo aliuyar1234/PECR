@@ -1,0 +1,13 @@
+{
+  "$id": "pecr.schemas.TraceEvent.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["trace_id", "event_type", "event_time", "payload_hash"],
+  "properties": {
+    "trace_id": { "type": "string" },
+    "event_type": { "type": "string" },
+    "event_time": { "type": "string" },
+    "payload_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "payload": {}
+  }
+}

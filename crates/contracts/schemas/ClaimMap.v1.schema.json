@@ -1,0 +1,14 @@
+{
+  "$id": "pecr.schemas.ClaimMap.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["claim_map_id", "terminal_mode", "claims", "coverage_threshold", "coverage_observed"],
+  "properties": {
+    "claim_map_id": { "type": "string" },
+    "terminal_mode": { "$ref": "pecr.schemas.TerminalMode.v1" },
+    "claims": { "type": "array", "items": { "$ref": "pecr.schemas.Claim.v1" } },
+    "coverage_threshold": { "type": "number", "minimum": 0, "maximum": 1 },
+    "coverage_observed": { "type": "number", "minimum": 0, "maximum": 1 },
+    "notes": { "type": "string" }
+  }
+}

@@ -1,0 +1,57 @@
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pecr
+          POSTGRES_PASSWORD: pecr
+          POSTGRES_DB: pecr
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pecr -d pecr"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.1
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Ensure scripts executable
+        shell: bash
+        run: chmod +x scripts/ci.sh
+
+      - name: CI checks (fmt/clippy/test)
+        shell: bash
+        env:
+          PECR_TEST_DB_URL: postgres://pecr:pecr@localhost:5432/pecr
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          ./scripts/ci.sh 2>&1 | tee artifacts/ci.log
+
+      - name: Upload CI artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-artifacts
+          path: artifacts
+          if-no-files-found: error

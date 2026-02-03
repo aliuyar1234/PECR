@@ -1,0 +1,11 @@
+[package]
+name = "pecr-ledger"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+sqlx = { version = "0.7", default-features = false, features = ["macros", "migrate", "postgres", "runtime-tokio"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+serde_json = "1"
+pecr-contracts = { path = "../contracts" }
+ulid = "1"

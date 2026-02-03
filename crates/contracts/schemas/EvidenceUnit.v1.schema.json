@@ -1,0 +1,46 @@
+{
+  "$id": "pecr.schemas.EvidenceUnit.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "source_system",
+    "object_id",
+    "version_id",
+    "span_or_row_spec",
+    "content_type",
+    "content_hash",
+    "retrieved_at",
+    "as_of_time",
+    "policy_snapshot_id",
+    "policy_snapshot_hash",
+    "transform_chain",
+    "evidence_unit_id"
+  ],
+  "properties": {
+    "source_system": { "type": "string", "minLength": 1 },
+    "object_id": { "type": "string", "minLength": 1 },
+    "version_id": { "type": "string", "minLength": 1 },
+    "span_or_row_spec": { "type": "object" },
+    "content_type": { "type": "string", "enum": ["text/plain", "application/json"] },
+    "content": {},
+    "content_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "retrieved_at": { "type": "string" },
+    "as_of_time": { "type": "string" },
+    "policy_snapshot_id": { "type": "string", "minLength": 1 },
+    "policy_snapshot_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "transform_chain": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["transform_type", "transform_hash"],
+        "properties": {
+          "transform_type": { "type": "string" },
+          "transform_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+          "params": {}
+        }
+      }
+    },
+    "evidence_unit_id": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+  }
+}

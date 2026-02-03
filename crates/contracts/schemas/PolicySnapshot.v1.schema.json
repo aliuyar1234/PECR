@@ -1,0 +1,29 @@
+{
+  "$id": "pecr.schemas.PolicySnapshot.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "policy_snapshot_hash",
+    "principal_id",
+    "tenant_id",
+    "principal_roles",
+    "principal_attrs_hash",
+    "policy_bundle_hash",
+    "as_of_time",
+    "evaluated_at"
+  ],
+  "properties": {
+    "policy_snapshot_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "principal_id": { "type": "string", "minLength": 1 },
+    "tenant_id": { "type": "string", "minLength": 1 },
+    "principal_roles": {
+      "type": "array",
+      "items": { "type": "string" },
+      "minItems": 0
+    },
+    "principal_attrs_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "policy_bundle_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "as_of_time": { "type": "string", "minLength": 1 },
+    "evaluated_at": { "type": "string", "minLength": 1 }
+  }
+}

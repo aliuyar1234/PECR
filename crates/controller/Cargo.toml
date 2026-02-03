@@ -1,0 +1,15 @@
+[package]
+name = "pecr-controller"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+pecr-contracts = { path = "../contracts" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+ulid = "1"

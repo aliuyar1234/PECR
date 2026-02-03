@@ -1,0 +1,4 @@
+Public fixture document (public_1).
+
+This file is safe to disclose. It is used to validate deterministic filesystem operators.
+

@@ -1,0 +1,20 @@
+[package]
+name = "pecr-gateway"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+axum = "0.8"
+pecr-contracts = { path = "../contracts" }
+pecr-ledger = { path = "../ledger" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+ulid = "1"
+sha2 = "0.10"
+hex = "0.4"
+sqlx = { version = "0.7", default-features = false, features = ["postgres", "runtime-tokio"] }
+similar = "2"

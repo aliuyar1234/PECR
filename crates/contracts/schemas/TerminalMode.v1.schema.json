@@ -1,0 +1,10 @@
+{
+  "$id": "pecr.schemas.TerminalMode.v1",
+  "type": "string",
+  "enum": [
+    "SUPPORTED",
+    "INSUFFICIENT_EVIDENCE",
+    "INSUFFICIENT_PERMISSION",
+    "SOURCE_UNAVAILABLE"
+  ]
+}

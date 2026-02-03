@@ -1,0 +1,187 @@
+use serde::{Deserialize, Serialize};
+
+pub mod canonical;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum TerminalMode {
+    Supported,
+    InsufficientEvidence,
+    InsufficientPermission,
+    SourceUnavailable,
+}
+
+impl TerminalMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            TerminalMode::Supported => "SUPPORTED",
+            TerminalMode::InsufficientEvidence => "INSUFFICIENT_EVIDENCE",
+            TerminalMode::InsufficientPermission => "INSUFFICIENT_PERMISSION",
+            TerminalMode::SourceUnavailable => "SOURCE_UNAVAILABLE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum EvidenceContentType {
+    #[serde(rename = "text/plain")]
+    TextPlain,
+    #[serde(rename = "application/json")]
+    ApplicationJson,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceUnitRef {
+    pub evidence_unit_id: String,
+    pub source_system: String,
+    pub object_id: String,
+    pub version_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TransformStep {
+    pub transform_type: String,
+    pub transform_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub params: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EvidenceUnit {
+    pub source_system: String,
+    pub object_id: String,
+    pub version_id: String,
+    pub span_or_row_spec: serde_json::Value,
+    pub content_type: EvidenceContentType,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<serde_json::Value>,
+    pub content_hash: String,
+    pub retrieved_at: String,
+    pub as_of_time: String,
+    pub policy_snapshot_id: String,
+    pub policy_snapshot_hash: String,
+    pub transform_chain: Vec<TransformStep>,
+    pub evidence_unit_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PolicySnapshot {
+    pub policy_snapshot_hash: String,
+    pub principal_id: String,
+    pub tenant_id: String,
+    pub principal_roles: Vec<String>,
+    pub principal_attrs_hash: String,
+    pub policy_bundle_hash: String,
+    pub as_of_time: String,
+    pub evaluated_at: String,
+}
+
+impl PolicySnapshot {
+    pub fn compute_hash(&self) -> String {
+        let mut roles = self.principal_roles.clone();
+        roles.sort();
+
+        canonical::hash_canonical_json(&serde_json::json!(
+            {
+                "principal_id": self.principal_id.clone(),
+                "tenant_id": self.tenant_id.clone(),
+                "principal_roles": roles,
+                "principal_attrs_hash": self.principal_attrs_hash.clone(),
+                "policy_bundle_hash": self.policy_bundle_hash.clone(),
+                "as_of_time": self.as_of_time.clone(),
+            }
+        ))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "SCREAMING_SNAKE_CASE")]
+pub enum ClaimStatus {
+    Supported,
+    Assumption,
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Claim {
+    pub claim_id: String,
+    pub claim_text: String,
+    pub status: ClaimStatus,
+    pub evidence_unit_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClaimMap {
+    pub claim_map_id: String,
+    pub terminal_mode: TerminalMode,
+    pub claims: Vec<Claim>,
+    pub coverage_threshold: f64,
+    pub coverage_observed: f64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub notes: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TraceEvent {
+    pub trace_id: String,
+    pub event_type: String,
+    pub event_time: String,
+    pub payload_hash: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Budget {
+    pub max_operator_calls: u32,
+    pub max_bytes: u64,
+    pub max_wallclock_ms: u64,
+    pub max_recursion_depth: u32,
+    #[serde(default)]
+    pub max_parallelism: Option<u32>,
+}
+
+impl Budget {
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_operator_calls > 10000 {
+            return Err("max_operator_calls out of range");
+        }
+        if self.max_recursion_depth > 20 {
+            return Err("max_recursion_depth out of range");
+        }
+        if let Some(max_parallelism) = self.max_parallelism
+            && !(1..=256).contains(&max_parallelism)
+        {
+            return Err("max_parallelism out of range");
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn policy_snapshot_hash_sorts_roles_and_ignores_evaluated_at() {
+        let a = PolicySnapshot {
+            policy_snapshot_hash: "unused".to_string(),
+            principal_id: "principal".to_string(),
+            tenant_id: "tenant".to_string(),
+            principal_roles: vec!["z".to_string(), "a".to_string()],
+            principal_attrs_hash:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            policy_bundle_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_string(),
+            as_of_time: "1970-01-01T00:00:00Z".to_string(),
+            evaluated_at: "2026-02-03T00:00:00Z".to_string(),
+        };
+
+        let mut b = a.clone();
+        b.principal_roles = vec!["a".to_string(), "z".to_string()];
+        b.evaluated_at = "2099-01-01T00:00:00Z".to_string();
+
+        assert_eq!(a.compute_hash(), b.compute_hash());
+    }
+}

@@ -1,0 +1,18 @@
+{
+  "$id": "pecr.schemas.Budget.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "max_operator_calls",
+    "max_bytes",
+    "max_wallclock_ms",
+    "max_recursion_depth"
+  ],
+  "properties": {
+    "max_operator_calls": { "type": "integer", "minimum": 0, "maximum": 10000 },
+    "max_bytes": { "type": "integer", "minimum": 0 },
+    "max_wallclock_ms": { "type": "integer", "minimum": 0 },
+    "max_recursion_depth": { "type": "integer", "minimum": 0, "maximum": 20 },
+    "max_parallelism": { "type": "integer", "minimum": 1, "maximum": 256 }
+  }
+}
