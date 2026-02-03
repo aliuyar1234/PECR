@@ -1,5 +1,6 @@
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pecr_contracts::canonical;
@@ -27,12 +28,26 @@ pub fn router(config: ControllerConfig) -> Router {
 
     Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .route("/v1/run", post(run))
         .with_state(state)
 }
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+async fn metrics() -> impl IntoResponse {
+    match crate::metrics::render() {
+        Ok((body, content_type)) => {
+            let mut headers = HeaderMap::new();
+            if let Ok(value) = HeaderValue::from_str(content_type.as_str()) {
+                headers.insert(header::CONTENT_TYPE, value);
+            }
+            (headers, body).into_response()
+        }
+        Err(_) => StatusCode::INTERNAL_SERVER_ERROR.into_response(),
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -55,6 +70,7 @@ async fn run(
     headers: HeaderMap,
     Json(req): Json<RunRequest>,
 ) -> Result<Json<RunResponse>, (StatusCode, Json<ErrorResponse>)> {
+    let request_started = Instant::now();
     let principal_id = extract_principal_id(&headers)?;
     let request_id = extract_request_id(&headers);
     let trace_id = extract_trace_id(&headers);
@@ -79,7 +95,7 @@ async fn run(
         request_id = %request_id,
         principal_id = %principal_id
     );
-    async move {
+    let handler_result = async move {
         let session =
             create_session(&state, &principal_id, &request_id, &trace_id, &budget).await?;
 
@@ -131,7 +147,28 @@ async fn run(
         }))
     }
     .instrument(span)
-    .await
+    .await;
+
+    let status = match &handler_result {
+        Ok(_) => StatusCode::OK,
+        Err((status, _)) => *status,
+    };
+    crate::metrics::observe_http_request(
+        "/v1/run",
+        "POST",
+        status.as_u16(),
+        request_started.elapsed(),
+    );
+    match &handler_result {
+        Ok(Json(body)) => {
+            crate::metrics::observe_terminal_mode("/v1/run", body.terminal_mode.as_str())
+        }
+        Err((_, Json(err))) => {
+            crate::metrics::observe_terminal_mode("/v1/run", err.terminal_mode_hint.as_str())
+        }
+    }
+
+    handler_result
 }
 
 fn response_text_for_terminal_mode(terminal_mode: TerminalMode) -> String {
@@ -765,6 +802,7 @@ async fn run_context_loop(
     let mut search_refs = Vec::<EvidenceUnitRef>::new();
 
     for depth in 0..budget.max_recursion_depth {
+        crate::metrics::inc_loop_iteration();
         if operator_calls_used >= budget.max_operator_calls {
             break;
         }
