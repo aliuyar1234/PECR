@@ -15,6 +15,7 @@ SER_THRESHOLD="${SER_THRESHOLD:-0.01}"
 OUT_DIR="target/perf"
 
 mkdir -p "$OUT_DIR"
+chmod 777 "$OUT_DIR"
 
 if [[ "${COLD_START:-0}" == "1" ]]; then
   docker compose down -v
