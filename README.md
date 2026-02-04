@@ -118,6 +118,21 @@ Controller (minimum):
 - `PECR_MODEL_PROVIDER` (use `mock`)
 - `PECR_BUDGET_DEFAULTS` (Budget JSON)
 
+### RLM controller engine (experimental)
+
+The controller can run an **RLM-style** planner loop behind a feature flag. This is **not** a trust boundary: it can only obtain evidence via policy-enforced operator calls.
+
+Enable it:
+- Build `pecr-controller` with feature `rlm` (the docker compose controller image does this by default).
+- Set:
+  - `PECR_CONTROLLER_ENGINE=rlm`
+  - `PECR_RLM_SANDBOX_ACK=1`
+
+Runtime knobs:
+- `PECR_RLM_BACKEND` (default: `mock`; currently only `mock` is implemented)
+- `PECR_RLM_PYTHON` (override Python executable; defaults to `python3` on Linux, `python` on Windows)
+- `PECR_RLM_SCRIPT_PATH` (override bridge script path; default search includes `scripts/rlm/pecr_rlm_bridge.py` and `/usr/local/share/pecr/pecr_rlm_bridge.py`)
+
 For the full set of env vars and defaults, see:
 - `crates/gateway/src/config.rs`
 - `crates/controller/src/config.rs`
