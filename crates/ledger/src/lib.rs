@@ -193,7 +193,7 @@ impl LedgerWriter {
         tokio::time::timeout(
             self.write_timeout,
             sqlx::query(
-                "INSERT INTO pecr_evidence_units (evidence_unit_id, trace_id, session_id, source_system, object_id, version_id, span_or_row_spec_json, content_type, content_hash, as_of_time, retrieved_at, policy_snapshot_id, policy_snapshot_hash, transform_chain_json, payload_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::timestamptz,$11::timestamptz,$12,$13,$14,$15)",
+                "INSERT INTO pecr_evidence_units (evidence_unit_id, trace_id, session_id, source_system, object_id, version_id, span_or_row_spec_json, content_type, content_hash, as_of_time, retrieved_at, policy_snapshot_id, policy_snapshot_hash, transform_chain_json, payload_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::timestamptz,$11::timestamptz,$12,$13,$14,$15) ON CONFLICT (evidence_unit_id) DO NOTHING",
             )
             .bind(&evidence.evidence_unit_id)
             .bind(trace_id)
