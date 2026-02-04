@@ -36,6 +36,21 @@ wait_for_postgres() {
   return 1
 }
 
+wait_for_http() {
+  local name="$1"
+  local url="$2"
+  local deadline
+  deadline=$((SECONDS + 60))
+  while ((SECONDS < deadline)); do
+    if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
+      return 0
+    fi
+    sleep 1
+  done
+  echo "${name} did not become ready in time (${url})" >&2
+  return 1
+}
+
 ensure_safeview_fixtures() {
   docker compose exec -T postgres psql -U pecr -d pecr -f /docker-entrypoint-initdb.d/002_safeview_fixtures.sql >/dev/null
 }
@@ -94,6 +109,8 @@ run_k6_gateway_safeview_timeout() {
 
 wait_for_postgres
 ensure_safeview_fixtures
+wait_for_http "gateway" "http://127.0.0.1:8080/healthz"
+wait_for_http "controller" "http://127.0.0.1:8081/healthz"
 
 echo "[suite7] baseline (p99 budget ${P99_BUDGET_MS}ms; vus=${BASELINE_VUS}; duration=${BASELINE_DURATION})"
 scrape_metrics "http://127.0.0.1:8080/metrics" "${OUT_DIR}/metrics_gateway.before.prom"
