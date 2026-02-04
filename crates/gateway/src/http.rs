@@ -1786,6 +1786,12 @@ impl FsVersionCache {
         let observed = self.observed_versions.get(object_id)?;
         let object_entry = self.entries.get(object_id)?;
 
+        if let Some((latest_as_of_time, _)) = observed.last_key_value()
+            && as_of_time > latest_as_of_time.as_str()
+        {
+            return None;
+        }
+
         observed
             .range(..=as_of_time.to_string())
             .rev()
