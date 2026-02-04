@@ -222,7 +222,7 @@ async fn smoke_controller_creates_session_calls_operator_and_finalizes() {
         .post(format!("http://{}/v1/sessions", gateway_addr))
         .header("x-pecr-principal-id", "dev")
         .header("x-pecr-request-id", &request_id)
-        .json(&serde_json::json!({"budget":{"max_operator_calls":10,"max_bytes":1024,"max_wallclock_ms":1000,"max_recursion_depth":3}}))
+        .json(&serde_json::json!({"budget":{"max_operator_calls":10,"max_bytes":1048576,"max_wallclock_ms":1000,"max_recursion_depth":3}}))
         .send()
         .await
         .expect("gateway session request should succeed");
@@ -1551,11 +1551,17 @@ async fn staleness_suite_as_of_selects_fs_snapshot() {
         .send()
         .await
         .expect("fetch_span v1 again request should succeed");
-    assert!(fetch_v1_again.status().is_success());
+    let fetch_v1_again_status = fetch_v1_again.status();
     let fetch_v1_again_body = fetch_v1_again
         .json::<serde_json::Value>()
         .await
         .expect("fetch_span v1 again response should be JSON");
+    assert!(
+        fetch_v1_again_status.is_success(),
+        "fetch_span v1 again unexpected status {}; body: {}",
+        fetch_v1_again_status,
+        fetch_v1_again_body
+    );
     assert_eq!(
         fetch_v1_again_body
             .pointer("/result/version_id")
@@ -1699,7 +1705,7 @@ async fn staleness_suite_as_of_selects_pg_snapshot() {
         .await
         .expect("schema should be reachable for updates");
     sqlx::query(
-        "UPDATE pecr_fixture_customers SET status = $1, updated_at = $2 WHERE tenant_id = 'local' AND customer_id = 'cust_public_1'",
+        "UPDATE pecr_fixture_customers SET status = $1, updated_at = $2::timestamptz WHERE tenant_id = 'local' AND customer_id = 'cust_public_1'",
     )
     .bind(&v2_marker)
     .bind(t2)
@@ -1769,11 +1775,17 @@ async fn staleness_suite_as_of_selects_pg_snapshot() {
         .send()
         .await
         .expect("fetch_rows v1 again request should succeed");
-    assert!(fetch_v1_again.status().is_success());
+    let fetch_v1_again_status = fetch_v1_again.status();
     let fetch_v1_again_body = fetch_v1_again
         .json::<serde_json::Value>()
         .await
         .expect("fetch_rows v1 again response should be JSON");
+    assert!(
+        fetch_v1_again_status.is_success(),
+        "fetch_rows v1 again unexpected status {}; body: {}",
+        fetch_v1_again_status,
+        fetch_v1_again_body
+    );
     assert_eq!(
         fetch_v1_again_body
             .pointer("/result/0/version_id")
@@ -2667,7 +2679,7 @@ async fn gateway_create_session_at(
     let mut body = serde_json::json!({
         "budget": {
             "max_operator_calls": 10,
-            "max_bytes": 1024,
+            "max_bytes": 1048576,
             "max_wallclock_ms": 1000,
             "max_recursion_depth": 3
         }
