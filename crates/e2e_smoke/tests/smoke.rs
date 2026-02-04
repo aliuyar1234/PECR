@@ -2693,21 +2693,38 @@ async fn gateway_create_session_at(
             );
     }
 
-    let response = client
-        .post(format!("http://{}/v1/sessions", gateway_addr))
-        .header("x-pecr-principal-id", principal_id)
-        .header("x-pecr-request-id", request_id)
-        .json(&body)
-        .send()
-        .await
-        .expect("gateway session request should succeed");
+    let response = {
+        let mut attempt: u32 = 0;
+        loop {
+            let response = client
+                .post(format!("http://{}/v1/sessions", gateway_addr))
+                .header("x-pecr-principal-id", principal_id)
+                .header("x-pecr-request-id", request_id)
+                .json(&body)
+                .send()
+                .await
+                .expect("gateway session request should succeed");
 
-    assert!(
-        response.status().is_success(),
-        "expected gateway session 2xx for principal {}, got {}",
-        principal_id,
-        response.status()
-    );
+            if response.status().is_success() {
+                break response;
+            }
+
+            // Gateway /healthz is intentionally shallow; the first authz/ledger call can race
+            // startup in CI. Retry a few times on transient 503s to deflake the suites.
+            let status = response.status();
+            let body_text = response.text().await.unwrap_or_default();
+            if status == StatusCode::SERVICE_UNAVAILABLE && attempt < 10 {
+                attempt += 1;
+                tokio::time::sleep(Duration::from_millis(50 * attempt as u64)).await;
+                continue;
+            }
+
+            panic!(
+                "expected gateway session 2xx for principal {}, got {} (body={})",
+                principal_id, status, body_text
+            );
+        }
+    };
 
     let session_token = response
         .headers()
