@@ -48,7 +48,26 @@ docker compose up -d
 
 Postgres is exposed as `127.0.0.1:${PECR_POSTGRES_PORT:-55432}` (override with `PECR_POSTGRES_PORT` before `docker compose up`).
 
-### 2) Run the same checks CI runs
+### 2) Send a smoke request (via controller)
+
+```bash
+curl -sS -X POST http://127.0.0.1:8081/v1/run \
+  -H 'content-type: application/json' \
+  -H 'x-pecr-principal-id: dev' \
+  -H 'x-pecr-request-id: demo' \
+  -d '{"query":"smoke"}'
+```
+
+PowerShell:
+```powershell
+curl.exe -sS -X POST "http://127.0.0.1:8081/v1/run" `
+  -H "content-type: application/json" `
+  -H "x-pecr-principal-id: dev" `
+  -H "x-pecr-request-id: demo" `
+  -d "{\"query\":\"smoke\"}"
+```
+
+### 3) Run the same checks CI runs
 
 ```bash
 PECR_TEST_DB_URL=postgres://pecr:pecr@localhost:55432/pecr bash scripts/ci.sh
@@ -60,7 +79,7 @@ $env:PECR_TEST_DB_URL = "postgres://pecr:pecr@localhost:55432/pecr"
 bash scripts/ci.sh
 ```
 
-### 3) Run the performance + fault injection suite (Suite 7)
+### 4) Run the performance + fault injection suite (Suite 7)
 
 ```bash
 bash scripts/perf/suite7.sh
@@ -83,6 +102,25 @@ Controller:
 - `GET /healthz`
 - `GET /metrics`
 - `POST /v1/run`
+
+## Configuration (Quick Reference)
+
+Config is loaded from the environment, optionally merged with `PECR_CONFIG_PATH` (a `KEY=VALUE` file).
+
+Gateway (minimum):
+- `PECR_DB_URL`
+- `PECR_OPA_URL`
+- `PECR_POLICY_BUNDLE_HASH` (64 lowercase hex chars)
+- `PECR_FS_CORPUS_PATH` (defaults to `fixtures/fs_corpus`)
+
+Controller (minimum):
+- `PECR_GATEWAY_URL`
+- `PECR_MODEL_PROVIDER` (use `mock`)
+- `PECR_BUDGET_DEFAULTS` (Budget JSON)
+
+For the full set of env vars and defaults, see:
+- `crates/gateway/src/config.rs`
+- `crates/controller/src/config.rs`
 
 ## Authentication Modes
 
@@ -129,6 +167,11 @@ There are two ways to apply redaction:
 - JSON logs via `tracing` (no raw evidence payloads by default; suites verify canaries do not leak).
 - Prometheus metrics on `/metrics`.
 - Optional OTLP traces: set `PECR_OTEL_ENABLED=1` and configure your collector using standard `OTEL_*` environment variables.
+
+## Quality Gates
+
+- `bash scripts/ci.sh`: formatting, clippy, boundary fitness check, and the full test suite.
+- `bash scripts/perf/suite7.sh`: k6-based p99 run + fault injection + BVR/SER checks and perf regression comparison.
 
 ## Repository Layout
 
