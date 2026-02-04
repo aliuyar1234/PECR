@@ -3,6 +3,7 @@ use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
+use pecr_auth::{OidcAuthenticator, Principal};
 use pecr_contracts::canonical;
 use pecr_contracts::{
     Budget, Claim, ClaimMap, ClaimStatus, EvidenceUnit, EvidenceUnitRef, TerminalMode,
@@ -12,25 +13,47 @@ use std::time::{Duration, Instant};
 use tracing::Instrument;
 use ulid::Ulid;
 
-use crate::config::{ControllerConfig, ControllerEngine};
+use crate::config::{AuthMode, ControllerConfig, ControllerEngine, StartupError};
 
 #[derive(Clone)]
 pub struct AppState {
     config: ControllerConfig,
     http: reqwest::Client,
+    oidc: Option<OidcAuthenticator>,
 }
 
-pub fn router(config: ControllerConfig) -> Router {
+type ApiError = (StatusCode, Json<ErrorResponse>);
+
+pub async fn router(config: ControllerConfig) -> Result<Router, StartupError> {
+    let oidc = if config.auth_mode == AuthMode::Oidc {
+        let oidc_config = config.oidc.clone().ok_or_else(|| StartupError {
+            code: "ERR_INVALID_CONFIG",
+            message: "oidc auth mode requires oidc config".to_string(),
+        })?;
+
+        Some(
+            OidcAuthenticator::new(oidc_config)
+                .await
+                .map_err(|err| StartupError {
+                    code: err.code,
+                    message: err.message,
+                })?,
+        )
+    } else {
+        None
+    };
+
     let state = AppState {
         config,
         http: reqwest::Client::new(),
+        oidc,
     };
 
-    Router::new()
+    Ok(Router::new()
         .route("/healthz", get(healthz))
         .route("/metrics", get(metrics))
         .route("/v1/run", post(run))
-        .with_state(state)
+        .with_state(state))
 }
 
 async fn healthz() -> &'static str {
@@ -71,9 +94,13 @@ async fn run(
     Json(req): Json<RunRequest>,
 ) -> Result<Json<RunResponse>, (StatusCode, Json<ErrorResponse>)> {
     let request_started = Instant::now();
-    let principal_id = extract_principal_id(&headers)?;
+    let principal = extract_principal(&state, &headers).await?;
+    let principal_id = principal.principal_id.clone();
     let request_id = extract_request_id(&headers);
     let trace_id = extract_trace_id(&headers);
+    let authz_header = (state.config.auth_mode == AuthMode::Oidc)
+        .then(|| extract_authorization_header(&headers))
+        .flatten();
     let budget = req
         .budget
         .unwrap_or_else(|| state.config.budget_defaults.clone());
@@ -96,11 +123,19 @@ async fn run(
         principal_id = %principal_id
     );
     let handler_result = async move {
-        let session =
-            create_session(&state, &principal_id, &request_id, &trace_id, &budget).await?;
+        let session = create_session(
+            &state,
+            &principal_id,
+            &request_id,
+            &trace_id,
+            authz_header.as_deref(),
+            &budget,
+        )
+        .await?;
 
         let ctx = GatewayCallContext {
             principal_id: &principal_id,
+            authz_header: authz_header.as_deref(),
             request_id: &request_id,
             trace_id: &trace_id,
             session_token: &session.session_token,
@@ -283,6 +318,7 @@ async fn create_session(
     principal_id: &str,
     request_id: &str,
     trace_id: &str,
+    authz_header: Option<&str>,
     budget: &Budget,
 ) -> Result<CreatedSession, (StatusCode, Json<ErrorResponse>)> {
     let span = tracing::info_span!(
@@ -301,12 +337,13 @@ async fn create_session(
             "{}/v1/sessions",
             state.config.gateway_url.trim_end_matches('/')
         );
-        let response = state
+        let builder = state
             .http
             .post(url)
-            .header("x-pecr-principal-id", principal_id)
             .header("x-pecr-request-id", request_id)
-            .header("x-pecr-trace-id", trace_id)
+            .header("x-pecr-trace-id", trace_id);
+
+        let response = apply_gateway_auth(builder, principal_id, authz_header)
             .json(&CreateSessionRequest {
                 budget: budget.clone(),
             })
@@ -430,13 +467,14 @@ async fn finalize_session(
         "{}/v1/finalize",
         state.config.gateway_url.trim_end_matches('/')
     );
-    let response = state
+    let builder = state
         .http
         .post(url)
-        .header("x-pecr-principal-id", ctx.principal_id)
         .header("x-pecr-request-id", ctx.request_id)
         .header("x-pecr-trace-id", ctx.trace_id)
-        .header("x-pecr-session-token", ctx.session_token)
+        .header("x-pecr-session-token", ctx.session_token);
+
+    let response = apply_gateway_auth(builder, ctx.principal_id, ctx.authz_header)
         .json(&FinalizeRequest {
             session_id: ctx.session_id.to_string(),
             response_text,
@@ -544,6 +582,7 @@ fn remaining_wallclock(budget: &Budget, started_at: Instant) -> Option<Duration>
 #[derive(Clone, Copy)]
 struct GatewayCallContext<'a> {
     principal_id: &'a str,
+    authz_header: Option<&'a str>,
     request_id: &'a str,
     trace_id: &'a str,
     session_token: &'a str,
@@ -684,13 +723,14 @@ async fn call_operator(
         );
 
         let send_fut = async {
-            let response = state
+            let builder = state
                 .http
                 .post(url)
-                .header("x-pecr-principal-id", ctx.principal_id)
                 .header("x-pecr-request-id", ctx.request_id)
                 .header("x-pecr-trace-id", ctx.trace_id)
-                .header("x-pecr-session-token", ctx.session_token)
+                .header("x-pecr-session-token", ctx.session_token);
+
+            let response = apply_gateway_auth(builder, ctx.principal_id, ctx.authz_header)
                 .json(&OperatorCallRequest {
                     session_id: ctx.session_id.to_string(),
                     params,
@@ -1005,6 +1045,77 @@ async fn run_context_loop_rlm(
     ))
 }
 
+fn extract_authorization_header(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+}
+
+async fn extract_principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, ApiError> {
+    match state.config.auth_mode {
+        AuthMode::Local => {
+            let principal_id = extract_principal_id(headers)?;
+            Ok(Principal {
+                principal_id,
+                tenant_id: "local".to_string(),
+                principal_roles: Vec::new(),
+                principal_attrs_hash: canonical::hash_canonical_json(&serde_json::json!({})),
+            })
+        }
+        AuthMode::Oidc => {
+            let Some(auth) = state.oidc.as_ref() else {
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ERR_INTERNAL",
+                    "oidc authenticator is not initialized".to_string(),
+                    TerminalMode::SourceUnavailable,
+                    false,
+                ));
+            };
+
+            auth.authenticate(headers)
+                .await
+                .map_err(|err| match err.code {
+                    "ERR_AUTH_UNAVAILABLE" => json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        err.code,
+                        err.message,
+                        TerminalMode::SourceUnavailable,
+                        true,
+                    ),
+                    "ERR_AUTH_REQUIRED" | "ERR_AUTH_INVALID" => json_error(
+                        StatusCode::UNAUTHORIZED,
+                        err.code,
+                        err.message,
+                        TerminalMode::InsufficientPermission,
+                        false,
+                    ),
+                    _ => json_error(
+                        StatusCode::UNAUTHORIZED,
+                        err.code,
+                        err.message,
+                        TerminalMode::InsufficientPermission,
+                        false,
+                    ),
+                })
+        }
+    }
+}
+
+fn apply_gateway_auth(
+    builder: reqwest::RequestBuilder,
+    principal_id: &str,
+    authz_header: Option<&str>,
+) -> reqwest::RequestBuilder {
+    match authz_header {
+        Some(authz_header) => builder.header(reqwest::header::AUTHORIZATION, authz_header),
+        None => builder.header("x-pecr-principal-id", principal_id),
+    }
+}
+
 fn extract_principal_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     let principal_id = headers
         .get("x-pecr-principal-id")
@@ -1198,8 +1309,10 @@ mod tests {
                 model_provider: crate::config::ModelProvider::Mock,
                 budget_defaults: budget,
                 auth_mode: crate::config::AuthMode::Local,
+                oidc: None,
             },
             http: reqwest::Client::new(),
+            oidc: None,
         }
     }
 
@@ -1219,6 +1332,7 @@ mod tests {
         let state = controller_state(gateway_addr, budget.clone());
         let ctx = GatewayCallContext {
             principal_id: "dev",
+            authz_header: None,
             request_id: "req_test_calls",
             trace_id: "trace_test_calls",
             session_token: "token",
@@ -1251,6 +1365,7 @@ mod tests {
         let state = controller_state(gateway_addr, budget.clone());
         let ctx = GatewayCallContext {
             principal_id: "dev",
+            authz_header: None,
             request_id: "req_test_depth",
             trace_id: "trace_test_depth",
             session_token: "token",
@@ -1284,6 +1399,7 @@ mod tests {
         let state = controller_state(gateway_addr, budget.clone());
         let ctx = GatewayCallContext {
             principal_id: "dev",
+            authz_header: None,
             request_id: "req_test_wallclock",
             trace_id: "trace_test_wallclock",
             session_token: "token",
@@ -1317,6 +1433,7 @@ mod tests {
         let state = controller_state(gateway_addr, budget.clone());
         let ctx = GatewayCallContext {
             principal_id: "dev",
+            authz_header: None,
             request_id: "req_test_plan",
             trace_id: "trace_test_plan",
             session_token: "token",

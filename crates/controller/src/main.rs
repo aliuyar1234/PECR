@@ -14,7 +14,13 @@ async fn main() {
         }
     };
 
-    let app = http::router(config.clone());
+    let app = match http::router(config.clone()).await {
+        Ok(app) => app,
+        Err(err) => {
+            eprintln!("STARTUP_ERROR {}", err);
+            std::process::exit(1);
+        }
+    };
 
     let listener = match tokio::net::TcpListener::bind(config.bind_addr).await {
         Ok(listener) => listener,

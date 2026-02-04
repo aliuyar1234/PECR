@@ -176,8 +176,12 @@ async fn smoke_controller_creates_session_calls_operator_and_finalizes() {
     ]))
     .expect("controller config should be valid");
 
-    let (controller_addr, controller_shutdown, controller_task) =
-        spawn_server(pecr_controller::http::router(controller_config)).await;
+    let (controller_addr, controller_shutdown, controller_task) = spawn_server(
+        pecr_controller::http::router(controller_config)
+            .await
+            .expect("controller router should init"),
+    )
+    .await;
 
     let client = reqwest::Client::new();
     wait_for_healthz(&client, controller_addr).await;
@@ -2340,8 +2344,12 @@ async fn observability_coverage_suite_required_signals_exist() {
     ]))
     .expect("controller config should be valid");
 
-    let (controller_addr, controller_shutdown, controller_task) =
-        spawn_server(pecr_controller::http::router(controller_config)).await;
+    let (controller_addr, controller_shutdown, controller_task) = spawn_server(
+        pecr_controller::http::router(controller_config)
+            .await
+            .expect("controller router should init"),
+    )
+    .await;
 
     let client = reqwest::Client::new();
     wait_for_healthz(&client, gateway_addr).await;

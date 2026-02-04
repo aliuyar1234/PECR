@@ -12,6 +12,7 @@ use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use hex::ToHex;
+use pecr_auth::{OidcAuthenticator, Principal};
 use pecr_contracts::canonical;
 use pecr_contracts::{
     Budget, ClaimMap, ClaimStatus, EvidenceUnitRef, PolicySnapshot, TerminalMode,
@@ -25,13 +26,14 @@ use tokio::sync::RwLock;
 use tracing::Instrument;
 use ulid::Ulid;
 
-use crate::config::{GatewayConfig, StartupError};
+use crate::config::{AuthMode, GatewayConfig, StartupError};
 use crate::opa::{OpaCacheKey, OpaClient};
 use crate::operator_cache::{OperatorCache, OperatorCacheKey};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: GatewayConfig,
+    oidc: Option<OidcAuthenticator>,
     ledger: LedgerWriter,
     opa: OpaClient,
     operator_cache: OperatorCache,
@@ -63,6 +65,24 @@ struct Session {
 }
 
 pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
+    let oidc = if config.auth_mode == AuthMode::Oidc {
+        let oidc_config = config.oidc.clone().ok_or_else(|| StartupError {
+            code: "ERR_INVALID_CONFIG",
+            message: "oidc auth mode requires oidc config".to_string(),
+        })?;
+
+        Some(
+            OidcAuthenticator::new(oidc_config)
+                .await
+                .map_err(|err| StartupError {
+                    code: err.code,
+                    message: err.message,
+                })?,
+        )
+    } else {
+        None
+    };
+
     let ledger = LedgerWriter::connect_and_migrate(
         &config.db_url,
         Duration::from_millis(config.ledger_write_timeout_ms),
@@ -108,6 +128,7 @@ pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
 
     let state = AppState {
         config,
+        oidc,
         ledger,
         opa,
         operator_cache,
@@ -164,7 +185,8 @@ async fn create_session(
     headers: HeaderMap,
     req: Result<Json<CreateSessionRequest>, JsonRejection>,
 ) -> Result<(HeaderMap, Json<CreateSessionResponse>), (StatusCode, Json<ErrorResponse>)> {
-    let principal_id = extract_principal_id(&headers)?;
+    let principal = extract_principal(&state, &headers).await?;
+    let principal_id = principal.principal_id.clone();
     let request_id = extract_request_id(&headers);
     let trace_id = extract_trace_id(&headers);
 
@@ -226,9 +248,9 @@ async fn create_session(
         let mut policy_snapshot = PolicySnapshot {
             policy_snapshot_hash: String::new(),
             principal_id: principal_id.clone(),
-            tenant_id: "local".to_string(),
-            principal_roles: Vec::new(),
-            principal_attrs_hash: canonical::hash_canonical_json(&serde_json::json!({})),
+            tenant_id: principal.tenant_id.clone(),
+            principal_roles: principal.principal_roles.clone(),
+            principal_attrs_hash: principal.principal_attrs_hash.clone(),
             policy_bundle_hash: state.config.policy_bundle_hash.clone(),
             as_of_time: as_of_time.clone(),
             evaluated_at: as_of_time.clone(),
@@ -445,7 +467,8 @@ async fn call_operator(
     let op_name_for_metrics = op_name.clone();
 
     let handler_result = (async move {
-        let principal_id = extract_principal_id(&headers)?;
+        let principal = extract_principal(&state, &headers).await?;
+        let principal_id = principal.principal_id.clone();
         let request_id = extract_request_id(&headers);
         let session_token = extract_session_token(&headers)?;
 
@@ -3304,7 +3327,8 @@ async fn finalize(
     let request_started = Instant::now();
 
     let handler_result = (async move {
-        let principal_id = extract_principal_id(&headers)?;
+        let principal = extract_principal(&state, &headers).await?;
+        let principal_id = principal.principal_id.clone();
         let request_id = extract_request_id(&headers);
         let session_token = extract_session_token(&headers)?;
 
@@ -3620,6 +3644,57 @@ async fn finalize(
     }
 
     handler_result
+}
+
+async fn extract_principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, ApiError> {
+    match state.config.auth_mode {
+        AuthMode::Local => {
+            let principal_id = extract_principal_id(headers)?;
+            Ok(Principal {
+                principal_id,
+                tenant_id: "local".to_string(),
+                principal_roles: Vec::new(),
+                principal_attrs_hash: canonical::hash_canonical_json(&serde_json::json!({})),
+            })
+        }
+        AuthMode::Oidc => {
+            let Some(auth) = state.oidc.as_ref() else {
+                return Err(json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ERR_INTERNAL",
+                    "oidc authenticator is not initialized".to_string(),
+                    TerminalMode::SourceUnavailable,
+                    false,
+                ));
+            };
+
+            auth.authenticate(headers)
+                .await
+                .map_err(|err| match err.code {
+                    "ERR_AUTH_UNAVAILABLE" => json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        err.code,
+                        err.message,
+                        TerminalMode::SourceUnavailable,
+                        true,
+                    ),
+                    "ERR_AUTH_REQUIRED" | "ERR_AUTH_INVALID" => json_error(
+                        StatusCode::UNAUTHORIZED,
+                        err.code,
+                        err.message,
+                        TerminalMode::InsufficientPermission,
+                        false,
+                    ),
+                    _ => json_error(
+                        StatusCode::UNAUTHORIZED,
+                        err.code,
+                        err.message,
+                        TerminalMode::InsufficientPermission,
+                        false,
+                    ),
+                })
+        }
+    }
 }
 
 fn extract_principal_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
