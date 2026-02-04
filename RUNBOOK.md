@@ -36,7 +36,19 @@ Default docker compose uses `PECR_AUTH_MODE=local`.
 
 OIDC mode (RS256 / JWKS) is available in both gateway and controller:
 - Set `PECR_AUTH_MODE=oidc`
-- Configure `PECR_OIDC_*` in each service (issuer + JWKS + claim mapping)
+- Configure `PECR_OIDC_*` in each service:
+  - Required:
+    - `PECR_OIDC_ISSUER`
+    - `PECR_OIDC_JWKS_URL` or `PECR_OIDC_JWKS_JSON`
+    - `PECR_OIDC_TENANT_CLAIM` or `PECR_OIDC_TENANT_ID_STATIC`
+  - Optional:
+    - `PECR_OIDC_AUDIENCE`
+    - `PECR_OIDC_PRINCIPAL_ID_CLAIM` (default: `sub`)
+    - `PECR_OIDC_ROLES_CLAIM`
+    - `PECR_OIDC_ABAC_CLAIMS` (comma-separated claim names)
+    - `PECR_OIDC_JWKS_TIMEOUT_MS` (default: `2000`)
+    - `PECR_OIDC_JWKS_REFRESH_TTL_SECS` (default: `300`)
+    - `PECR_OIDC_CLOCK_SKEW_SECS` (default: `60`)
 
 ## Policy bundle updates
 
