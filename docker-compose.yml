@@ -37,10 +37,12 @@ services:
       PECR_BIND_ADDR: 0.0.0.0:8080
       PECR_DEV_ALLOW_NONLOCAL_BIND: "1"
       PECR_DB_URL: postgres://pecr:pecr@postgres:5432/pecr
-      PECR_OPA_URL: http://opa:8181
-      PECR_POLICY_BUNDLE_HASH: a4dffeeec94957dbf4d56b4f0ee920204c44a16e125628d298b1fa03366d254f
-      PECR_CACHE_MAX_ENTRIES: "0"
-      PECR_CACHE_TTL_MS: "0"
+      PECR_OPA_URL: "${PECR_OPA_URL:-http://opa:8181}"
+      PECR_OPA_TIMEOUT_MS: "${PECR_OPA_TIMEOUT_MS:-200}"
+      PECR_POLICY_BUNDLE_HASH: 028f4668cc37ca6270a10726acb8516f308f85bbc4ef106bf9874f436db2d565
+      PECR_CACHE_MAX_ENTRIES: "${PECR_CACHE_MAX_ENTRIES:-0}"
+      PECR_CACHE_TTL_MS: "${PECR_CACHE_TTL_MS:-0}"
+      PECR_PG_SAFEVIEW_QUERY_TIMEOUT_MS: "${PECR_PG_SAFEVIEW_QUERY_TIMEOUT_MS:-200}"
       PECR_EVIDENCE_PAYLOAD_STORE_MODE: metadata-only
       PECR_AUTH_MODE: local
       PECR_FS_CORPUS_PATH: /fixtures/fs_corpus
@@ -70,6 +72,24 @@ services:
         condition: service_started
     ports:
       - "127.0.0.1:8081:8081"
+
+  k6:
+    image: grafana/k6:0.49.0
+    profiles: ["perf"]
+    entrypoint: ["k6"]
+    volumes:
+      - ./scripts/k6:/scripts:ro
+      - ./target/perf:/results
+
+  opa_blackhole:
+    image: python:3.12-alpine
+    profiles: ["faults"]
+    command:
+      [
+        "python",
+        "-c",
+        "import socket,threading,time; s=socket.socket(); s.setsockopt(socket.SOL_SOCKET,socket.SO_REUSEADDR,1); s.bind(('0.0.0.0',8181)); s.listen(1024);\\n\\ndef hold(conn):\\n  try: time.sleep(3600)\\n  finally: conn.close()\\n\\nwhile True:\\n  c,_=s.accept(); threading.Thread(target=hold,args=(c,),daemon=True).start()",
+      ]
 
 volumes:
   postgres_data:
