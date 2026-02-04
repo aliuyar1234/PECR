@@ -1185,6 +1185,141 @@ async fn injection_suite_context_as_malware_tool_steering() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn redaction_policy_suite_denies_fields_in_fetch_rows_results() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping redaction policy suite; set PECR_TEST_DB_URL to enable");
+        return;
+    };
+
+    let request_id = format!(
+        "req_redaction_policy_{}_{}",
+        std::process::id(),
+        next_suffix()
+    );
+
+    let fs_corpus_root = prepare_temp_fs_corpus();
+    let fs_corpus_path = fs_corpus_root.to_string_lossy().to_string();
+
+    let pg_fixtures_sql = std::fs::read_to_string(
+        workspace_root()
+            .join("db")
+            .join("init")
+            .join("002_safeview_fixtures.sql"),
+    )
+    .expect("postgres fixture SQL should be readable");
+
+    let (schema_pool, schema_name, schema_url) = create_test_schema(&db_url).await;
+    apply_pg_fixtures(&schema_url, &pg_fixtures_sql).await;
+
+    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
+
+    let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
+        ("PECR_BIND_ADDR".to_string(), "127.0.0.1:0".to_string()),
+        ("PECR_DB_URL".to_string(), schema_url.clone()),
+        ("PECR_OPA_URL".to_string(), format!("http://{}", opa_addr)),
+        (
+            "PECR_POLICY_BUNDLE_HASH".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ),
+        ("PECR_FS_CORPUS_PATH".to_string(), fs_corpus_path.clone()),
+        (
+            "PECR_AS_OF_TIME_DEFAULT".to_string(),
+            "1970-01-01T00:00:00Z".to_string(),
+        ),
+    ]))
+    .expect("gateway config should be valid");
+
+    let (gateway_addr, gateway_shutdown, gateway_task) = spawn_server(
+        pecr_gateway::http::router(gateway_config)
+            .await
+            .expect("gateway router should init"),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+
+    let (session_id, session_token, _trace_id, _policy_snapshot_id) =
+        gateway_create_session(&client, gateway_addr, "redacted", &request_id).await;
+
+    let fetch_rows = client
+        .post(format!("http://{}/v1/operators/fetch_rows", gateway_addr))
+        .header("x-pecr-principal-id", "redacted")
+        .header("x-pecr-request-id", &request_id)
+        .header("x-pecr-session-token", &session_token)
+        .json(&serde_json::json!({
+            "session_id": session_id,
+            "params": {
+                "view_id": "safe_customer_view_admin",
+                "fields": ["admin_note"]
+            }
+        }))
+        .send()
+        .await
+        .expect("fetch_rows request should succeed");
+    assert!(fetch_rows.status().is_success());
+
+    let fetch_rows_body = fetch_rows
+        .json::<serde_json::Value>()
+        .await
+        .expect("fetch_rows response should be JSON");
+
+    let units = fetch_rows_body
+        .get("result")
+        .and_then(|v| v.as_array())
+        .expect("fetch_rows must return result array");
+    assert!(!units.is_empty(), "fetch_rows must return rows");
+
+    assert!(
+        units
+            .iter()
+            .all(|unit| unit.pointer("/content/admin_note").is_none()),
+        "expected policy redaction to remove content.admin_note from all units"
+    );
+
+    assert!(
+        units.iter().all(|unit| {
+            let Some(fields) = unit
+                .pointer("/span_or_row_spec/fields")
+                .and_then(|v| v.as_array())
+            else {
+                return false;
+            };
+            !fields
+                .iter()
+                .any(|v| v.as_str().is_some_and(|s| s == "admin_note"))
+        }),
+        "expected policy redaction to remove admin_note from span_or_row_spec.fields"
+    );
+
+    assert!(
+        units.iter().all(|unit| {
+            unit.pointer("/transform_chain")
+                .and_then(|v| v.as_array())
+                .is_some_and(|chain| {
+                    chain.iter().any(|step| {
+                        step.get("transform_type")
+                            .and_then(|v| v.as_str())
+                            .is_some_and(|t| t == "redaction")
+                    })
+                })
+        }),
+        "expected policy redaction to append a redaction transform step"
+    );
+
+    // Shutdown servers.
+    let _ = gateway_shutdown.send(());
+    let _ = opa_shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), gateway_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), opa_task).await;
+
+    let _ = std::fs::remove_dir_all(&fs_corpus_root);
+
+    drop_test_schema(&schema_pool, &schema_name).await;
+    schema_pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn staleness_suite_as_of_selects_fs_snapshot() {
     let Some(db_url) = test_db_url() else {
         eprintln!("skipping staleness suite; set PECR_TEST_DB_URL to enable");
@@ -2687,7 +2822,9 @@ async fn opa_decision(
 
     let allow = match action {
         "health" => true,
-        "create_session" | "finalize" => matches!(principal_id, "dev" | "support" | "guest"),
+        "create_session" | "finalize" => {
+            matches!(principal_id, "dev" | "support" | "guest" | "redacted")
+        }
         "operator_call" => match principal_id {
             "dev" => true,
             "support" => {
@@ -2710,12 +2847,19 @@ async fn opa_decision(
                     _ => false,
                 }
             }
+            "redacted" => true,
             _ => false,
         },
         _ => false,
     };
 
     let cacheable = matches!(action, "operator_call");
+
+    let redaction = if allow && action == "operator_call" && principal_id == "redacted" {
+        serde_json::json!({"deny_fields": ["admin_note"]})
+    } else {
+        serde_json::json!({})
+    };
 
     (
         StatusCode::OK,
@@ -2724,7 +2868,7 @@ async fn opa_decision(
                 "allow": allow,
                 "cacheable": cacheable,
                 "reason": if allow { "test_allow" } else { "test_deny" },
-                "redaction": {}
+                "redaction": redaction
             }
         })),
     )
