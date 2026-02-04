@@ -1,8 +1,8 @@
 # PECR Target Repo Decisions
 
-This log records implementation-repo decisions for `C:\Research\pecr`.
+This log records implementation-repo decisions for `pecr`.
 
-The spec SSOT and its decision log live in `C:\Research\pcdr`.
+The SSOT spec pack and its decision log live in the sibling repo `pcdr`.
 
 ## D-0001 — Vendor upstream RLM repo pinned commit
 
@@ -15,5 +15,5 @@ The spec SSOT and its decision log live in `C:\Research\pcdr`.
 - Satisfy SSOT T-0033 and keep optional code-execution paths off-by-default.
 
 **SSOT references**
-- SSOT decision: `C:\Research\pcdr\DECISIONS.md` (D-0007)
-- SSOT security requirements: `C:\Research\pcdr\spec\06_SECURITY_AND_THREAT_MODEL.md` (Sandboxing and egress controls; RLM optional)
+- SSOT decision: `pcdr/DECISIONS.md` (D-0007)
+- SSOT security requirements: `pcdr/spec/06_SECURITY_AND_THREAT_MODEL.md` (Sandboxing and egress controls; RLM optional)
