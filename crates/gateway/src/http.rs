@@ -15,7 +15,8 @@ use hex::ToHex;
 use pecr_auth::{OidcAuthenticator, Principal};
 use pecr_contracts::canonical;
 use pecr_contracts::{
-    Budget, ClaimMap, ClaimStatus, EvidenceUnitRef, PolicySnapshot, TerminalMode,
+    Budget, ClaimMap, ClaimStatus, EvidenceContentType, EvidenceUnit, EvidenceUnitRef,
+    PolicySnapshot, TerminalMode, TransformStep,
 };
 use pecr_ledger::{FinalizeResultRecord, LedgerWriter};
 use serde::{Deserialize, Serialize};
@@ -1368,6 +1369,167 @@ async fn call_operator(
                         result,
                     },
                     vec![evidence],
+                )
+            }
+            "redact" => {
+                let redaction = parse_field_redaction(decision.redaction.as_ref())?;
+
+                let evidence_units = req
+                    .params
+                    .get("evidence_units")
+                    .and_then(|v| v.as_array())
+                    .ok_or_else(|| {
+                        json_error(
+                            StatusCode::BAD_REQUEST,
+                            "ERR_INVALID_PARAMS",
+                            "params.evidence_units must be an array".to_string(),
+                            TerminalMode::InsufficientEvidence,
+                            false,
+                        )
+                    })?;
+
+                if evidence_units.len() > 200 {
+                    return Err(json_error(
+                        StatusCode::BAD_REQUEST,
+                        "ERR_INVALID_PARAMS",
+                        "evidence_units too large".to_string(),
+                        TerminalMode::InsufficientEvidence,
+                        false,
+                    ));
+                }
+
+                let mut out_units = Vec::with_capacity(evidence_units.len());
+                let mut evidence_emitted = Vec::new();
+
+                for raw in evidence_units {
+                    let unit: EvidenceUnit = serde_json::from_value(raw.clone()).map_err(|_| {
+                        json_error(
+                            StatusCode::BAD_REQUEST,
+                            "ERR_INVALID_PARAMS",
+                            "invalid EvidenceUnit".to_string(),
+                            TerminalMode::InsufficientEvidence,
+                            false,
+                        )
+                    })?;
+
+                    if !canonical::is_sha256_hex(&unit.evidence_unit_id) {
+                        return Err(json_error(
+                            StatusCode::BAD_REQUEST,
+                            "ERR_INVALID_PARAMS",
+                            "EvidenceUnit.evidence_unit_id must be sha256 hex".to_string(),
+                            TerminalMode::InsufficientEvidence,
+                            false,
+                        ));
+                    }
+
+                    if !session.evidence_unit_ids.contains(&unit.evidence_unit_id) {
+                        return Err(json_error(
+                            StatusCode::BAD_REQUEST,
+                            "ERR_INVALID_PARAMS",
+                            "evidence_unit_id not emitted in this session".to_string(),
+                            TerminalMode::InsufficientEvidence,
+                            false,
+                        ));
+                    }
+
+                    if unit.policy_snapshot_hash != session.policy_snapshot_hash
+                        || unit.as_of_time != session.as_of_time
+                    {
+                        return Err(json_error(
+                            StatusCode::BAD_REQUEST,
+                            "ERR_INVALID_PARAMS",
+                            "evidence_unit must match current session policy_snapshot_hash and as_of_time".to_string(),
+                            TerminalMode::InsufficientEvidence,
+                            false,
+                        ));
+                    }
+
+                    let content = unit.content.as_ref().ok_or_else(|| {
+                        json_error(
+                            StatusCode::BAD_REQUEST,
+                            "ERR_INVALID_PARAMS",
+                            "EvidenceUnit.content is required".to_string(),
+                            TerminalMode::InsufficientEvidence,
+                            false,
+                        )
+                    })?;
+                    let expected_content_hash = compute_content_hash(unit.content_type, content)?;
+                    if unit.content_hash != expected_content_hash {
+                        return Err(json_error(
+                            StatusCode::BAD_REQUEST,
+                            "ERR_INVALID_PARAMS",
+                            "EvidenceUnit.content_hash mismatch".to_string(),
+                            TerminalMode::InsufficientEvidence,
+                            false,
+                        ));
+                    }
+
+                    let expected_id = compute_evidence_unit_id(&unit);
+                    if unit.evidence_unit_id != expected_id {
+                        return Err(json_error(
+                            StatusCode::BAD_REQUEST,
+                            "ERR_INVALID_PARAMS",
+                            "EvidenceUnit.evidence_unit_id mismatch".to_string(),
+                            TerminalMode::InsufficientEvidence,
+                            false,
+                        ));
+                    }
+
+                    let Some(redaction) = redaction.as_ref() else {
+                        out_units.push(unit);
+                        continue;
+                    };
+
+                    if unit.content_type != EvidenceContentType::ApplicationJson {
+                        return Err(json_error(
+                            StatusCode::BAD_REQUEST,
+                            "ERR_INVALID_PARAMS",
+                            "redact supports application/json evidence only".to_string(),
+                            TerminalMode::InsufficientEvidence,
+                            false,
+                        ));
+                    }
+
+                    let redacted_content = apply_field_redaction(content, redaction);
+                    if redacted_content == *content {
+                        out_units.push(unit);
+                        continue;
+                    }
+
+                    let mut redacted = unit.clone();
+                    redacted.content = Some(redacted_content);
+                    redacted.content_hash = compute_content_hash(
+                        EvidenceContentType::ApplicationJson,
+                        redacted.content.as_ref().unwrap(),
+                    )?;
+                    redacted.span_or_row_spec =
+                        redact_span_or_row_spec_fields(&redacted.span_or_row_spec, redaction);
+                    redacted.policy_snapshot_id = session.policy_snapshot_id.clone();
+                    redacted.policy_snapshot_hash = session.policy_snapshot_hash.clone();
+
+                    let step_params = redaction.params_value();
+                    let step_hash = canonical::hash_canonical_json(&step_params);
+                    redacted.transform_chain.push(TransformStep {
+                        transform_type: "redaction".to_string(),
+                        transform_hash: step_hash,
+                        params: Some(step_params),
+                    });
+                    redacted.evidence_unit_id = compute_evidence_unit_id(&redacted);
+
+                    evidence_emitted.push(redacted.clone());
+                    out_units.push(redacted);
+                }
+
+                let result =
+                    serde_json::to_value(&out_units).unwrap_or_else(|_| serde_json::json!([]));
+                (
+                    StatusCode::OK,
+                    None,
+                    OperatorCallResponse {
+                        terminal_mode: TerminalMode::Supported,
+                        result,
+                    },
+                    evidence_emitted,
                 )
             }
             _ => (
@@ -3810,6 +3972,224 @@ fn sanitize_as_of_time(raw: &str) -> Option<String> {
     Some(raw.to_string())
 }
 
+#[derive(Debug, Clone)]
+enum FieldRedaction {
+    Allow(Vec<String>),
+    Deny(Vec<String>),
+}
+
+impl FieldRedaction {
+    fn keeps_key(&self, key: &str) -> bool {
+        match self {
+            FieldRedaction::Allow(fields) => {
+                fields.binary_search_by(|f| f.as_str().cmp(key)).is_ok()
+            }
+            FieldRedaction::Deny(fields) => {
+                fields.binary_search_by(|f| f.as_str().cmp(key)).is_err()
+            }
+        }
+    }
+
+    fn apply_to_field_list(&self, fields: &[String]) -> Vec<String> {
+        let mut out = Vec::with_capacity(fields.len());
+        for field in fields {
+            if self.keeps_key(field.as_str()) {
+                out.push(field.clone());
+            }
+        }
+        out
+    }
+
+    fn params_value(&self) -> serde_json::Value {
+        match self {
+            FieldRedaction::Allow(fields) => serde_json::json!({ "allow_fields": fields }),
+            FieldRedaction::Deny(fields) => serde_json::json!({ "deny_fields": fields }),
+        }
+    }
+}
+
+fn parse_field_redaction(
+    redaction: Option<&serde_json::Value>,
+) -> Result<Option<FieldRedaction>, ApiError> {
+    let Some(redaction) = redaction else {
+        return Ok(None);
+    };
+
+    let Some(obj) = redaction.as_object() else {
+        return Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ERR_INTERNAL",
+            "policy redaction must be an object".to_string(),
+            TerminalMode::InsufficientPermission,
+            false,
+        ));
+    };
+
+    if obj.is_empty() {
+        return Ok(None);
+    }
+
+    let parse_fields = |key: &str| -> Result<Option<Vec<String>>, ApiError> {
+        let Some(value) = obj.get(key) else {
+            return Ok(None);
+        };
+        let Some(arr) = value.as_array() else {
+            return Err(json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ERR_INTERNAL",
+                format!("policy redaction `{}` must be an array", key),
+                TerminalMode::InsufficientPermission,
+                false,
+            ));
+        };
+
+        let mut out = Vec::with_capacity(arr.len());
+        for raw in arr {
+            let field = raw
+                .as_str()
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "ERR_INTERNAL",
+                        format!("policy redaction `{}` must be a string array", key),
+                        TerminalMode::InsufficientPermission,
+                        false,
+                    )
+                })?;
+            out.push(field.to_string());
+        }
+
+        out.sort();
+        out.dedup();
+        if out.is_empty() {
+            Ok(None)
+        } else {
+            Ok(Some(out))
+        }
+    };
+
+    let allow_fields = parse_fields("allow_fields")?;
+    let deny_fields = parse_fields("deny_fields")?;
+
+    if allow_fields.is_some() && deny_fields.is_some() {
+        return Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ERR_INTERNAL",
+            "policy redaction cannot specify both allow_fields and deny_fields".to_string(),
+            TerminalMode::InsufficientPermission,
+            false,
+        ));
+    }
+
+    Ok(match (allow_fields, deny_fields) {
+        (Some(fields), None) => Some(FieldRedaction::Allow(fields)),
+        (None, Some(fields)) => Some(FieldRedaction::Deny(fields)),
+        _ => None,
+    })
+}
+
+fn apply_field_redaction(
+    value: &serde_json::Value,
+    redaction: &FieldRedaction,
+) -> serde_json::Value {
+    match value {
+        serde_json::Value::Object(map) => {
+            let mut out = serde_json::Map::with_capacity(map.len());
+            for (k, v) in map {
+                if redaction.keeps_key(k.as_str()) {
+                    out.insert(k.clone(), apply_field_redaction(v, redaction));
+                }
+            }
+            serde_json::Value::Object(out)
+        }
+        serde_json::Value::Array(values) => serde_json::Value::Array(
+            values
+                .iter()
+                .map(|v| apply_field_redaction(v, redaction))
+                .collect::<Vec<_>>(),
+        ),
+        _ => value.clone(),
+    }
+}
+
+fn redact_span_or_row_spec_fields(
+    span_or_row_spec: &serde_json::Value,
+    redaction: &FieldRedaction,
+) -> serde_json::Value {
+    let Some(obj) = span_or_row_spec.as_object() else {
+        return span_or_row_spec.clone();
+    };
+
+    let Some(fields_value) = obj.get("fields") else {
+        return span_or_row_spec.clone();
+    };
+    let Some(fields) = fields_value.as_array() else {
+        return span_or_row_spec.clone();
+    };
+
+    let mut parsed = fields
+        .iter()
+        .filter_map(|v| v.as_str())
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())
+        .collect::<Vec<_>>();
+    parsed.sort();
+    parsed.dedup();
+
+    let redacted_fields = redaction.apply_to_field_list(&parsed);
+
+    let mut out = obj.clone();
+    out.insert(
+        "fields".to_string(),
+        serde_json::Value::Array(
+            redacted_fields
+                .into_iter()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    serde_json::Value::Object(out)
+}
+
+fn compute_content_hash(
+    content_type: EvidenceContentType,
+    content: &serde_json::Value,
+) -> Result<String, ApiError> {
+    match content_type {
+        EvidenceContentType::ApplicationJson => Ok(canonical::hash_canonical_json(content)),
+        EvidenceContentType::TextPlain => {
+            let text = content.as_str().ok_or_else(|| {
+                json_error(
+                    StatusCode::BAD_REQUEST,
+                    "ERR_INVALID_PARAMS",
+                    "text/plain evidence content must be a string".to_string(),
+                    TerminalMode::InsufficientEvidence,
+                    false,
+                )
+            })?;
+            let canonical_text = canonical::canonicalize_text_plain(text);
+            Ok(canonical::sha256_hex(canonical_text.as_bytes()))
+        }
+    }
+}
+
+fn compute_evidence_unit_id(evidence: &EvidenceUnit) -> String {
+    let identity = serde_json::json!({
+        "source_system": evidence.source_system.as_str(),
+        "object_id": evidence.object_id.as_str(),
+        "version_id": evidence.version_id.as_str(),
+        "span_or_row_spec": &evidence.span_or_row_spec,
+        "content_hash": evidence.content_hash.as_str(),
+        "as_of_time": evidence.as_of_time.as_str(),
+        "policy_snapshot_hash": evidence.policy_snapshot_hash.as_str(),
+        "transform_chain": &evidence.transform_chain,
+    });
+    canonical::hash_canonical_json(&identity)
+}
+
 fn is_allowlisted_operator(op_name: &str) -> bool {
     matches!(
         op_name,
@@ -4047,5 +4427,60 @@ mod tests {
 
         let out = finalize_gate(&session, claim_map, 0.95).expect("gate should succeed");
         assert_eq!(out.terminal_mode, TerminalMode::InsufficientEvidence);
+    }
+
+    #[test]
+    fn field_redaction_parse_allows_and_denies() {
+        let allow = parse_field_redaction(Some(&serde_json::json!({
+            "allow_fields": ["b", "a", "a"]
+        })))
+        .expect("allow parse should succeed")
+        .expect("allow spec should exist");
+
+        assert!(matches!(
+            allow,
+            FieldRedaction::Allow(fields) if fields == vec!["a".to_string(), "b".to_string()]
+        ));
+
+        let deny = parse_field_redaction(Some(&serde_json::json!({
+            "deny_fields": ["secret"]
+        })))
+        .expect("deny parse should succeed")
+        .expect("deny spec should exist");
+
+        assert!(matches!(
+            deny,
+            FieldRedaction::Deny(fields) if fields == vec!["secret".to_string()]
+        ));
+    }
+
+    #[test]
+    fn field_redaction_applies_recursively() {
+        let redaction = FieldRedaction::Deny(vec!["secret".to_string()]);
+        let input = serde_json::json!({
+            "ok": 1,
+            "secret": "top",
+            "nested": {
+                "secret": "hidden",
+                "keep": true
+            },
+            "arr": [
+                {"secret": "x", "keep": 1},
+                {"keep": 2}
+            ]
+        });
+
+        let out = apply_field_redaction(&input, &redaction);
+        assert_eq!(
+            out,
+            serde_json::json!({
+                "ok": 1,
+                "nested": { "keep": true },
+                "arr": [
+                    {"keep": 1},
+                    {"keep": 2}
+                ]
+            })
+        );
     }
 }
