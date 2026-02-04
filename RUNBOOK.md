@@ -13,9 +13,12 @@ This repo follows the SSOT runbook baseline in `pcdr/spec/12_RUNBOOK.md`.
 1) Start services:
 - `docker compose up -d`
 
+Notes:
+- Postgres is exposed on `127.0.0.1:${PECR_POSTGRES_PORT:-55432}` by default (override via `PECR_POSTGRES_PORT`).
+
 2) Run the end-to-end suites (requires a Postgres URL):
-- PowerShell: `$env:PECR_TEST_DB_URL='postgres://pecr:pecr@localhost:5432/pecr'; cargo test -p e2e_smoke`
-- Bash: `PECR_TEST_DB_URL=postgres://pecr:pecr@localhost:5432/pecr cargo test -p e2e_smoke`
+- PowerShell: `$env:PECR_TEST_DB_URL='postgres://pecr:pecr@localhost:55432/pecr'; cargo test -p e2e_smoke`
+- Bash: `PECR_TEST_DB_URL=postgres://pecr:pecr@localhost:55432/pecr cargo test -p e2e_smoke`
 
 3) Run the full CI script locally:
 - `bash scripts/ci.sh`

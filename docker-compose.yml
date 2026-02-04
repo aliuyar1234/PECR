@@ -6,7 +6,7 @@ services:
       POSTGRES_PASSWORD: pecr
       POSTGRES_DB: pecr
     ports:
-      - "127.0.0.1:5432:5432"
+      - "127.0.0.1:${PECR_POSTGRES_PORT:-55432}:5432"
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U pecr -d pecr"]
       interval: 5s
