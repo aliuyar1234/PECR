@@ -1,37 +1,134 @@
-# PECR - Policy-Enforced Context Runtime
+# PECR — Policy‑Enforced Context Runtime
 
 [![CI](https://github.com/aliuyar1234/pecr/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/aliuyar1234/pecr/actions/workflows/ci.yml)
-[![Release](https://img.shields.io/github/v/release/aliuyar1234/pecr)](https://github.com/aliuyar1234/pecr/releases)
+[![Release](badges/release.svg)](https://github.com/aliuyar1234/pecr/releases)
 
-PECR is a **gateway + controller** runtime that turns heterogeneous systems-of-record into **policy-correct, time-correct, evidence-auditable** context bundles - while keeping the model/controller **non-privileged**.
+> Note: the Release badge is committed as `badges/release.svg` so it renders for private repos (hosted badge services cannot read private GitHub releases).
 
-This repo is the Rust implementation of the PECR/CEGP SSOT spec pack (`pcdr`, not included here).
+PECR (Policy‑Enforced Context Runtime) is a **governance plane for context**: it turns heterogeneous systems‑of‑record into **policy‑correct, time‑correct, evidence‑auditable** context bundles — while keeping the model/controller **non‑privileged**.
 
-## What This Repo Provides
+If you know “ChatGPT + RAG”: PECR is the missing runtime layer that makes retrieval **safe, reviewable, and repeatable** (deny‑by‑default policy, immutable evidence IDs, audit ledger, deterministic refusal modes).
 
-- **Deny-by-default policy enforcement** via OPA for session creation, operator calls, and finalize.
-- **Immutable EvidenceUnits** with deterministic IDs and content hashes (hashes are computed **after redaction**).
-- **Append-only Postgres ledger** for policy snapshots, sessions, evidence, and audit events.
-- **Budgeted context loop** (controller) + **finalize gate** (gateway) with strict terminal modes.
-- **Release-blocking suites** (leakage, injection, staleness, claim<->evidence, cache bleed, telemetry leakage) and a k6-based p99 + fault injection harness.
-- **Observability**: JSON logs + Prometheus `/metrics`; optional OTLP traces.
+This repository is the Rust implementation of PECR/CEGP (spec SSOT lives in a separate internal pack, `pcdr`).
 
-## Architecture (High Level)
+## What You Get (Guarantees)
 
-The trust boundary is explicit:
+- **Hard trust boundary**: privileged **Gateway** vs non‑privileged **Controller** (the controller holds no source credentials).
+- **Deny‑by‑default policy enforcement** (OPA) for session creation, every operator call, and finalize.
+- **EvidenceUnits**: immutable, versioned, **hashed after redaction**, bound to **policy snapshot** and **as‑of time**.
+- **Claim↔Evidence gate**: answers are compiled into atomic claims mapped to EvidenceUnit IDs (or you get a refusal terminal mode).
+- **Budgeted execution**: strict caps on operator calls, bytes, wallclock, recursion depth (plus parallelism).
+- **Auditability**: append‑only Postgres ledger + `trace_id` correlation across requests, evidence, and finalization.
+- **Release‑blocking suites**: leakage, injection, staleness/time‑travel correctness, claim↔evidence, cache bleed, telemetry leakage.
+- **Performance + fault injection harness**: k6 p99 run + injected OPA/Postgres faults + regression checks.
 
+## Why This Isn’t “Just RAG”
+
+**RAG is a retrieval strategy. PECR is the architecture around retrieval.**
+
+RAG *can* exist inside `search()` (dense/hybrid/BM25/vector). But PECR removes the “top‑k → stuff into prompt → hope” failure mode by enforcing:
+
+- **Policy**: who can retrieve what (and which fields must be redacted) is evaluated per call.
+- **Provenance**: retrieved material is packaged as **EvidenceUnits** with deterministic IDs/hashes.
+- **Time correctness**: evidence is anchored to an `as_of_time` so you can answer “as of last Tuesday” deterministically.
+- **Governance**: the final answer must pass a **Claim↔Evidence** coverage gate.
+- **Safe failure**: the system returns one of four terminal modes (no “partial success” ambiguity).
+
+Mini‑picture:
+
+```text
++-----------------------------+
+| Controller (LLM optional)  |
+| - plans / calls operators  |
+| - never touches data stores|
++--------------+-------------+
+               |
+               | operator calls only
+               v
++-----------------------------+
+| PECR Gateway (privileged)   |
+| - allowlist + validation    |
+| - OPA policy + redaction    |
+| - EvidenceUnit emitter      |
+| - append-only ledger writer |
++-----------------------------+
 ```
-client
-  |
-  v
-controller (non-privileged)
-  |  HTTP (mTLS in prod)
-  v
-gateway (privileged runtime)
-  +--> OPA (policy decisions + redaction directives)
-  +--> adapters (filesystem corpus, Postgres safe-view)
-  \\--> Postgres ledger (append-only)
+
+### Where PECR Shines
+
+- **Enterprise assistants** that must respect RBAC/ABAC and field‑level redaction across multiple systems‑of‑record.
+- **Regulated environments** (PII/finance/health) where provenance, auditability, and deterministic failure matter.
+- **Time‑travel answers** (“as of last week”) without silently mixing data from different points in time.
+- **Agentic workflows** where the model must not have direct access to databases, APIs, or credentials.
+
+## Architecture (Trust Boundary)
+
+```text
++---------------------------+           mTLS            +------------------------------+
+| Controller (non-privileged)|  --------------------->  | PECR Gateway (privileged)    |
+| - Budgeted context loop    |                          | - Operator runtime (allowlist)|
+| - LLM provider (optional)  |                          | - Policy client (OPA)         |
+| - Claim draft + mapping    |                          | - EvidenceUnit emitter        |
++-------------+-------------+                          | - Ledger writer (append-only)|
+              |                                        +---------------+--------------+
+              |                                                        |
+              |                                                        | SQL
+              |                                                        v
+              |                                        +------------------------------+
+              |                                        | PostgreSQL (ledger datastore)|
+              |                                        +------------------------------+
+              |
+              |  HTTP (policy queries)                  +------------------------------+
+              +---------------------------------------> | OPA (policy engine sidecar) |
+                                                         +------------------------------+
+
+Adapters live behind the Gateway operator boundary:
+- Filesystem adapter (deterministic dev/test)
+- Postgres safe-view adapter (structured rows/fields provenance)
 ```
+
+## Critical Flow (End‑to‑End)
+
+1) **Session**: client starts a session via the Gateway; Gateway computes a **policy snapshot** and returns a capability token.
+2) **Context loop**: controller runs a budgeted loop by calling **typed operators** through the Gateway.
+3) **Evidence**: Gateway returns EvidenceUnits/refs (already policy‑enforced + redacted) and writes ledger events.
+4) **Finalize**: controller submits the candidate answer + ClaimMap to Gateway `/v1/finalize`.
+5) **Gate**: Gateway verifies Claim↔Evidence contracts, enforces terminal mode, appends ledger events, returns the final result.
+
+The controller’s `/v1/run` response shape:
+
+```json
+{
+  "terminal_mode": "INSUFFICIENT_EVIDENCE",
+  "trace_id": "01KG...",
+  "claim_map": { "claims": [ /* atomic claims */ ] },
+  "response_text": "UNKNOWN: ..."
+}
+```
+
+## Core Concepts (Quick Glossary)
+
+### Terminal modes (exactly 4; fail‑closed)
+
+- `SUPPORTED`: only allowed if Claim↔Evidence coverage thresholds pass.
+- `INSUFFICIENT_EVIDENCE`: you didn’t retrieve enough admissible evidence within budget.
+- `INSUFFICIENT_PERMISSION`: policy denied the required access.
+- `SOURCE_UNAVAILABLE`: a required dependency is down or timing out (OPA, adapters, database, …).
+
+### Operators (typed allowlist)
+
+Gateway exposes a fixed operator surface:
+`search`, `fetch_span`, `fetch_rows`, `aggregate`, `list_versions`, `diff`, `redact`.
+
+### EvidenceUnit (immutable evidence package)
+
+EvidenceUnit is a versioned, hashed record of what was retrieved, under which policy snapshot, at which as‑of time.
+Hashes are computed **after redaction**, so the evidence ID is safe to persist and compare.
+
+### ClaimMap (claim↔evidence link)
+
+Answers are compiled into atomic claims. Each `SUPPORTED` claim must reference ≥1 EvidenceUnit ID.
+Finalize rejects unsupported “supported” claims and enforces coverage thresholds.
 
 ## Quickstart (Deterministic Local Run)
 
@@ -48,7 +145,7 @@ docker compose up -d
 
 Postgres is exposed as `127.0.0.1:${PECR_POSTGRES_PORT:-55432}` (override with `PECR_POSTGRES_PORT` before `docker compose up`).
 
-### 2) Send a smoke request (via controller)
+### 2) Send a request (controller `/v1/run`)
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8081/v1/run \
@@ -59,12 +156,14 @@ curl -sS -X POST http://127.0.0.1:8081/v1/run \
 ```
 
 PowerShell:
+
 ```powershell
-curl.exe -sS -X POST "http://127.0.0.1:8081/v1/run" `
-  -H "content-type: application/json" `
-  -H "x-pecr-principal-id: dev" `
-  -H "x-pecr-request-id: demo" `
-  -d "{\"query\":\"smoke\"}"
+$body = @{ query = "smoke" } | ConvertTo-Json
+Invoke-RestMethod -Method Post `
+  -Uri "http://127.0.0.1:8081/v1/run" `
+  -Headers @{ "x-pecr-principal-id"="dev"; "x-pecr-request-id"="demo" } `
+  -ContentType "application/json" `
+  -Body $body
 ```
 
 ### 3) Run the same checks CI runs
@@ -74,12 +173,13 @@ PECR_TEST_DB_URL=postgres://pecr:pecr@localhost:55432/pecr bash scripts/ci.sh
 ```
 
 PowerShell:
+
 ```powershell
 $env:PECR_TEST_DB_URL = "postgres://pecr:pecr@localhost:55432/pecr"
 bash scripts/ci.sh
 ```
 
-### 4) Run the performance + fault injection suite (Suite 7)
+### 4) Run performance + fault injection (Suite 7)
 
 ```bash
 bash scripts/perf/suite7.sh
@@ -89,7 +189,7 @@ Outputs are written to `target/perf/`.
 
 More operational details: `RUNBOOK.md`.
 
-## Endpoints
+## API Surface
 
 Gateway:
 - `GET /healthz`
@@ -118,9 +218,9 @@ Controller (minimum):
 - `PECR_MODEL_PROVIDER` (use `mock`)
 - `PECR_BUDGET_DEFAULTS` (Budget JSON)
 
-### RLM controller engine (experimental)
+## RLM Controller Engine (Experimental)
 
-The controller can run an **RLM-style** planner loop behind a feature flag. This is **not** a trust boundary: it can only obtain evidence via policy-enforced operator calls.
+The controller can run an **RLM‑style** planner loop behind a feature flag. This is **not** a trust boundary: it can only obtain evidence via policy‑enforced operator calls.
 
 Enable it:
 - Build `pecr-controller` with feature `rlm` (the docker compose controller image does this by default).
@@ -157,15 +257,15 @@ Required configuration keys:
 - `PECR_OIDC_TENANT_CLAIM` or `PECR_OIDC_TENANT_ID_STATIC`
 
 Notes:
-- Both gateway and controller **refuse non-local bind** unless `PECR_AUTH_MODE=oidc` (docker compose uses `PECR_DEV_ALLOW_NONLOCAL_BIND=1` as a dev-only escape hatch).
-- See `RUNBOOK.md` for the full list of OIDC-related env vars and defaults.
+- Both gateway and controller **refuse non‑local bind** unless `PECR_AUTH_MODE=oidc` (docker compose uses `PECR_DEV_ALLOW_NONLOCAL_BIND=1` as a dev‑only escape hatch).
+- See `RUNBOOK.md` for the full list of OIDC‑related env vars and defaults.
 
 ## Policy (OPA)
 
 The gateway calls OPA for every decision and fails closed if the policy engine is unavailable.
 
 - Bundle entrypoint: `opa/bundle/policy.rego`
-- Compose runs OPA as `openpolicyagent/opa` with the bundle mounted read-only.
+- Compose runs OPA as `openpolicyagent/opa` with the bundle mounted read‑only.
 
 OPA returns `{ allow, cacheable, reason, redaction }`. Redaction directives support:
 - `{"deny_fields": ["field", ...]}` or
@@ -173,8 +273,7 @@ OPA returns `{ allow, cacheable, reason, redaction }`. Redaction directives supp
 
 ## Redaction
 
-There are two ways to apply redaction:
-- **Policy-driven redaction enforcement**: DB operator outputs (`fetch_rows`, `aggregate`) automatically apply OPA redaction directives when present.
+- **Policy‑driven redaction enforcement**: DB operator outputs (`fetch_rows`, `aggregate`) automatically apply OPA redaction directives.
 - **Explicit redaction operator**: `redact` transforms EvidenceUnits (JSON only) into redacted EvidenceUnits with new hashes/IDs and an appended `transform_chain` step.
 
 ## Observability
@@ -186,17 +285,17 @@ There are two ways to apply redaction:
 ## Quality Gates
 
 - `bash scripts/ci.sh`: formatting, clippy, boundary fitness check, and the full test suite.
-- `bash scripts/perf/suite7.sh`: k6-based p99 run + fault injection + BVR/SER checks and perf regression comparison.
+- `bash scripts/perf/suite7.sh`: k6‑based p99 run + fault injection + BVR/SER checks and perf regression comparison.
 
 ## Repository Layout
 
 - `crates/gateway`: privileged runtime (OPA calls, adapters, ledger writes)
-- `crates/controller`: non-privileged budgeted context loop + claim map building
+- `crates/controller`: non‑privileged budgeted context loop + claim map building
 - `crates/contracts`: schemas + canonicalization/hashing helpers
-- `crates/ledger`: migrations + append-only ledger writer
+- `crates/ledger`: migrations + append‑only ledger writer
 - `crates/auth`: local and OIDC/JWT authentication helpers
 - `crates/boundary-check`: enforces the controller boundary in CI
-- `crates/e2e_smoke`: end-to-end smoke + release-blocking suites
+- `crates/e2e_smoke`: end‑to‑end smoke + release‑blocking suites
 - `opa/bundle`: OPA bundle used by docker compose and local perf harness
 - `db/init`: deterministic SQL fixtures and schema init
 - `scripts`: CI + perf harnesses (`scripts/ci.sh`, `scripts/perf/suite7.sh`)
@@ -210,7 +309,8 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Or run the repo's CI script:
+Or run the repo’s CI script:
+
 ```bash
 bash scripts/ci.sh
 ```
@@ -218,4 +318,4 @@ bash scripts/ci.sh
 ## Notes / Current Limitations
 
 - `PECR_MODEL_PROVIDER=external` is intentionally **not implemented** and will refuse startup (use `mock`).
-- The optional `rlm` controller engine is vendored behind a feature flag and is **not wired yet**; selecting it currently delegates to the baseline loop.
+- RLM engine is **experimental**; current backend is `mock` (the bridge + operator RPC wiring is real).
