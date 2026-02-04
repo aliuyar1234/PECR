@@ -10,6 +10,7 @@ static HTTP_REQUESTS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static HTTP_REQUEST_DURATION_SECONDS: OnceLock<HistogramVec> = OnceLock::new();
 static TERMINAL_MODES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static LOOP_ITERATIONS_TOTAL: OnceLock<IntCounter> = OnceLock::new();
+static BUDGET_VIOLATIONS_TOTAL: OnceLock<IntCounter> = OnceLock::new();
 
 fn registry() -> &'static Registry {
     REGISTRY.get_or_init(Registry::new)
@@ -83,6 +84,18 @@ fn loop_iterations_total() -> &'static IntCounter {
     })
 }
 
+fn budget_violations_total() -> &'static IntCounter {
+    BUDGET_VIOLATIONS_TOTAL.get_or_init(|| {
+        register_collector(
+            IntCounter::new(
+                "pecr_controller_budget_violations_total",
+                "Controller budget violations observed.",
+            )
+            .expect("create pecr_controller_budget_violations_total"),
+        )
+    })
+}
+
 pub fn observe_http_request(route: &str, method: &str, status: u16, duration: Duration) {
     let status_str = status.to_string();
     http_requests_total()
@@ -109,7 +122,13 @@ pub fn inc_loop_iteration() {
     loop_iterations_total().inc();
 }
 
+pub fn inc_budget_violation() {
+    budget_violations_total().inc();
+}
+
 pub fn render() -> Result<(Vec<u8>, String), prometheus::Error> {
+    let _ = budget_violations_total();
+
     let encoder = TextEncoder::new();
     let metric_families = registry().gather();
     let mut buffer = Vec::new();

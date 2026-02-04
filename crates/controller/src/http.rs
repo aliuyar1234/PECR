@@ -796,18 +796,24 @@ async fn run_context_loop(
     let mut operator_calls_used: u32 = 0;
     let mut bytes_used: u64 = 0;
     let mut depth_used: u32 = 0;
+    let mut stop_reason: &'static str = "unknown";
+    let mut budget_violation = false;
 
     let mut evidence_refs = Vec::<EvidenceUnitRef>::new();
     let mut evidence_units = Vec::<EvidenceUnit>::new();
     let mut search_refs = Vec::<EvidenceUnitRef>::new();
 
-    for depth in 0..budget.max_recursion_depth {
+    'context_loop: for depth in 0..budget.max_recursion_depth {
         crate::metrics::inc_loop_iteration();
         if operator_calls_used >= budget.max_operator_calls {
+            stop_reason = "budget_max_operator_calls";
+            budget_violation = true;
             break;
         }
 
         let Some(timeout) = remaining_wallclock(budget, loop_start) else {
+            stop_reason = "budget_max_wallclock_ms";
+            budget_violation = true;
             break;
         };
 
@@ -828,6 +834,7 @@ async fn run_context_loop(
 
                 if outcome.body.is_none() {
                     terminal_mode = outcome.terminal_mode_hint;
+                    stop_reason = "operator_error";
                     break;
                 }
             }
@@ -849,6 +856,7 @@ async fn run_context_loop(
 
                 let Some(body) = outcome.body else {
                     terminal_mode = outcome.terminal_mode_hint;
+                    stop_reason = "operator_error";
                     break;
                 };
 
@@ -876,6 +884,7 @@ async fn run_context_loop(
 
                 let Some(body) = outcome.body else {
                     terminal_mode = outcome.terminal_mode_hint;
+                    stop_reason = "operator_error";
                     break;
                 };
 
@@ -889,10 +898,14 @@ async fn run_context_loop(
             3 => {
                 for r in search_refs.iter().take(2) {
                     if operator_calls_used >= budget.max_operator_calls {
-                        break;
+                        stop_reason = "budget_max_operator_calls";
+                        budget_violation = true;
+                        break 'context_loop;
                     }
                     let Some(timeout) = remaining_wallclock(budget, loop_start) else {
-                        break;
+                        stop_reason = "budget_max_wallclock_ms";
+                        budget_violation = true;
+                        break 'context_loop;
                     };
 
                     let outcome = call_operator(
@@ -908,7 +921,8 @@ async fn run_context_loop(
 
                     let Some(body) = outcome.body else {
                         terminal_mode = outcome.terminal_mode_hint;
-                        break;
+                        stop_reason = "operator_error";
+                        break 'context_loop;
                     };
 
                     if let Ok(unit) = serde_json::from_value::<EvidenceUnit>(body.result) {
@@ -916,13 +930,26 @@ async fn run_context_loop(
                     }
                 }
             }
-            _ => break,
+            _ => {
+                stop_reason = "plan_complete";
+                break;
+            }
         }
 
         if bytes_used > budget.max_bytes {
             terminal_mode = TerminalMode::InsufficientEvidence;
+            stop_reason = "budget_max_bytes";
+            budget_violation = true;
             break;
         }
+    }
+
+    if stop_reason == "unknown" {
+        stop_reason = "budget_max_recursion_depth";
+        budget_violation = true;
+    }
+    if budget_violation {
+        crate::metrics::inc_budget_violation();
     }
 
     tracing::info!(
@@ -931,6 +958,8 @@ async fn run_context_loop(
         principal_id = %ctx.principal_id,
         session_id = %ctx.session_id,
         terminal_mode = %terminal_mode.as_str(),
+        stop_reason = %stop_reason,
+        budget_violation,
         operator_calls_used,
         depth_used,
         bytes_used,

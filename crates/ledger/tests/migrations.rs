@@ -1,9 +1,16 @@
+use sqlx::Row;
+
 fn test_db_url() -> Option<String> {
     std::env::var("PECR_TEST_DB_URL")
         .ok()
         .or_else(|| std::env::var("DATABASE_URL").ok())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+fn schema_db_url(base: &str, schema: &str) -> String {
+    let separator = if base.contains('?') { "&" } else { "?" };
+    format!("{base}{separator}options=-csearch_path%3D{schema}")
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -154,6 +161,109 @@ async fn migrations_enforce_append_only_tables() {
             "expected append-only error for {table} delete, got: {delete_err:?}"
         );
     }
+
+    let drop_schema = format!("DROP SCHEMA {} CASCADE", schema);
+    let _ = sqlx::query(&drop_schema).execute(&pool).await;
+
+    pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ledger_event_payload_hash_verifies() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping ledger integrity test; set PECR_TEST_DB_URL to enable");
+        return;
+    };
+
+    let schema = format!("pecr_test_{}", ulid::Ulid::new());
+    let schema_url = schema_db_url(&db_url, &schema);
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url)
+        .await
+        .expect("DB connect should succeed");
+
+    let create_schema = format!("CREATE SCHEMA {}", schema);
+    sqlx::query(&create_schema)
+        .execute(&pool)
+        .await
+        .expect("create schema should succeed");
+
+    let writer = pecr_ledger::LedgerWriter::connect_and_migrate(
+        &schema_url,
+        std::time::Duration::from_millis(500),
+    )
+    .await
+    .expect("ledger writer init should succeed");
+
+    let budget = pecr_contracts::Budget {
+        max_operator_calls: 10,
+        max_bytes: 1024,
+        max_wallclock_ms: 1000,
+        max_recursion_depth: 1,
+        max_parallelism: None,
+    };
+
+    let mut snapshot = pecr_contracts::PolicySnapshot {
+        policy_snapshot_hash: String::new(),
+        principal_id: "dev".to_string(),
+        tenant_id: "local".to_string(),
+        principal_roles: Vec::new(),
+        principal_attrs_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .to_string(),
+        policy_bundle_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            .to_string(),
+        as_of_time: "1970-01-01T00:00:00Z".to_string(),
+        evaluated_at: "1970-01-01T00:00:00Z".to_string(),
+    };
+    snapshot.policy_snapshot_hash = snapshot.compute_hash();
+
+    writer
+        .create_session("s1", "t1", "dev", &budget, "ps1", &snapshot)
+        .await
+        .expect("create session should succeed");
+
+    let payload_json = serde_json::json!({
+        "k": "v",
+        "obj": {"a": "b", "c": "d"},
+        "arr": ["x", "y"]
+    });
+
+    let event_id = writer
+        .append_event("t1", "s1", "TEST_EVENT", "dev", "ps1", payload_json.clone())
+        .await
+        .expect("append event should succeed");
+
+    let verify_pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&schema_url)
+        .await
+        .expect("DB connect should succeed");
+
+    let row = sqlx::query(
+        "SELECT payload_json, payload_hash FROM pecr_ledger_events WHERE event_id = $1",
+    )
+    .bind(&event_id)
+    .fetch_one(&verify_pool)
+    .await
+    .expect("fetch event should succeed");
+
+    let stored_payload_json: serde_json::Value = row
+        .try_get("payload_json")
+        .expect("payload_json should exist");
+    let stored_payload_hash: String = row
+        .try_get("payload_hash")
+        .expect("payload_hash should exist");
+
+    let recomputed = pecr_contracts::canonical::hash_canonical_json(&stored_payload_json);
+    assert_eq!(stored_payload_hash, recomputed);
+
+    let expected = pecr_contracts::canonical::hash_canonical_json(&payload_json);
+    assert_eq!(stored_payload_hash, expected);
+
+    verify_pool.close().await;
+    writer.close().await;
 
     let drop_schema = format!("DROP SCHEMA {} CASCADE", schema);
     let _ = sqlx::query(&drop_schema).execute(&pool).await;

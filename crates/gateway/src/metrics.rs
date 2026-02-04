@@ -10,6 +10,7 @@ static HTTP_REQUESTS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static HTTP_REQUEST_DURATION_SECONDS: OnceLock<HistogramVec> = OnceLock::new();
 static TERMINAL_MODES_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static OPERATOR_CALLS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static OPERATOR_CACHE_HITS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static BUDGET_VIOLATIONS_TOTAL: OnceLock<IntCounter> = OnceLock::new();
 static STALENESS_ERRORS_TOTAL: OnceLock<IntCounter> = OnceLock::new();
 static LEAKAGE_DETECTIONS_TOTAL: OnceLock<IntCounter> = OnceLock::new();
@@ -153,11 +154,33 @@ pub fn observe_operator_call(operator_name: &str, outcome: &str) {
         .inc();
 }
 
+fn operator_cache_hits_total() -> &'static IntCounterVec {
+    OPERATOR_CACHE_HITS_TOTAL.get_or_init(|| {
+        register_collector(
+            IntCounterVec::new(
+                Opts::new(
+                    "pecr_gateway_operator_cache_hits_total",
+                    "Gateway operator cache hits.",
+                ),
+                &["operator_name"],
+            )
+            .expect("create pecr_gateway_operator_cache_hits_total"),
+        )
+    })
+}
+
 pub fn inc_budget_violation() {
     budget_violations_total().inc();
 }
 
+pub fn inc_operator_cache_hit(operator_name: &str) {
+    operator_cache_hits_total()
+        .with_label_values(&[operator_name])
+        .inc();
+}
+
 pub fn render() -> Result<(Vec<u8>, String), prometheus::Error> {
+    let _ = budget_violations_total();
     let _ = staleness_errors_total();
     let _ = leakage_detections_total();
 

@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
@@ -26,14 +27,17 @@ use ulid::Ulid;
 
 use crate::config::{GatewayConfig, StartupError};
 use crate::opa::{OpaCacheKey, OpaClient};
+use crate::operator_cache::{OperatorCache, OperatorCacheKey};
 
 #[derive(Clone)]
 pub struct AppState {
     pub config: GatewayConfig,
     ledger: LedgerWriter,
     opa: OpaClient,
+    operator_cache: OperatorCache,
     pg_pool: PgPool,
     fs_versions: Arc<RwLock<FsVersionCache>>,
+    pg_versions: Arc<RwLock<FsVersionCache>>,
     sessions: Arc<RwLock<HashMap<String, Session>>>,
 }
 
@@ -48,6 +52,7 @@ struct Session {
     tenant_id: String,
     policy_snapshot_id: String,
     policy_snapshot_hash: String,
+    as_of_time: String,
     budget: Budget,
     session_token: String,
     session_token_expires_at: Instant,
@@ -86,7 +91,17 @@ pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
             message: "failed to initialize safe-view database pool".to_string(),
         })?;
 
+    let operator_cache = OperatorCache::new(
+        config.cache_max_entries,
+        Duration::from_millis(config.cache_ttl_ms),
+    );
+
     let fs_versions = Arc::new(RwLock::new(FsVersionCache::new(
+        config.fs_version_cache_max_bytes,
+        config.fs_version_cache_max_versions_per_object,
+    )));
+
+    let pg_versions = Arc::new(RwLock::new(FsVersionCache::new(
         config.fs_version_cache_max_bytes,
         config.fs_version_cache_max_versions_per_object,
     )));
@@ -95,8 +110,10 @@ pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
         config,
         ledger,
         opa,
+        operator_cache,
         pg_pool,
         fs_versions,
+        pg_versions,
         sessions: Arc::new(RwLock::new(HashMap::new())),
     };
 
@@ -130,6 +147,8 @@ async fn metrics() -> impl IntoResponse {
 #[serde(deny_unknown_fields)]
 struct CreateSessionRequest {
     budget: Budget,
+    #[serde(default)]
+    as_of_time: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -169,6 +188,24 @@ async fn create_session(
         )
     })?;
 
+    let as_of_time = match req
+        .as_of_time
+        .as_deref()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+    {
+        None => state.config.as_of_time_default.clone(),
+        Some(raw) => sanitize_as_of_time(raw).ok_or_else(|| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "ERR_INVALID_PARAMS",
+                "as_of_time must be RFC3339 UTC (YYYY-MM-DDTHH:MM:SSZ)".to_string(),
+                TerminalMode::InsufficientEvidence,
+                false,
+            )
+        })?,
+    };
+
     let session_id = Ulid::new().to_string();
     let policy_snapshot_id = Ulid::new().to_string();
 
@@ -193,8 +230,8 @@ async fn create_session(
             principal_roles: Vec::new(),
             principal_attrs_hash: canonical::hash_canonical_json(&serde_json::json!({})),
             policy_bundle_hash: state.config.policy_bundle_hash.clone(),
-            as_of_time: state.config.as_of_time_default.clone(),
-            evaluated_at: state.config.as_of_time_default.clone(),
+            as_of_time: as_of_time.clone(),
+            evaluated_at: as_of_time.clone(),
         };
         policy_snapshot.policy_snapshot_hash = policy_snapshot.compute_hash();
         tracing::Span::current().record(
@@ -228,7 +265,7 @@ async fn create_session(
                         "principal_id": principal_id.as_str(),
                         "policy_snapshot_hash": policy_snapshot.policy_snapshot_hash.as_str(),
                         "policy_bundle_hash": state.config.policy_bundle_hash.as_str(),
-                        "as_of_time": state.config.as_of_time_default.as_str(),
+                        "as_of_time": as_of_time.as_str(),
                         "budget_hash": budget_hash,
                         "request_id": request_id.as_str(),
                     }),
@@ -327,6 +364,7 @@ async fn create_session(
             tenant_id: policy_snapshot.tenant_id.clone(),
             policy_snapshot_id: policy_snapshot_id.clone(),
             policy_snapshot_hash: policy_snapshot.policy_snapshot_hash.clone(),
+            as_of_time: as_of_time.clone(),
             budget: req.budget.clone(),
             session_token: session_token.clone(),
             session_token_expires_at,
@@ -730,7 +768,7 @@ async fn call_operator(
             "policy_snapshot_id": session.policy_snapshot_id.as_str(),
             "policy_snapshot_hash": session.policy_snapshot_hash.as_str(),
             "policy_bundle_hash": state.config.policy_bundle_hash.as_str(),
-            "as_of_time": state.config.as_of_time_default.as_str(),
+            "as_of_time": session.as_of_time.as_str(),
             "op_name": op_name.as_str(),
             "params_hash": params_hash.as_str(),
             "params_bytes": params_bytes,
@@ -1014,6 +1052,15 @@ async fn call_operator(
         async {
         let started = Instant::now();
 
+        let mut cache_hit = false;
+        let operator_cache_key = OperatorCacheKey::operator_call(
+            principal_id.as_str(),
+            session.policy_snapshot_hash.as_str(),
+            session.as_of_time.as_str(),
+            op_name.as_str(),
+            params_hash.as_str(),
+        );
+
         let (status, error_code, response, evidence_emitted) = match op_name.as_str() {
             "search" => {
                 let adapter_span = tracing::info_span!(
@@ -1026,25 +1073,54 @@ async fn call_operator(
                     latency_ms = tracing::field::Empty,
                     outcome = tracing::field::Empty,
                 );
-                let adapter_started = Instant::now();
-                let refs = adapter_span.in_scope(|| {
-                    search_from_fs(
+
+                let (terminal_mode, result, hit) = async {
+                    let started = Instant::now();
+                    if let Some((terminal_mode, result)) =
+                        state.operator_cache.get(&operator_cache_key).await
+                    {
+                        let latency_ms = started.elapsed().as_millis() as u64;
+                        tracing::Span::current().record("latency_ms", latency_ms);
+                        tracing::Span::current().record("outcome", "cache_hit");
+                        return Ok::<_, ApiError>((terminal_mode, result, true));
+                    }
+
+                    let refs = search_from_fs(
                         &state.config.fs_corpus_path,
-                        &state.config.as_of_time_default,
+                        session.as_of_time.as_str(),
                         &session.policy_snapshot_hash,
                         &req.params,
-                    )
-                })?;
-                let latency_ms = adapter_started.elapsed().as_millis() as u64;
-                adapter_span.record("latency_ms", latency_ms);
-                adapter_span.record("outcome", "ok");
+                    )?;
+                    let result = serde_json::json!({ "refs": refs });
+                    state
+                        .operator_cache
+                        .put(
+                            operator_cache_key.clone(),
+                            TerminalMode::Supported,
+                            result.clone(),
+                        )
+                        .await;
+
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    tracing::Span::current().record("latency_ms", latency_ms);
+                    tracing::Span::current().record("outcome", "ok");
+
+                    Ok::<_, ApiError>((TerminalMode::Supported, result, false))
+                }
+                .instrument(adapter_span)
+                .await?;
+
+                if hit {
+                    cache_hit = true;
+                    crate::metrics::inc_operator_cache_hit("search");
+                }
 
                 (
                     StatusCode::OK,
                     None,
                     OperatorCallResponse {
-                        terminal_mode: TerminalMode::Supported,
-                        result: serde_json::json!({ "refs": refs }),
+                        terminal_mode,
+                        result,
                     },
                     Vec::new(),
                 )
@@ -1065,7 +1141,7 @@ async fn call_operator(
                     let versions = list_versions_from_fs(
                         &state.fs_versions,
                         &state.config.fs_corpus_path,
-                        &state.config.as_of_time_default,
+                        session.as_of_time.as_str(),
                         &req.params,
                     )
                     .await?;
@@ -1103,7 +1179,7 @@ async fn call_operator(
                     let evidence = diff_from_fs(
                         &state.fs_versions,
                         &state.config.fs_corpus_path,
-                        &state.config.as_of_time_default,
+                        session.as_of_time.as_str(),
                         state.config.fs_diff_max_bytes,
                         &session.policy_snapshot_id,
                         &session.policy_snapshot_hash,
@@ -1141,19 +1217,25 @@ async fn call_operator(
                     latency_ms = tracing::field::Empty,
                     outcome = tracing::field::Empty,
                 );
-                let adapter_started = Instant::now();
-                let evidence = adapter_span.in_scope(|| {
-                    fetch_span_from_fs(
+
+                let evidence = async {
+                    let started = Instant::now();
+                    let evidence = fetch_span_from_fs(
+                        &state.fs_versions,
                         &state.config.fs_corpus_path,
-                        &state.config.as_of_time_default,
+                        session.as_of_time.as_str(),
                         &session.policy_snapshot_id,
                         &session.policy_snapshot_hash,
                         &req.params,
                     )
-                })?;
-                let latency_ms = adapter_started.elapsed().as_millis() as u64;
-                adapter_span.record("latency_ms", latency_ms);
-                adapter_span.record("outcome", "ok");
+                    .await?;
+                    let latency_ms = started.elapsed().as_millis() as u64;
+                    tracing::Span::current().record("latency_ms", latency_ms);
+                    tracing::Span::current().record("outcome", "ok");
+                    Ok::<_, ApiError>(evidence)
+                }
+                .instrument(adapter_span)
+                .await?;
 
                 let result =
                     serde_json::to_value(&evidence).unwrap_or_else(|_| serde_json::json!({}));
@@ -1171,6 +1253,7 @@ async fn call_operator(
                 let tenant_id = session.tenant_id.clone();
                 let policy_snapshot_id = session.policy_snapshot_id.clone();
                 let policy_snapshot_hash = session.policy_snapshot_hash.clone();
+                let as_of_time = session.as_of_time.clone();
 
                 let adapter_span = tracing::info_span!(
                     "adapter.pg_safeview",
@@ -1185,15 +1268,16 @@ async fn call_operator(
 
                 let evidence = async {
                     let started = Instant::now();
-                    let evidence = fetch_rows_from_pg_safeview(
-                        &state.pg_pool,
-                        &state.config,
-                        &tenant_id,
-                        &policy_snapshot_id,
-                        &policy_snapshot_hash,
-                        &req.params,
-                    )
-                    .await?;
+                    let ctx = PgSafeviewContext {
+                        pool: &state.pg_pool,
+                        config: &state.config,
+                        versions: &state.pg_versions,
+                        tenant_id: tenant_id.as_str(),
+                        policy_snapshot_id: policy_snapshot_id.as_str(),
+                        policy_snapshot_hash: policy_snapshot_hash.as_str(),
+                        as_of_time: as_of_time.as_str(),
+                    };
+                    let evidence = fetch_rows_from_pg_safeview(ctx, &req.params).await?;
                     let latency_ms = started.elapsed().as_millis() as u64;
                     tracing::Span::current().record("latency_ms", latency_ms);
                     tracing::Span::current().record("outcome", "ok");
@@ -1218,6 +1302,7 @@ async fn call_operator(
                 let tenant_id = session.tenant_id.clone();
                 let policy_snapshot_id = session.policy_snapshot_id.clone();
                 let policy_snapshot_hash = session.policy_snapshot_hash.clone();
+                let as_of_time = session.as_of_time.clone();
 
                 let adapter_span = tracing::info_span!(
                     "adapter.pg_safeview",
@@ -1238,6 +1323,7 @@ async fn call_operator(
                         &tenant_id,
                         &policy_snapshot_id,
                         &policy_snapshot_hash,
+                        as_of_time.as_str(),
                         &req.params,
                     )
                     .await?;
@@ -1364,6 +1450,7 @@ async fn call_operator(
                     serde_json::json!({
                         "op_name": op_name.as_str(),
                         "params_hash": params_hash,
+                        "cache_hit": cache_hit,
                         "params_bytes": params_bytes,
                         "result_bytes": result_bytes,
                         "terminal_mode": response.terminal_mode.as_str(),
@@ -1473,6 +1560,7 @@ struct FsVersionCache {
     total_bytes: usize,
     fifo: VecDeque<(String, String, usize)>,
     entries: HashMap<String, HashMap<String, Vec<u8>>>,
+    observed_versions: HashMap<String, BTreeMap<String, String>>,
 }
 
 impl FsVersionCache {
@@ -1483,7 +1571,29 @@ impl FsVersionCache {
             total_bytes: 0,
             fifo: VecDeque::new(),
             entries: HashMap::new(),
+            observed_versions: HashMap::new(),
         }
+    }
+
+    fn observe_version(&mut self, object_id: &str, as_of_time: &str, version_id: &str) {
+        self.observed_versions
+            .entry(object_id.to_string())
+            .or_default()
+            .insert(as_of_time.to_string(), version_id.to_string());
+    }
+
+    fn select_version_at(&self, object_id: &str, as_of_time: &str) -> Option<String> {
+        let observed = self.observed_versions.get(object_id)?;
+        let object_entry = self.entries.get(object_id)?;
+
+        observed
+            .range(..=as_of_time.to_string())
+            .rev()
+            .find_map(|(_, version_id)| {
+                object_entry
+                    .contains_key(version_id)
+                    .then(|| version_id.clone())
+            })
     }
 
     fn insert(&mut self, object_id: &str, version_id: &str, bytes: Vec<u8>) {
@@ -1679,6 +1789,7 @@ async fn list_versions_from_fs(
 
     let mut cache = fs_versions.write().await;
     cache.insert(object_id, &version_id, bytes);
+    cache.observe_version(object_id, as_of_time_default, &version_id);
     let mut version_ids = cache.list_version_ids(object_id);
     if !version_ids.contains(&version_id) {
         version_ids.push(version_id.clone());
@@ -1889,9 +2000,10 @@ async fn diff_from_fs(
     }])
 }
 
-fn fetch_span_from_fs(
+async fn fetch_span_from_fs(
+    fs_versions: &Arc<RwLock<FsVersionCache>>,
     fs_corpus_path: &str,
-    as_of_time_default: &str,
+    as_of_time: &str,
     policy_snapshot_id: &str,
     policy_snapshot_hash: &str,
     params: &serde_json::Value,
@@ -1911,60 +2023,34 @@ fn fetch_span_from_fs(
             )
         })?;
 
-    let object_rel = std::path::Path::new(object_id);
-    if object_rel.is_absolute() || !is_safe_rel_path(object_rel) {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "ERR_INVALID_PARAMS",
-            "object_id must be a relative path without parent components".to_string(),
-            TerminalMode::InsufficientEvidence,
-            false,
-        ));
-    }
+    let selected_version_id = fs_versions
+        .read()
+        .await
+        .select_version_at(object_id, as_of_time);
 
-    let base = std::path::Path::new(fs_corpus_path);
-    let base_canon = base.canonicalize().map_err(|_| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ERR_INTERNAL",
-            "filesystem corpus path does not exist".to_string(),
-            TerminalMode::SourceUnavailable,
-            false,
-        )
-    })?;
+    let (bytes, version_id) = if let Some(version_id) = selected_version_id {
+        if let Some(bytes) = fs_versions.read().await.get(object_id, &version_id) {
+            (bytes.to_vec(), version_id)
+        } else {
+            let bytes = read_object_bytes_from_fs(fs_corpus_path, object_id)?;
+            let version_id = sha256_hex(&bytes);
 
-    let full_path = base.join(object_rel);
-    let full_canon = full_path.canonicalize().map_err(|_| {
-        json_error(
-            StatusCode::NOT_FOUND,
-            "ERR_SOURCE_UNAVAILABLE",
-            "object not found".to_string(),
-            TerminalMode::SourceUnavailable,
-            false,
-        )
-    })?;
+            let mut cache = fs_versions.write().await;
+            cache.insert(object_id, &version_id, bytes.clone());
+            cache.observe_version(object_id, as_of_time, &version_id);
 
-    if !full_canon.starts_with(&base_canon) {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "ERR_INVALID_PARAMS",
-            "object_id escapes corpus root".to_string(),
-            TerminalMode::InsufficientEvidence,
-            false,
-        ));
-    }
+            (bytes, version_id)
+        }
+    } else {
+        let bytes = read_object_bytes_from_fs(fs_corpus_path, object_id)?;
+        let version_id = sha256_hex(&bytes);
 
-    let bytes = std::fs::read(&full_canon).map_err(|_| {
-        json_error(
-            StatusCode::NOT_FOUND,
-            "ERR_SOURCE_UNAVAILABLE",
-            "object not found".to_string(),
-            TerminalMode::SourceUnavailable,
-            false,
-        )
-    })?;
+        let mut cache = fs_versions.write().await;
+        cache.insert(object_id, &version_id, bytes.clone());
+        cache.observe_version(object_id, as_of_time, &version_id);
 
-    let version_id = sha256_hex(&bytes);
+        (bytes, version_id)
+    };
 
     let start_byte = params
         .get("start_byte")
@@ -2020,7 +2106,7 @@ fn fetch_span_from_fs(
         "version_id": version_id.clone(),
         "span_or_row_spec": span_or_row_spec.clone(),
         "content_hash": content_hash.clone(),
-        "as_of_time": as_of_time_default,
+        "as_of_time": as_of_time,
         "policy_snapshot_hash": policy_snapshot_hash,
         "transform_chain": transform_chain,
     });
@@ -2034,8 +2120,8 @@ fn fetch_span_from_fs(
         content_type: pecr_contracts::EvidenceContentType::TextPlain,
         content: Some(serde_json::Value::String(content.to_string())),
         content_hash,
-        retrieved_at: as_of_time_default.to_string(),
-        as_of_time: as_of_time_default.to_string(),
+        retrieved_at: as_of_time.to_string(),
+        as_of_time: as_of_time.to_string(),
         policy_snapshot_id: policy_snapshot_id.to_string(),
         policy_snapshot_hash: policy_snapshot_hash.to_string(),
         transform_chain: Vec::new(),
@@ -2239,6 +2325,21 @@ fn safeview_spec(view_id: &str) -> Option<SafeViewSpec> {
             allowlisted_group_by_fields: &["status", "plan_tier"],
             allowlisted_metrics: METRICS,
         }),
+        "safe_customer_view_public_slow" => Some(SafeViewSpec {
+            view_id: "safe_customer_view_public_slow",
+            primary_key_fields: PK,
+            version_field: "updated_at",
+            allowlisted_fields: &[
+                "tenant_id",
+                "customer_id",
+                "status",
+                "plan_tier",
+                "updated_at",
+            ],
+            allowlisted_filter_fields: &["customer_id", "status", "plan_tier"],
+            allowlisted_group_by_fields: &["status", "plan_tier"],
+            allowlisted_metrics: METRICS,
+        }),
         "safe_customer_view_admin" => Some(SafeViewSpec {
             view_id: "safe_customer_view_admin",
             primary_key_fields: PK,
@@ -2429,14 +2530,29 @@ fn parse_safeview_filter_spec(
     Ok(out)
 }
 
+struct PgSafeviewContext<'a> {
+    pool: &'a PgPool,
+    config: &'a GatewayConfig,
+    versions: &'a Arc<RwLock<FsVersionCache>>,
+    tenant_id: &'a str,
+    policy_snapshot_id: &'a str,
+    policy_snapshot_hash: &'a str,
+    as_of_time: &'a str,
+}
+
 async fn fetch_rows_from_pg_safeview(
-    pool: &PgPool,
-    config: &GatewayConfig,
-    tenant_id: &str,
-    policy_snapshot_id: &str,
-    policy_snapshot_hash: &str,
+    ctx: PgSafeviewContext<'_>,
     params: &serde_json::Value,
 ) -> Result<Vec<pecr_contracts::EvidenceUnit>, (StatusCode, Json<ErrorResponse>)> {
+    let PgSafeviewContext {
+        pool,
+        config,
+        versions: pg_versions,
+        tenant_id,
+        policy_snapshot_id,
+        policy_snapshot_hash,
+        as_of_time,
+    } = ctx;
     let view_id = parse_safeview_string(params.get("view_id"), "view_id")?;
     let spec = safeview_spec(&view_id).ok_or_else(|| {
         json_error(
@@ -2451,21 +2567,114 @@ async fn fetch_rows_from_pg_safeview(
     let fields = parse_safeview_fields(params, spec, config.pg_safeview_max_fields)?;
     let filters = parse_safeview_filter_spec(params, spec)?;
 
-    let mut select_fields = spec
-        .primary_key_fields
+    if let Some(customer_id) = filters
         .iter()
-        .map(|s| s.to_string())
-        .collect::<Vec<_>>();
-    select_fields.push(spec.version_field.to_string());
-    for f in &fields {
-        if !select_fields.iter().any(|existing| existing == f) {
-            select_fields.push(f.clone());
+        .find(|(field, _)| field == "customer_id")
+        .map(|(_, value)| value.as_str())
+    {
+        let cache_object_id = format!("{}:{}:{}", spec.view_id, tenant_id, customer_id);
+        let cache = pg_versions.read().await;
+        if let Some(version_id) = cache.select_version_at(cache_object_id.as_str(), as_of_time)
+            && let Some(snapshot_bytes) = cache.get(cache_object_id.as_str(), version_id.as_str())
+            && let Ok(snapshot_value) = serde_json::from_slice::<serde_json::Value>(snapshot_bytes)
+            && let Some(snapshot_obj) = snapshot_value.as_object()
+            && filters.iter().all(|(field, expected)| {
+                snapshot_obj
+                    .get(field)
+                    .and_then(|v| v.as_str())
+                    .map(|actual| actual == expected)
+                    .unwrap_or(false)
+            })
+        {
+            let mut primary_key = serde_json::Map::new();
+            let mut pk_values = Vec::with_capacity(spec.primary_key_fields.len());
+            for pk in spec.primary_key_fields {
+                let value = snapshot_obj
+                    .get(*pk)
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "ERR_INTERNAL",
+                            "safe view snapshot missing primary key field".to_string(),
+                            TerminalMode::SourceUnavailable,
+                            false,
+                        )
+                    })?;
+                pk_values.push(value.to_string());
+                primary_key.insert(pk.to_string(), serde_json::Value::String(value.to_string()));
+            }
+
+            let mut content = serde_json::Map::new();
+            for field in &fields {
+                content.insert(
+                    field.clone(),
+                    snapshot_obj
+                        .get(field)
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null),
+                );
+            }
+            let content = serde_json::Value::Object(content);
+            let content_hash = canonical::hash_canonical_json(&content);
+
+            let span_or_row_spec = serde_json::json!({
+                "type": "db_row",
+                "view_id": spec.view_id,
+                "primary_key": primary_key,
+                "fields": &fields,
+            });
+
+            let object_id = format!("{}:{}", spec.view_id, pk_values.join(":"));
+            let transform_chain: Vec<pecr_contracts::TransformStep> = Vec::new();
+            let identity = serde_json::json!({
+                "source_system": "pg_safeview",
+                "object_id": object_id.as_str(),
+                "version_id": version_id.clone(),
+                "span_or_row_spec": span_or_row_spec.clone(),
+                "content_hash": content_hash.clone(),
+                "as_of_time": as_of_time,
+                "policy_snapshot_hash": policy_snapshot_hash,
+                "transform_chain": transform_chain,
+            });
+            let evidence_unit_id = canonical::hash_canonical_json(&identity);
+
+            return Ok(vec![pecr_contracts::EvidenceUnit {
+                source_system: "pg_safeview".to_string(),
+                object_id,
+                version_id,
+                span_or_row_spec,
+                content_type: pecr_contracts::EvidenceContentType::ApplicationJson,
+                content: Some(content),
+                content_hash,
+                retrieved_at: as_of_time.to_string(),
+                as_of_time: as_of_time.to_string(),
+                policy_snapshot_id: policy_snapshot_id.to_string(),
+                policy_snapshot_hash: policy_snapshot_hash.to_string(),
+                transform_chain: Vec::new(),
+                evidence_unit_id,
+            }]);
         }
     }
 
+    let select_fields = spec
+        .allowlisted_fields
+        .iter()
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+
     let select_sql = select_fields
         .iter()
-        .map(|f| format!("{}::text as {}", f, f))
+        .map(|f| {
+            if f == spec.version_field {
+                format!(
+                    "to_char({} AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as {}",
+                    f, f
+                )
+            } else {
+                format!("{}::text as {}", f, f)
+            }
+        })
         .collect::<Vec<_>>()
         .join(", ");
 
@@ -2551,8 +2760,6 @@ async fn fetch_rows_from_pg_safeview(
         )
     })?;
 
-    let as_of_time_default = config.as_of_time_default.as_str();
-
     let schema_error = || {
         json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -2564,29 +2771,43 @@ async fn fetch_rows_from_pg_safeview(
     };
 
     let mut out = Vec::with_capacity(rows.len());
+    let mut cache = pg_versions.write().await;
     for row in rows {
+        let mut snapshot = serde_json::Map::new();
+        for field in spec.allowlisted_fields {
+            let value: Option<String> = row.try_get(field).map_err(|_| schema_error())?;
+            snapshot.insert(
+                field.to_string(),
+                value
+                    .map(serde_json::Value::String)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+        }
+
         let mut primary_key = serde_json::Map::new();
         let mut pk_values = Vec::with_capacity(spec.primary_key_fields.len());
         for pk in spec.primary_key_fields {
-            let value: Option<String> = row.try_get(pk).map_err(|_| schema_error())?;
-            let value = value.ok_or_else(&schema_error)?;
-            pk_values.push(value.clone());
-            primary_key.insert(pk.to_string(), serde_json::Value::String(value));
+            let value = snapshot
+                .get(*pk)
+                .and_then(|v| v.as_str())
+                .ok_or_else(&schema_error)?;
+            pk_values.push(value.to_string());
+            primary_key.insert(pk.to_string(), serde_json::Value::String(value.to_string()));
         }
 
-        let updated_at: Option<String> = row
-            .try_get(spec.version_field)
-            .map_err(|_| schema_error())?;
-        let updated_at = updated_at.ok_or_else(&schema_error)?;
+        let updated_at = snapshot
+            .get(spec.version_field)
+            .and_then(|v| v.as_str())
+            .ok_or_else(&schema_error)?;
         let version_id = sha256_hex(updated_at.as_bytes());
 
         let mut content = serde_json::Map::new();
         for field in &fields {
-            let value: Option<String> = row.try_get(field.as_str()).map_err(|_| schema_error())?;
             content.insert(
                 field.clone(),
-                value
-                    .map(serde_json::Value::String)
+                snapshot
+                    .get(field)
+                    .cloned()
                     .unwrap_or(serde_json::Value::Null),
             );
         }
@@ -2608,11 +2829,16 @@ async fn fetch_rows_from_pg_safeview(
             "version_id": version_id.clone(),
             "span_or_row_spec": span_or_row_spec.clone(),
             "content_hash": content_hash.clone(),
-            "as_of_time": as_of_time_default,
+            "as_of_time": as_of_time,
             "policy_snapshot_hash": policy_snapshot_hash,
             "transform_chain": transform_chain,
         });
         let evidence_unit_id = canonical::hash_canonical_json(&identity);
+
+        let snapshot_bytes =
+            serde_json::to_vec(&serde_json::Value::Object(snapshot)).unwrap_or_else(|_| Vec::new());
+        cache.insert(object_id.as_str(), version_id.as_str(), snapshot_bytes);
+        cache.observe_version(object_id.as_str(), as_of_time, version_id.as_str());
 
         out.push(pecr_contracts::EvidenceUnit {
             source_system: "pg_safeview".to_string(),
@@ -2622,14 +2848,15 @@ async fn fetch_rows_from_pg_safeview(
             content_type: pecr_contracts::EvidenceContentType::ApplicationJson,
             content: Some(content),
             content_hash,
-            retrieved_at: as_of_time_default.to_string(),
-            as_of_time: as_of_time_default.to_string(),
+            retrieved_at: as_of_time.to_string(),
+            as_of_time: as_of_time.to_string(),
             policy_snapshot_id: policy_snapshot_id.to_string(),
             policy_snapshot_hash: policy_snapshot_hash.to_string(),
             transform_chain: Vec::new(),
             evidence_unit_id,
         });
     }
+    drop(cache);
 
     Ok(out)
 }
@@ -2640,6 +2867,7 @@ async fn aggregate_from_pg_safeview(
     tenant_id: &str,
     policy_snapshot_id: &str,
     policy_snapshot_hash: &str,
+    as_of_time: &str,
     params: &serde_json::Value,
 ) -> Result<pecr_contracts::EvidenceUnit, (StatusCode, Json<ErrorResponse>)> {
     let view_id = parse_safeview_string(params.get("view_id"), "view_id")?;
@@ -2927,7 +3155,6 @@ async fn aggregate_from_pg_safeview(
             .collect::<Vec<_>>(),
     });
 
-    let as_of_time_default = config.as_of_time_default.as_str();
     let version_id = content_hash.clone();
     let transform_chain: Vec<pecr_contracts::TransformStep> = Vec::new();
     let identity = serde_json::json!({
@@ -2936,7 +3163,7 @@ async fn aggregate_from_pg_safeview(
         "version_id": version_id.clone(),
         "span_or_row_spec": span_or_row_spec.clone(),
         "content_hash": content_hash.clone(),
-        "as_of_time": as_of_time_default,
+        "as_of_time": as_of_time,
         "policy_snapshot_hash": policy_snapshot_hash,
         "transform_chain": transform_chain,
     });
@@ -2950,8 +3177,8 @@ async fn aggregate_from_pg_safeview(
         content_type: pecr_contracts::EvidenceContentType::ApplicationJson,
         content: Some(content),
         content_hash,
-        retrieved_at: as_of_time_default.to_string(),
-        as_of_time: as_of_time_default.to_string(),
+        retrieved_at: as_of_time.to_string(),
+        as_of_time: as_of_time.to_string(),
         policy_snapshot_id: policy_snapshot_id.to_string(),
         policy_snapshot_hash: policy_snapshot_hash.to_string(),
         transform_chain: Vec::new(),
@@ -2991,18 +3218,12 @@ fn claim_id_for(claim_text: &str, status: ClaimStatus, evidence_unit_ids: &[Stri
     }))
 }
 
-fn finalize_gate(session: &Session, mut claim_map: ClaimMap) -> Result<ClaimMap, ApiError> {
-    if !claim_map.coverage_threshold.is_finite()
-        || !(0.0..=1.0).contains(&claim_map.coverage_threshold)
-    {
-        return Err(json_error(
-            StatusCode::BAD_REQUEST,
-            "ERR_INVALID_PARAMS",
-            "claim_map.coverage_threshold must be between 0 and 1".to_string(),
-            TerminalMode::InsufficientEvidence,
-            false,
-        ));
-    }
+fn finalize_gate(
+    session: &Session,
+    mut claim_map: ClaimMap,
+    coverage_threshold: f64,
+) -> Result<ClaimMap, ApiError> {
+    claim_map.coverage_threshold = coverage_threshold;
 
     let mut supported_claims: u64 = 0;
     let mut covered_supported_claims: u64 = 0;
@@ -3057,18 +3278,15 @@ fn finalize_gate(session: &Session, mut claim_map: ClaimMap) -> Result<ClaimMap,
         claim.claim_id = claim_id_for(&claim.claim_text, claim.status, &claim.evidence_unit_ids);
     }
 
-    claim_map.coverage_observed = if supported_claims == 0 {
-        1.0
-    } else {
-        covered_supported_claims as f64 / supported_claims as f64
-    };
+    claim_map.coverage_observed =
+        covered_supported_claims as f64 / std::cmp::max(1, supported_claims) as f64;
 
     let budget_violation = session.operator_calls_used > session.budget.max_operator_calls
         || session.bytes_used > session.budget.max_bytes;
 
     claim_map.terminal_mode = if !budget_violation
         && supported_claims > 0
-        && claim_map.coverage_observed >= claim_map.coverage_threshold
+        && claim_map.coverage_observed >= coverage_threshold
     {
         TerminalMode::Supported
     } else {
@@ -3165,7 +3383,7 @@ async fn finalize(
             "policy_snapshot_id": session.policy_snapshot_id.as_str(),
             "policy_snapshot_hash": session.policy_snapshot_hash.as_str(),
             "policy_bundle_hash": state.config.policy_bundle_hash.as_str(),
-            "as_of_time": state.config.as_of_time_default.as_str(),
+            "as_of_time": session.as_of_time.as_str(),
             "request_id": request_id.as_str(),
         });
         let cache_key = OpaCacheKey::finalize(&session.policy_snapshot_hash);
@@ -3300,7 +3518,7 @@ async fn finalize(
                 response_text,
                 session_id: _,
             } = req;
-            let claim_map = finalize_gate(session, claim_map)?;
+            let claim_map = finalize_gate(session, claim_map, state.config.coverage_threshold)?;
 
             let terminal_mode = claim_map.terminal_mode.as_str();
             tracing::Span::current().record("terminal_mode", terminal_mode);
@@ -3480,6 +3698,43 @@ fn sanitize_request_id(raw: &str) -> Option<String> {
     (!out.is_empty()).then_some(out)
 }
 
+fn sanitize_as_of_time(raw: &str) -> Option<String> {
+    const LEN: usize = 20;
+    let raw = raw.trim();
+    if raw.len() != LEN {
+        return None;
+    }
+
+    let bytes = raw.as_bytes();
+    let digit = |idx: usize| bytes.get(idx).is_some_and(|b| b.is_ascii_digit());
+
+    if !digit(0)
+        || !digit(1)
+        || !digit(2)
+        || !digit(3)
+        || bytes.get(4) != Some(&b'-')
+        || !digit(5)
+        || !digit(6)
+        || bytes.get(7) != Some(&b'-')
+        || !digit(8)
+        || !digit(9)
+        || bytes.get(10) != Some(&b'T')
+        || !digit(11)
+        || !digit(12)
+        || bytes.get(13) != Some(&b':')
+        || !digit(14)
+        || !digit(15)
+        || bytes.get(16) != Some(&b':')
+        || !digit(17)
+        || !digit(18)
+        || bytes.get(19) != Some(&b'Z')
+    {
+        return None;
+    }
+
+    Some(raw.to_string())
+}
+
 fn is_allowlisted_operator(op_name: &str) -> bool {
     matches!(
         op_name,
@@ -3557,6 +3812,7 @@ mod tests {
             tenant_id: "tenant".to_string(),
             policy_snapshot_id: "policy".to_string(),
             policy_snapshot_hash: "hash".to_string(),
+            as_of_time: "1970-01-01T00:00:00Z".to_string(),
             budget,
             session_token: "token".to_string(),
             session_token_expires_at: Instant::now() + Duration::from_secs(60),
@@ -3608,7 +3864,7 @@ mod tests {
             TerminalMode::Supported,
         );
 
-        let err = finalize_gate(&session, claim_map).unwrap_err();
+        let err = finalize_gate(&session, claim_map, 0.95).unwrap_err();
         let (status, Json(body)) = err;
         assert_eq!(status, StatusCode::BAD_REQUEST);
         assert_eq!(body.code, "ERR_INVALID_PARAMS");
@@ -3639,9 +3895,9 @@ mod tests {
             TerminalMode::Supported,
         );
 
-        let out = finalize_gate(&session, claim_map).expect("gate should succeed");
+        let out = finalize_gate(&session, claim_map, 0.95).expect("gate should succeed");
         assert_eq!(out.terminal_mode, TerminalMode::InsufficientEvidence);
-        assert_eq!(out.coverage_observed, 1.0);
+        assert_eq!(out.coverage_observed, 0.0);
         assert_eq!(out.claims.len(), 1);
 
         let claim = &out.claims[0];
@@ -3678,7 +3934,7 @@ mod tests {
             TerminalMode::Supported,
         );
 
-        let out = finalize_gate(&session, claim_map).expect("gate should succeed");
+        let out = finalize_gate(&session, claim_map, 0.95).expect("gate should succeed");
         assert_eq!(out.terminal_mode, TerminalMode::Supported);
         assert_eq!(out.coverage_observed, 1.0);
         assert_eq!(out.claims.len(), 1);
@@ -3714,7 +3970,7 @@ mod tests {
             TerminalMode::Supported,
         );
 
-        let out = finalize_gate(&session, claim_map).expect("gate should succeed");
+        let out = finalize_gate(&session, claim_map, 0.95).expect("gate should succeed");
         assert_eq!(out.terminal_mode, TerminalMode::InsufficientEvidence);
     }
 }

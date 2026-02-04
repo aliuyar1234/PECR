@@ -22,6 +22,7 @@ pub struct GatewayConfig {
     pub pg_safeview_max_rows: usize,
     pub pg_safeview_max_fields: usize,
     pub pg_safeview_max_groups: usize,
+    pub coverage_threshold: f64,
     pub as_of_time_default: String,
 }
 
@@ -183,6 +184,18 @@ impl GatewayConfig {
             "PECR_PG_SAFEVIEW_MAX_GROUPS",
         )?;
 
+        let coverage_threshold = parse_f64(
+            kv.get("PECR_COVERAGE_THRESHOLD"),
+            0.95,
+            "PECR_COVERAGE_THRESHOLD",
+        )?;
+        if !coverage_threshold.is_finite() || !(0.0..=1.0).contains(&coverage_threshold) {
+            return Err(StartupError {
+                code: "ERR_INVALID_CONFIG",
+                message: "PECR_COVERAGE_THRESHOLD must be between 0 and 1".to_string(),
+            });
+        }
+
         let as_of_time_default = kv
             .get("PECR_AS_OF_TIME_DEFAULT")
             .map(|s| s.trim())
@@ -210,6 +223,7 @@ impl GatewayConfig {
             pg_safeview_max_rows,
             pg_safeview_max_fields,
             pg_safeview_max_groups,
+            coverage_threshold,
             as_of_time_default,
         })
     }
@@ -320,6 +334,17 @@ fn parse_u64(value: Option<&String>, default: u64, key: &'static str) -> Result<
         Some(v) => v.parse::<u64>().map_err(|_| StartupError {
             code: "ERR_INVALID_CONFIG",
             message: format!("{} must be an integer", key),
+        }),
+    }
+}
+
+fn parse_f64(value: Option<&String>, default: f64, key: &'static str) -> Result<f64, StartupError> {
+    match value {
+        None => Ok(default),
+        Some(v) if v.trim().is_empty() => Ok(default),
+        Some(v) => v.parse::<f64>().map_err(|_| StartupError {
+            code: "ERR_INVALID_CONFIG",
+            message: format!("{} must be a number", key),
         }),
     }
 }

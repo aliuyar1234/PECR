@@ -329,6 +329,7 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "hex",
+ "pecr-contracts",
  "pecr-controller",
  "pecr-gateway",
  "reqwest",

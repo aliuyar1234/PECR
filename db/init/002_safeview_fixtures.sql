@@ -42,6 +42,18 @@ SELECT
 FROM pecr_fixture_customers
 WHERE tenant_id = current_setting('pecr.tenant_id', true);
 
+-- Suite 7 fault-injection helper: intentionally slow safe-view to exercise statement_timeout handling.
+CREATE OR REPLACE VIEW safe_customer_view_public_slow AS
+SELECT
+  c.tenant_id,
+  c.customer_id,
+  c.status,
+  c.plan_tier,
+  c.updated_at
+FROM pecr_fixture_customers c
+CROSS JOIN LATERAL (SELECT pg_sleep(0.2)) AS _delay
+WHERE c.tenant_id = current_setting('pecr.tenant_id', true);
+
 CREATE OR REPLACE VIEW safe_customer_view_admin AS
 SELECT
   tenant_id,
