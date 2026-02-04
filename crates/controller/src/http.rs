@@ -15,6 +15,13 @@ use ulid::Ulid;
 
 use crate::config::{AuthMode, ControllerConfig, ControllerEngine, StartupError};
 
+#[cfg(feature = "rlm")]
+use std::path::PathBuf;
+#[cfg(feature = "rlm")]
+use std::process::Stdio;
+#[cfg(feature = "rlm")]
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
 #[derive(Clone)]
 pub struct AppState {
     config: ControllerConfig,
@@ -160,7 +167,9 @@ async fn run(
         let finalized = async {
             let finalize_started = Instant::now();
 
-            let response_text = response_text_for_terminal_mode(loop_result.terminal_mode);
+            let response_text = loop_result
+                .response_text
+                .unwrap_or_else(|| response_text_for_terminal_mode(loop_result.terminal_mode));
             let claim_map = build_claim_map(&response_text, loop_result.terminal_mode);
 
             let finalized = finalize_session(&state, ctx, response_text, claim_map).await?;
@@ -540,6 +549,8 @@ struct OperatorCallResponse {
 #[derive(Debug)]
 struct ContextLoopResult {
     terminal_mode: TerminalMode,
+    #[allow(dead_code)]
+    response_text: Option<String>,
     #[allow(dead_code)]
     evidence_refs: Vec<EvidenceUnitRef>,
     #[allow(dead_code)]
@@ -1008,6 +1019,7 @@ async fn run_context_loop(
 
     Ok(ContextLoopResult {
         terminal_mode,
+        response_text: None,
         evidence_refs,
         evidence_units,
         operator_calls_used,
@@ -1023,10 +1035,388 @@ async fn run_context_loop_rlm(
     query: &str,
     budget: &Budget,
 ) -> Result<ContextLoopResult, (StatusCode, Json<ErrorResponse>)> {
-    tracing::warn!(
-        "rlm engine selected; integration is vendored but not wired yet (delegating to baseline loop)"
+    let loop_start = Instant::now();
+
+    let mut terminal_mode = TerminalMode::InsufficientEvidence;
+    let mut operator_calls_used: u32 = 0;
+    let mut bytes_used: u64 = 0;
+    let mut depth_used: u32 = 0;
+    let stop_reason: Option<&'static str>;
+    let mut budget_violation = false;
+
+    let mut evidence_refs = Vec::<EvidenceUnitRef>::new();
+    let mut evidence_units = Vec::<EvidenceUnit>::new();
+
+    let python = std::env::var("PECR_RLM_PYTHON")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "python".to_string()
+            } else {
+                "python3".to_string()
+            }
+        });
+
+    let script_path = std::env::var("PECR_RLM_SCRIPT_PATH")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            let candidates = [
+                PathBuf::from("/usr/local/share/pecr/pecr_rlm_bridge.py"),
+                PathBuf::from("scripts/rlm/pecr_rlm_bridge.py"),
+            ];
+            candidates.into_iter().find(|p| p.exists())
+        })
+        .ok_or_else(|| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ERR_RLM_BRIDGE_SCRIPT_NOT_FOUND",
+                "rlm bridge script not found; set PECR_RLM_SCRIPT_PATH or ensure scripts/rlm/pecr_rlm_bridge.py is present"
+                    .to_string(),
+                TerminalMode::SourceUnavailable,
+                false,
+            )
+        })?;
+
+    let mut child = tokio::process::Command::new(&python)
+        .arg(&script_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|_| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ERR_RLM_BRIDGE_SPAWN_FAILED",
+                format!(
+                    "failed to spawn rlm bridge (python={}, script={})",
+                    python,
+                    script_path.display()
+                ),
+                TerminalMode::SourceUnavailable,
+                false,
+            )
+        })?;
+
+    let mut child_stdin = child.stdin.take().ok_or_else(|| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ERR_RLM_BRIDGE_INTERNAL",
+            "failed to open rlm bridge stdin".to_string(),
+            TerminalMode::SourceUnavailable,
+            false,
+        )
+    })?;
+    let child_stdout = child.stdout.take().ok_or_else(|| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ERR_RLM_BRIDGE_INTERNAL",
+            "failed to open rlm bridge stdout".to_string(),
+            TerminalMode::SourceUnavailable,
+            false,
+        )
+    })?;
+    let child_stderr = child.stderr.take().ok_or_else(|| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ERR_RLM_BRIDGE_INTERNAL",
+            "failed to open rlm bridge stderr".to_string(),
+            TerminalMode::SourceUnavailable,
+            false,
+        )
+    })?;
+
+    let trace_id = ctx.trace_id.to_string();
+    let request_id = ctx.request_id.to_string();
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(child_stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::warn!(
+                trace_id = %trace_id,
+                request_id = %request_id,
+                line = %line,
+                "rlm.bridge.stderr"
+            );
+        }
+    });
+
+    let start_msg = serde_json::json!({
+        "type": "start",
+        "query": query,
+        "budget": budget,
+    });
+    let start_line = serde_json::to_string(&start_msg).map_err(|_| {
+        json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ERR_RLM_BRIDGE_INTERNAL",
+            "failed to serialize rlm bridge start message".to_string(),
+            TerminalMode::SourceUnavailable,
+            false,
+        )
+    })?;
+    child_stdin
+        .write_all(format!("{}\n", start_line).as_bytes())
+        .await
+        .map_err(|_| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ERR_RLM_BRIDGE_PROTOCOL",
+                "failed to write rlm bridge start message".to_string(),
+                TerminalMode::SourceUnavailable,
+                false,
+            )
+        })?;
+
+    let mut stdout_lines = tokio::io::BufReader::new(child_stdout).lines();
+    let mut response_text: Option<String> = None;
+
+    loop {
+        let Some(timeout) = remaining_wallclock(budget, loop_start) else {
+            stop_reason = Some("budget_max_wallclock_ms");
+            budget_violation = true;
+            break;
+        };
+
+        let next_line = tokio::time::timeout(timeout, stdout_lines.next_line()).await;
+        let line = match next_line {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => {
+                stop_reason = Some("bridge_eof");
+                budget_violation = false;
+                break;
+            }
+            Ok(Err(_)) => {
+                stop_reason = Some("bridge_read_error");
+                budget_violation = false;
+                break;
+            }
+            Err(_) => {
+                stop_reason = Some("budget_max_wallclock_ms");
+                budget_violation = true;
+                break;
+            }
+        };
+
+        let msg = serde_json::from_str::<serde_json::Value>(&line).map_err(|_| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ERR_RLM_BRIDGE_PROTOCOL",
+                "rlm bridge emitted invalid json".to_string(),
+                TerminalMode::SourceUnavailable,
+                false,
+            )
+        })?;
+        let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+
+        match msg_type {
+            "call_operator" => {
+                let id = msg
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let depth = msg.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let op_name = msg
+                    .get("op_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let params = msg.get("params").cloned().unwrap_or(serde_json::json!({}));
+
+                if id.is_empty() {
+                    stop_reason = Some("bridge_invalid_message");
+                    break;
+                }
+                if depth >= budget.max_recursion_depth {
+                    stop_reason = Some("budget_max_recursion_depth");
+                    budget_violation = true;
+                    break;
+                }
+                depth_used = depth_used.max(depth.saturating_add(1));
+
+                if operator_calls_used >= budget.max_operator_calls {
+                    stop_reason = Some("budget_max_operator_calls");
+                    budget_violation = true;
+                    break;
+                }
+
+                let allowed = matches!(
+                    op_name.as_str(),
+                    "search"
+                        | "fetch_span"
+                        | "fetch_rows"
+                        | "aggregate"
+                        | "list_versions"
+                        | "diff"
+                        | "redact"
+                );
+                if !allowed {
+                    stop_reason = Some("bridge_operator_not_allowlisted");
+                    break;
+                }
+
+                let outcome = call_operator(state, ctx, op_name.as_str(), params, timeout).await?;
+                operator_calls_used = operator_calls_used.saturating_add(1);
+                bytes_used = bytes_used.saturating_add(outcome.bytes_len as u64);
+
+                if let Some(body) = outcome.body {
+                    let terminal_mode_for_resp = body.terminal_mode;
+                    let result = body.result;
+                    if op_name == "search" {
+                        if let Some(refs_value) = result.get("refs").cloned()
+                            && let Ok(refs) =
+                                serde_json::from_value::<Vec<EvidenceUnitRef>>(refs_value)
+                        {
+                            evidence_refs = refs;
+                        }
+                    }
+
+                    if let Ok(units) = serde_json::from_value::<Vec<EvidenceUnit>>(result.clone()) {
+                        evidence_units.extend(units);
+                    } else if let Ok(unit) = serde_json::from_value::<EvidenceUnit>(result.clone())
+                    {
+                        evidence_units.push(unit);
+                    }
+
+                    let resp = serde_json::json!({
+                        "type": "operator_result",
+                        "id": id,
+                        "ok": true,
+                        "terminal_mode": terminal_mode_for_resp.as_str(),
+                        "result": result,
+                        "bytes_len": outcome.bytes_len,
+                    });
+                    let resp_line = serde_json::to_string(&resp).map_err(|_| {
+                        json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "ERR_RLM_BRIDGE_INTERNAL",
+                            "failed to serialize rlm bridge response".to_string(),
+                            TerminalMode::SourceUnavailable,
+                            false,
+                        )
+                    })?;
+                    child_stdin
+                        .write_all(format!("{}\n", resp_line).as_bytes())
+                        .await
+                        .map_err(|_| {
+                            json_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "ERR_RLM_BRIDGE_PROTOCOL",
+                                "failed to write rlm bridge response".to_string(),
+                                TerminalMode::SourceUnavailable,
+                                false,
+                            )
+                        })?;
+                } else {
+                    terminal_mode = outcome.terminal_mode_hint;
+                    stop_reason = Some("operator_error");
+
+                    let resp = serde_json::json!({
+                        "type": "operator_result",
+                        "id": id,
+                        "ok": false,
+                        "terminal_mode": outcome.terminal_mode_hint.as_str(),
+                        "result": serde_json::Value::Null,
+                        "bytes_len": outcome.bytes_len,
+                    });
+                    let resp_line = serde_json::to_string(&resp).map_err(|_| {
+                        json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "ERR_RLM_BRIDGE_INTERNAL",
+                            "failed to serialize rlm bridge response".to_string(),
+                            TerminalMode::SourceUnavailable,
+                            false,
+                        )
+                    })?;
+                    let _ = child_stdin
+                        .write_all(format!("{}\n", resp_line).as_bytes())
+                        .await;
+                    break;
+                }
+
+                if bytes_used > budget.max_bytes {
+                    stop_reason = Some("budget_max_bytes");
+                    budget_violation = true;
+                    break;
+                }
+            }
+            "done" => {
+                response_text = msg
+                    .get("final_answer")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                stop_reason = Some("rlm_done");
+                break;
+            }
+            _ => {
+                stop_reason = Some("bridge_unknown_message");
+                break;
+            }
+        }
+    }
+
+    if budget_violation {
+        crate::metrics::inc_budget_violation();
+    }
+
+    let stop_reason = stop_reason.unwrap_or("unknown");
+    let stop_is_bridge_failure = matches!(
+        stop_reason,
+        "bridge_eof"
+            | "bridge_read_error"
+            | "bridge_invalid_message"
+            | "bridge_operator_not_allowlisted"
+            | "bridge_unknown_message"
     );
-    run_context_loop(state, ctx, query, budget).await
+
+    let status = if stop_reason == "rlm_done" {
+        tokio::time::timeout(Duration::from_millis(250), child.wait())
+            .await
+            .ok()
+            .and_then(Result::ok)
+    } else {
+        let _ = child.kill();
+        let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
+        None
+    };
+
+    if stop_is_bridge_failure || status.is_some_and(|s| !s.success()) {
+        return Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ERR_RLM_BRIDGE_FAILED",
+            format!("rlm bridge failed (reason={})", stop_reason),
+            TerminalMode::SourceUnavailable,
+            false,
+        ));
+    }
+
+    tracing::info!(
+        request_id = %ctx.request_id,
+        trace_id = %ctx.trace_id,
+        principal_id = %ctx.principal_id,
+        session_id = %ctx.session_id,
+        terminal_mode = %terminal_mode.as_str(),
+        stop_reason = %stop_reason,
+        budget_violation,
+        operator_calls_used,
+        depth_used,
+        bytes_used,
+        "controller.context_loop_completed"
+    );
+
+    Ok(ContextLoopResult {
+        terminal_mode,
+        response_text,
+        evidence_refs,
+        evidence_units,
+        operator_calls_used,
+        bytes_used,
+        depth_used,
+    })
 }
 
 #[cfg(not(feature = "rlm"))]
