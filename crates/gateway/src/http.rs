@@ -944,6 +944,8 @@ async fn call_operator(
             ));
         }
 
+        let field_redaction = parse_field_redaction(decision.redaction.as_ref())?;
+
         let operator_span = match op_name.as_str() {
             "search" => tracing::info_span!(
                 "operator.search",
@@ -1310,6 +1312,15 @@ async fn call_operator(
                 .instrument(adapter_span)
                 .await?;
 
+                let evidence = if let Some(redaction) = field_redaction.as_ref() {
+                    evidence
+                        .into_iter()
+                        .map(|unit| apply_field_redaction_to_evidence_unit(unit, redaction))
+                        .collect::<Result<Vec<_>, ApiError>>()?
+                } else {
+                    evidence
+                };
+
                 let result =
                     serde_json::to_value(&evidence).unwrap_or_else(|_| serde_json::json!([]));
                 (
@@ -1372,8 +1383,6 @@ async fn call_operator(
                 )
             }
             "redact" => {
-                let redaction = parse_field_redaction(decision.redaction.as_ref())?;
-
                 let evidence_units = req
                     .params
                     .get("evidence_units")
@@ -1475,7 +1484,7 @@ async fn call_operator(
                         ));
                     }
 
-                    let Some(redaction) = redaction.as_ref() else {
+                    let Some(redaction) = field_redaction.as_ref() else {
                         out_units.push(unit);
                         continue;
                     };
@@ -4190,6 +4199,43 @@ fn compute_evidence_unit_id(evidence: &EvidenceUnit) -> String {
     canonical::hash_canonical_json(&identity)
 }
 
+fn apply_field_redaction_to_evidence_unit(
+    mut evidence: EvidenceUnit,
+    redaction: &FieldRedaction,
+) -> Result<EvidenceUnit, ApiError> {
+    if evidence.content_type != EvidenceContentType::ApplicationJson {
+        return Ok(evidence);
+    }
+
+    let Some(content) = evidence.content.as_ref() else {
+        return Ok(evidence);
+    };
+
+    let redacted_content = apply_field_redaction(content, redaction);
+    if redacted_content == *content {
+        return Ok(evidence);
+    }
+
+    evidence.content = Some(redacted_content);
+    evidence.content_hash = compute_content_hash(
+        EvidenceContentType::ApplicationJson,
+        evidence.content.as_ref().unwrap(),
+    )?;
+    evidence.span_or_row_spec =
+        redact_span_or_row_spec_fields(&evidence.span_or_row_spec, redaction);
+
+    let step_params = redaction.params_value();
+    let step_hash = canonical::hash_canonical_json(&step_params);
+    evidence.transform_chain.push(TransformStep {
+        transform_type: "redaction".to_string(),
+        transform_hash: step_hash,
+        params: Some(step_params),
+    });
+
+    evidence.evidence_unit_id = compute_evidence_unit_id(&evidence);
+    Ok(evidence)
+}
+
 fn is_allowlisted_operator(op_name: &str) -> bool {
     matches!(
         op_name,
@@ -4482,5 +4528,58 @@ mod tests {
                 ]
             })
         );
+    }
+
+    #[test]
+    fn evidence_unit_redaction_updates_hashes_and_ids() {
+        let content = serde_json::json!({
+            "ok": "1",
+            "secret": "x",
+        });
+
+        let mut evidence = EvidenceUnit {
+            source_system: "pg_safeview".to_string(),
+            object_id: "obj".to_string(),
+            version_id: "v1".to_string(),
+            span_or_row_spec: serde_json::json!({
+                "type": "db_row",
+                "fields": ["ok", "secret"],
+            }),
+            content_type: EvidenceContentType::ApplicationJson,
+            content: Some(content),
+            content_hash: canonical::hash_canonical_json(&serde_json::json!({
+                "ok": "1",
+                "secret": "x",
+            })),
+            retrieved_at: "t".to_string(),
+            as_of_time: "t".to_string(),
+            policy_snapshot_id: "p".to_string(),
+            policy_snapshot_hash: "h".to_string(),
+            transform_chain: Vec::new(),
+            evidence_unit_id: String::new(),
+        };
+        evidence.evidence_unit_id = compute_evidence_unit_id(&evidence);
+        let original_id = evidence.evidence_unit_id.clone();
+
+        let redaction = FieldRedaction::Deny(vec!["secret".to_string()]);
+        let redacted =
+            apply_field_redaction_to_evidence_unit(evidence, &redaction).expect("redaction ok");
+
+        let out_content = redacted.content.as_ref().expect("content preserved");
+        assert_eq!(out_content, &serde_json::json!({ "ok": "1" }));
+        assert_eq!(
+            redacted.content_hash,
+            canonical::hash_canonical_json(out_content)
+        );
+        assert_ne!(redacted.evidence_unit_id, original_id);
+        assert_eq!(redacted.transform_chain.len(), 1);
+
+        let fields = redacted
+            .span_or_row_spec
+            .get("fields")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(fields, vec![serde_json::Value::String("ok".to_string())]);
     }
 }
