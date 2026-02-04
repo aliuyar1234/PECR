@@ -1,5 +1,8 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::time::Duration;
+
+use pecr_auth::OidcConfig;
 
 #[derive(Debug, Clone)]
 pub struct GatewayConfig {
@@ -14,6 +17,7 @@ pub struct GatewayConfig {
     pub session_token_ttl_secs: u64,
     pub evidence_payload_store_mode: EvidencePayloadStoreMode,
     pub auth_mode: AuthMode,
+    pub oidc: Option<OidcConfig>,
     pub fs_corpus_path: String,
     pub fs_version_cache_max_bytes: usize,
     pub fs_version_cache_max_versions_per_object: usize,
@@ -93,13 +97,6 @@ impl GatewayConfig {
             }
         }
 
-        if auth_mode == AuthMode::Oidc {
-            return Err(StartupError {
-                code: "ERR_AUTH_MODE_UNIMPLEMENTED",
-                message: "oidc auth mode is not implemented yet; refuse startup".to_string(),
-            });
-        }
-
         let db_url = require_nonempty(kv, "PECR_DB_URL")?;
         let opa_url = require_nonempty(kv, "PECR_OPA_URL")?;
 
@@ -134,6 +131,12 @@ impl GatewayConfig {
 
         let evidence_payload_store_mode =
             parse_store_mode(kv.get("PECR_EVIDENCE_PAYLOAD_STORE_MODE"))?;
+
+        let oidc = if auth_mode == AuthMode::Oidc {
+            Some(parse_oidc_config(kv)?)
+        } else {
+            None
+        };
 
         let fs_corpus_path = kv
             .get("PECR_FS_CORPUS_PATH")
@@ -215,6 +218,7 @@ impl GatewayConfig {
             session_token_ttl_secs,
             evidence_payload_store_mode,
             auth_mode,
+            oidc,
             fs_corpus_path,
             fs_version_cache_max_bytes,
             fs_version_cache_max_versions_per_object,
@@ -380,6 +384,115 @@ fn parse_auth_mode(value: Option<&String>) -> Result<AuthMode, StartupError> {
             message: "PECR_AUTH_MODE must be local or oidc".to_string(),
         }),
     }
+}
+
+fn parse_oidc_config(kv: &HashMap<String, String>) -> Result<OidcConfig, StartupError> {
+    let issuer = require_nonempty(kv, "PECR_OIDC_ISSUER")?;
+
+    let jwks_json = kv
+        .get("PECR_OIDC_JWKS_JSON")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let jwks_url = kv
+        .get("PECR_OIDC_JWKS_URL")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    if jwks_json.is_none() && jwks_url.is_none() {
+        return Err(StartupError {
+            code: "ERR_INVALID_CONFIG",
+            message: "oidc requires PECR_OIDC_JWKS_URL or PECR_OIDC_JWKS_JSON".to_string(),
+        });
+    }
+
+    let audience = kv
+        .get("PECR_OIDC_AUDIENCE")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let principal_id_claim = kv
+        .get("PECR_OIDC_PRINCIPAL_ID_CLAIM")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("sub")
+        .to_string();
+
+    let tenant_claim = kv
+        .get("PECR_OIDC_TENANT_CLAIM")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let tenant_id_static = kv
+        .get("PECR_OIDC_TENANT_ID_STATIC")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    if tenant_claim.is_none() && tenant_id_static.is_none() {
+        return Err(StartupError {
+            code: "ERR_INVALID_CONFIG",
+            message:
+                "oidc requires tenant mapping via PECR_OIDC_TENANT_CLAIM or PECR_OIDC_TENANT_ID_STATIC"
+                    .to_string(),
+        });
+    }
+
+    let roles_claim = kv
+        .get("PECR_OIDC_ROLES_CLAIM")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string());
+
+    let jwks_timeout_ms = parse_u64(
+        kv.get("PECR_OIDC_JWKS_TIMEOUT_MS"),
+        2000,
+        "PECR_OIDC_JWKS_TIMEOUT_MS",
+    )?;
+    let jwks_refresh_ttl_secs = parse_u64(
+        kv.get("PECR_OIDC_JWKS_REFRESH_TTL_SECS"),
+        300,
+        "PECR_OIDC_JWKS_REFRESH_TTL_SECS",
+    )?;
+    let clock_skew_secs = parse_u64(
+        kv.get("PECR_OIDC_CLOCK_SKEW_SECS"),
+        60,
+        "PECR_OIDC_CLOCK_SKEW_SECS",
+    )?;
+
+    let abac_claims_raw = kv
+        .get("PECR_OIDC_ABAC_CLAIMS")
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("");
+
+    let mut abac_claims = abac_claims_raw
+        .split(',')
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .map(|s| s.to_string())
+        .collect::<Vec<_>>();
+    abac_claims.sort();
+    abac_claims.dedup();
+
+    Ok(OidcConfig {
+        issuer,
+        audience,
+        jwks_url,
+        jwks_json,
+        jwks_timeout: Duration::from_millis(jwks_timeout_ms),
+        jwks_refresh_ttl: Duration::from_secs(jwks_refresh_ttl_secs),
+        clock_skew: Duration::from_secs(clock_skew_secs),
+        principal_id_claim,
+        tenant_claim,
+        tenant_id_static,
+        roles_claim,
+        abac_claims,
+    })
 }
 
 fn parse_bool(value: Option<&String>) -> Option<bool> {
