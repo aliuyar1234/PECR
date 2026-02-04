@@ -5,6 +5,7 @@ on:
   push:
     branches:
       - main
+      - master
 
 jobs:
   rust:
@@ -37,7 +38,10 @@ jobs:
 
       - name: Ensure scripts executable
         shell: bash
-        run: chmod +x scripts/ci.sh
+        run: |
+          set -euo pipefail
+          chmod +x scripts/ci.sh
+          chmod +x scripts/perf/suite7.sh
 
       - name: CI checks (fmt/clippy/test)
         shell: bash
@@ -47,6 +51,41 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts
           ./scripts/ci.sh 2>&1 | tee artifacts/ci.log
+
+      - name: Suite 7 (p99 + fault injection)
+        shell: bash
+        env:
+          BASELINE_VUS: "10"
+          BASELINE_DURATION: "10s"
+          FAULT_VUS: "10"
+          FAULT_DURATION: "5s"
+          P99_BUDGET_MS: "2000"
+          PECR_PERF_REGRESSION_P95_FACTOR: "3.0"
+          PECR_PERF_REGRESSION_P99_FACTOR: "3.0"
+          PECR_PERF_REGRESSION_ABS_MS: "1000"
+        run: |
+          set -euo pipefail
+          set +e
+          ./scripts/perf/suite7.sh 2>&1 | tee artifacts/suite7.log
+          suite7_status=${PIPESTATUS[0]}
+          set -e
+
+          mkdir -p artifacts/perf
+          cp -a target/perf/* artifacts/perf/ 2>/dev/null || true
+
+          if [[ "${suite7_status}" -ne 0 ]]; then
+            exit "${suite7_status}"
+          fi
+
+          set +e
+          python3 scripts/perf/compare_k6_baseline.py \
+            --baseline perf/baselines/suite7_baseline.summary.json \
+            --current target/perf/suite7_baseline.summary.json \
+            2>&1 | tee artifacts/perf_regression.log
+          perf_status=${PIPESTATUS[0]}
+          set -e
+
+          exit "${perf_status}"
 
       - name: Upload CI artifacts
         if: always()
