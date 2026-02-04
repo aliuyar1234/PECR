@@ -1370,6 +1370,12 @@ async fn call_operator(
                 .instrument(adapter_span)
                 .await?;
 
+                let evidence = if let Some(redaction) = field_redaction.as_ref() {
+                    apply_field_redaction_to_evidence_unit(evidence, redaction)?
+                } else {
+                    evidence
+                };
+
                 let result =
                     serde_json::to_value(&evidence).unwrap_or_else(|_| serde_json::json!({}));
                 (
