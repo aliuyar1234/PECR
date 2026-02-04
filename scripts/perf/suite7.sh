@@ -133,7 +133,7 @@ run_k6_controller "suite7_fault_opa_unavailable" "SOURCE_UNAVAILABLE" "0"
 docker compose start opa
 
 echo "[suite7] fault: opa timeout"
-docker compose --profile faults up -d opa_blackhole
+docker compose --profile faults up -d --force-recreate opa_blackhole
 PECR_OPA_URL="http://opa_blackhole:8181" PECR_OPA_TIMEOUT_MS="50" recreate_gateway
 run_k6_controller "suite7_fault_opa_timeout" "SOURCE_UNAVAILABLE" "0"
 recreate_gateway
