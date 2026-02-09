@@ -11,10 +11,30 @@ If you know “ChatGPT + RAG”: PECR is the missing runtime layer that makes re
 
 This repository is the Rust implementation of PECR/CEGP (spec SSOT lives in a separate internal pack, `pcdr`).
 
+## Maturity Snapshot (February 9, 2026)
+
+PECR is a solo-built Rust project with enterprise-focused engineering standards.
+
+- **Modular trust boundary**: privileged Gateway and non-privileged Controller are separated by design and verified in CI.
+- **Security-first runtime**: deny-by-default policy, fail-closed decisions, append-only audit ledger, and deterministic redaction/evidence hashing.
+- **Reliability hardening**: session bootstrap is transactional and per-session operator/finalize execution is serialized to prevent race-driven state drift.
+- **Quality automation**: formatting, clippy, boundary checks, unit/integration/e2e suites, contract-lock drift checks, and image pinning policy checks are all enforced.
+- **Contract discipline**: versioned OpenAPI and schema lockfiles keep interfaces stable and reviewable.
+
+Current positioning: strong enterprise-grade groundwork with a clear path to 9/10 in performance evidence and operations maturity.
+
+### Path To 9/10 Enterprise Readiness
+
+1. Add sustained-load SLO gates (p95/p99 latency + error budget) as merge blockers.
+2. Expand chaos and recovery verification (DB failover, OPA outage windows, backup/restore drills).
+3. Add dedicated high-concurrency integration tests for session/operator/finalize race resistance.
+4. Maintain a formal security assurance cadence (threat model updates, dependency/CVE review, hardening baseline checks).
+
 ## What You Get (Guarantees)
 
 - **Hard trust boundary**: privileged **Gateway** vs non‑privileged **Controller** (the controller holds no source credentials).
 - **Deny‑by‑default policy enforcement** (OPA) for session creation, every operator call, and finalize.
+- **State consistency under concurrency**: session runtime is initialized transactionally and per-session operations are serialized.
 - **EvidenceUnits**: immutable, versioned, **hashed after redaction**, bound to **policy snapshot** and **as‑of time**.
 - **Claim↔Evidence gate**: answers are compiled into atomic claims mapped to EvidenceUnit IDs (or you get a refusal terminal mode).
 - **Budgeted execution**: strict caps on operator calls, bytes, wallclock, recursion depth (plus parallelism).
@@ -291,7 +311,8 @@ OPA returns `{ allow, cacheable, reason, redaction }`. Redaction directives supp
 
 - `bash scripts/ci.sh`: formatting, clippy, architecture boundary check, full tests, e2e smoke, contract lock, and image pinning policy checks.
 - `bash scripts/perf/suite7.sh`: k6‑based p99 run + fault injection + BVR/SER checks and perf regression comparison.
-- `.github/workflows/security.yml`: dependency audit, secret scanning, SBOM generation, and vulnerability budget enforcement.
+- `.github/workflows/ci.yml`: explicit gate job requires `quality`, `perf`, and `contracts` jobs to pass.
+- `.github/workflows/security.yml`: dependency audit, secret scanning, SBOM generation, and Trivy vulnerability enforcement.
 - `.github/workflows/codeql.yml`: static analysis for Rust, JavaScript, Python, and workflow logic.
 - Enterprise guardrail policy: `docs/enterprise/QUALITY_GUARDRAILS.md`.
 
