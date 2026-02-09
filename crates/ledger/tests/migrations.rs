@@ -270,3 +270,103 @@ async fn ledger_event_payload_hash_verifies() {
 
     pool.close().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn session_runtime_round_trip() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping session runtime test; set PECR_TEST_DB_URL to enable");
+        return;
+    };
+
+    let schema = format!("pecr_test_{}", ulid::Ulid::new());
+    let schema_url = schema_db_url(&db_url, &schema);
+
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&db_url)
+        .await
+        .expect("DB connect should succeed");
+
+    let create_schema = format!("CREATE SCHEMA {}", schema);
+    sqlx::query(&create_schema)
+        .execute(&pool)
+        .await
+        .expect("create schema should succeed");
+
+    let writer = pecr_ledger::LedgerWriter::connect_and_migrate(
+        &schema_url,
+        std::time::Duration::from_millis(500),
+    )
+    .await
+    .expect("ledger writer init should succeed");
+
+    let budget = pecr_contracts::Budget {
+        max_operator_calls: 10,
+        max_bytes: 1024,
+        max_wallclock_ms: 1000,
+        max_recursion_depth: 1,
+        max_parallelism: Some(4),
+    };
+
+    let mut snapshot = pecr_contracts::PolicySnapshot {
+        policy_snapshot_hash: String::new(),
+        principal_id: "dev".to_string(),
+        tenant_id: "local".to_string(),
+        principal_roles: Vec::new(),
+        principal_attrs_hash: "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+            .to_string(),
+        policy_bundle_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            .to_string(),
+        as_of_time: "1970-01-01T00:00:00Z".to_string(),
+        evaluated_at: "1970-01-01T00:00:00Z".to_string(),
+    };
+    snapshot.policy_snapshot_hash = snapshot.compute_hash();
+
+    writer
+        .create_session("s1", "t1", "dev", &budget, "ps1", &snapshot)
+        .await
+        .expect("create session should succeed");
+
+    let evidence_ids = vec![
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+    ];
+
+    writer
+        .upsert_session_runtime(pecr_ledger::SessionRuntimeWrite {
+            session_id: "s1",
+            tenant_id: "local",
+            session_token_hash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            session_token_expires_at_epoch_ms: 1_000_000,
+            operator_calls_used: 2,
+            bytes_used: 200,
+            evidence_unit_ids: &evidence_ids,
+            finalized: false,
+        })
+        .await
+        .expect("upsert runtime should succeed");
+
+    let loaded = writer
+        .load_session_runtime("s1")
+        .await
+        .expect("load session should succeed")
+        .expect("session runtime should exist");
+
+    assert_eq!(loaded.session_id, "s1");
+    assert_eq!(loaded.trace_id, "t1");
+    assert_eq!(loaded.principal_id, "dev");
+    assert_eq!(loaded.tenant_id, "local");
+    assert_eq!(loaded.policy_snapshot_id, "ps1");
+    assert_eq!(loaded.budget, budget);
+    assert_eq!(loaded.operator_calls_used, 2);
+    assert_eq!(loaded.bytes_used, 200);
+    assert_eq!(loaded.evidence_unit_ids, evidence_ids);
+    assert!(!loaded.finalized);
+
+    writer.close().await;
+
+    let drop_schema = format!("DROP SCHEMA {} CASCADE", schema);
+    let _ = sqlx::query(&drop_schema).execute(&pool).await;
+
+    pool.close().await;
+}

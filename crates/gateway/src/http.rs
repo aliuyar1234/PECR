@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -18,7 +18,7 @@ use pecr_contracts::{
     Budget, ClaimMap, ClaimStatus, EvidenceContentType, EvidenceUnit, EvidenceUnitRef,
     PolicySnapshot, TerminalMode, TransformStep,
 };
-use pecr_ledger::{FinalizeResultRecord, LedgerWriter};
+use pecr_ledger::{FinalizeResultRecord, LedgerWriter, SessionRuntimeWrite};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use similar::TextDiff;
@@ -28,7 +28,7 @@ use tracing::Instrument;
 use ulid::Ulid;
 
 use crate::config::{AuthMode, GatewayConfig, StartupError};
-use crate::opa::{OpaCacheKey, OpaClient};
+use crate::opa::{OpaCacheKey, OpaClient, OpaClientConfig};
 use crate::operator_cache::{OperatorCache, OperatorCacheKey};
 
 #[derive(Clone)]
@@ -41,7 +41,6 @@ pub struct AppState {
     pg_pool: PgPool,
     fs_versions: Arc<RwLock<FsVersionCache>>,
     pg_versions: Arc<RwLock<FsVersionCache>>,
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
 }
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
@@ -57,8 +56,8 @@ struct Session {
     policy_snapshot_hash: String,
     as_of_time: String,
     budget: Budget,
-    session_token: String,
-    session_token_expires_at: Instant,
+    session_token_hash: String,
+    session_token_expires_at_epoch_ms: i64,
     operator_calls_used: u32,
     bytes_used: u64,
     evidence_unit_ids: HashSet<String>,
@@ -94,12 +93,16 @@ pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
         message: "failed to initialize ledger".to_string(),
     })?;
 
-    let opa = OpaClient::new(
-        config.opa_url.clone(),
-        Duration::from_millis(config.opa_timeout_ms),
-        config.cache_max_entries,
-        Duration::from_millis(config.cache_ttl_ms),
-    )
+    let opa = OpaClient::new(OpaClientConfig {
+        base_url: config.opa_url.clone(),
+        timeout: Duration::from_millis(config.opa_timeout_ms),
+        cache_max_entries: config.cache_max_entries,
+        cache_ttl: Duration::from_millis(config.cache_ttl_ms),
+        retry_max_attempts: config.opa_retry_max_attempts,
+        retry_base_backoff: Duration::from_millis(config.opa_retry_base_backoff_ms),
+        circuit_breaker_failure_threshold: config.opa_circuit_breaker_failure_threshold,
+        circuit_breaker_open_for: Duration::from_millis(config.opa_circuit_breaker_open_ms),
+    })
     .map_err(|_| StartupError {
         code: "ERR_OPA_UNAVAILABLE",
         message: "failed to initialize policy client".to_string(),
@@ -136,11 +139,11 @@ pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
         pg_pool,
         fs_versions,
         pg_versions,
-        sessions: Arc::new(RwLock::new(HashMap::new())),
     };
 
     Ok(Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/v1/sessions", post(create_session))
         .route("/v1/operators/{op_name}", post(call_operator))
@@ -150,6 +153,45 @@ pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+#[derive(Debug, Serialize)]
+struct ReadyzResponse {
+    status: &'static str,
+    checks: BTreeMap<&'static str, bool>,
+}
+
+async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    let mut checks = BTreeMap::new();
+
+    let ledger_ready = state.ledger.ping().await.is_ok();
+    checks.insert("ledger", ledger_ready);
+
+    let postgres_ready = tokio::time::timeout(
+        Duration::from_millis(state.config.pg_safeview_query_timeout_ms.max(50)),
+        sqlx::query("SELECT 1").execute(&state.pg_pool),
+    )
+    .await
+    .is_ok_and(|res| res.is_ok());
+    checks.insert("postgres", postgres_ready);
+
+    let opa_ready = state.opa.ready().await.is_ok();
+    checks.insert("opa", opa_ready);
+
+    let all_ready = checks.values().all(|ok| *ok);
+    let status = if all_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(ReadyzResponse {
+            status: if all_ready { "ready" } else { "not_ready" },
+            checks,
+        }),
+    )
 }
 
 async fn metrics() -> impl IntoResponse {
@@ -328,8 +370,10 @@ async fn create_session(
         }
 
         let session_token = Ulid::new().to_string();
-        let session_token_expires_at =
-            Instant::now() + Duration::from_secs(state.config.session_token_ttl_secs);
+        let session_token_hash = sha256_hex(session_token.as_bytes());
+        let session_token_expires_at_epoch_ms = unix_epoch_ms_now()
+            + i64::try_from(state.config.session_token_ttl_secs.saturating_mul(1000))
+                .unwrap_or(i64::MAX);
 
         tracing::info!(
             trace_id = %trace_id,
@@ -389,19 +433,25 @@ async fn create_session(
             policy_snapshot_hash: policy_snapshot.policy_snapshot_hash.clone(),
             as_of_time: as_of_time.clone(),
             budget: req.budget.clone(),
-            session_token: session_token.clone(),
-            session_token_expires_at,
+            session_token_hash: session_token_hash.clone(),
+            session_token_expires_at_epoch_ms,
             operator_calls_used: 0,
             bytes_used: 0,
             evidence_unit_ids: HashSet::new(),
             finalized: false,
         };
 
-        state
-            .sessions
-            .write()
+        persist_session_runtime(&state, &session)
             .await
-            .insert(session_id.clone(), session);
+            .map_err(|_| {
+                json_error(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "ERR_LEDGER_UNAVAILABLE",
+                    "ledger unavailable".to_string(),
+                    TerminalMode::SourceUnavailable,
+                    true,
+                )
+            })?;
 
         let mut resp_headers = HeaderMap::new();
         let token_value = axum::http::HeaderValue::from_str(&session_token).map_err(|_| {
@@ -489,8 +539,19 @@ async fn call_operator(
         let params_hash =
             sha256_hex(&serde_json::to_vec(&req.params).unwrap_or_else(|_| Vec::new()));
 
-        let mut sessions = state.sessions.write().await;
-        let Some(session) = sessions.get_mut(&req.session_id) else {
+        let mut session = load_session_runtime(&state, &req.session_id)
+            .await?
+            .ok_or_else(|| {
+                json_error(
+                    StatusCode::NOT_FOUND,
+                    "ERR_INVALID_PARAMS",
+                    "unknown session_id".to_string(),
+                    TerminalMode::InsufficientEvidence,
+                    false,
+                )
+            })?;
+
+        if session.session_id != req.session_id {
             return Err(json_error(
                 StatusCode::NOT_FOUND,
                 "ERR_INVALID_PARAMS",
@@ -498,7 +559,7 @@ async fn call_operator(
                 TerminalMode::InsufficientEvidence,
                 false,
             ));
-        };
+        }
 
         if session.finalized {
             return Err(json_error(
@@ -553,8 +614,9 @@ async fn call_operator(
             ));
         }
 
-        if Instant::now() > session.session_token_expires_at
-            || session.session_token != session_token
+        let session_token_hash = sha256_hex(session_token.as_bytes());
+        if unix_epoch_ms_now() > session.session_token_expires_at_epoch_ms
+            || session.session_token_hash != session_token_hash
         {
             state
                 .ledger
@@ -1674,6 +1736,17 @@ async fn call_operator(
 
             session.operator_calls_used = next_operator_calls_used;
             session.bytes_used = next_bytes_used;
+            persist_session_runtime(&state, &session)
+                .await
+                .map_err(|_| {
+                    json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ERR_LEDGER_UNAVAILABLE",
+                        "ledger unavailable".to_string(),
+                        TerminalMode::SourceUnavailable,
+                        true,
+                    )
+                })?;
 
             tracing::Span::current().record("latency_ms", started.elapsed().as_millis() as u64);
             tracing::Span::current().record("outcome", "ok");
@@ -3525,16 +3598,17 @@ async fn finalize(
             )
         })?;
 
-        let mut sessions = state.sessions.write().await;
-        let Some(session) = sessions.get_mut(&req.session_id) else {
-            return Err(json_error(
-                StatusCode::NOT_FOUND,
-                "ERR_INVALID_PARAMS",
-                "unknown session_id".to_string(),
-                TerminalMode::InsufficientEvidence,
-                false,
-            ));
-        };
+        let mut session = load_session_runtime(&state, &req.session_id)
+            .await?
+            .ok_or_else(|| {
+                json_error(
+                    StatusCode::NOT_FOUND,
+                    "ERR_INVALID_PARAMS",
+                    "unknown session_id".to_string(),
+                    TerminalMode::InsufficientEvidence,
+                    false,
+                )
+            })?;
 
         if session.finalized {
             return Err(json_error(
@@ -3563,8 +3637,9 @@ async fn finalize(
             ));
         }
 
-        if Instant::now() > session.session_token_expires_at
-            || session.session_token != session_token
+        let session_token_hash = sha256_hex(session_token.as_bytes());
+        if unix_epoch_ms_now() > session.session_token_expires_at_epoch_ms
+            || session.session_token_hash != session_token_hash
         {
             tracing::warn!(
                 trace_id = %session.trace_id,
@@ -3725,7 +3800,7 @@ async fn finalize(
                 response_text,
                 session_id: _,
             } = req;
-            let claim_map = finalize_gate(session, claim_map, state.config.coverage_threshold)?;
+            let claim_map = finalize_gate(&session, claim_map, state.config.coverage_threshold)?;
 
             let terminal_mode = claim_map.terminal_mode.as_str();
             tracing::Span::current().record("terminal_mode", terminal_mode);
@@ -3789,6 +3864,17 @@ async fn finalize(
             .await?;
 
             session.finalized = true;
+            persist_session_runtime(&state, &session)
+                .await
+                .map_err(|_| {
+                    json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ERR_LEDGER_UNAVAILABLE",
+                        "ledger unavailable".to_string(),
+                        TerminalMode::SourceUnavailable,
+                        true,
+                    )
+                })?;
 
             let latency_ms = started.elapsed().as_millis() as u64;
             tracing::Span::current().record("latency_ms", latency_ms);
@@ -3827,6 +3913,98 @@ async fn finalize(
     }
 
     handler_result
+}
+
+fn unix_epoch_ms_now() -> i64 {
+    let duration = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO);
+    duration.as_millis().min(i64::MAX as u128) as i64
+}
+
+async fn persist_session_runtime(state: &AppState, session: &Session) -> Result<(), ApiError> {
+    let mut evidence_unit_ids = session
+        .evidence_unit_ids
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    evidence_unit_ids.sort();
+    evidence_unit_ids.dedup();
+
+    state
+        .ledger
+        .upsert_session_runtime(SessionRuntimeWrite {
+            session_id: session.session_id.as_str(),
+            tenant_id: session.tenant_id.as_str(),
+            session_token_hash: session.session_token_hash.as_str(),
+            session_token_expires_at_epoch_ms: session.session_token_expires_at_epoch_ms,
+            operator_calls_used: session.operator_calls_used,
+            bytes_used: session.bytes_used,
+            evidence_unit_ids: &evidence_unit_ids,
+            finalized: session.finalized,
+        })
+        .await
+        .map_err(|_| {
+            json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ERR_LEDGER_UNAVAILABLE",
+                "ledger unavailable".to_string(),
+                TerminalMode::SourceUnavailable,
+                true,
+            )
+        })
+}
+
+async fn load_session_runtime(
+    state: &AppState,
+    session_id: &str,
+) -> Result<Option<Session>, ApiError> {
+    let record = state
+        .ledger
+        .load_session_runtime(session_id)
+        .await
+        .map_err(|_| {
+            json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ERR_LEDGER_UNAVAILABLE",
+                "ledger unavailable".to_string(),
+                TerminalMode::SourceUnavailable,
+                true,
+            )
+        })?;
+
+    let Some(record) = record else {
+        return Ok(None);
+    };
+
+    if record.budget.validate().is_err() {
+        return Err(json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ERR_INTERNAL",
+            "stored session budget is invalid".to_string(),
+            TerminalMode::SourceUnavailable,
+            false,
+        ));
+    }
+
+    let evidence_unit_ids = record.evidence_unit_ids.into_iter().collect::<HashSet<_>>();
+
+    Ok(Some(Session {
+        session_id: record.session_id,
+        trace_id: record.trace_id,
+        principal_id: record.principal_id,
+        tenant_id: record.tenant_id,
+        policy_snapshot_id: record.policy_snapshot_id,
+        policy_snapshot_hash: record.policy_snapshot_hash,
+        as_of_time: record.as_of_time,
+        budget: record.budget,
+        session_token_hash: record.session_token_hash,
+        session_token_expires_at_epoch_ms: record.session_token_expires_at_epoch_ms,
+        operator_calls_used: record.operator_calls_used,
+        bytes_used: record.bytes_used,
+        evidence_unit_ids,
+        finalized: record.finalized,
+    }))
 }
 
 async fn extract_principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, ApiError> {
@@ -4293,6 +4471,13 @@ fn opa_error_response(err: &crate::opa::OpaError) -> (StatusCode, Json<ErrorResp
             TerminalMode::SourceUnavailable,
             true,
         ),
+        crate::opa::OpaError::CircuitOpen => json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ERR_SOURCE_UNAVAILABLE",
+            "policy engine circuit breaker is open".to_string(),
+            TerminalMode::SourceUnavailable,
+            true,
+        ),
         _ => json_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "ERR_SOURCE_UNAVAILABLE",
@@ -4327,8 +4512,8 @@ mod tests {
             policy_snapshot_hash: "hash".to_string(),
             as_of_time: "1970-01-01T00:00:00Z".to_string(),
             budget,
-            session_token: "token".to_string(),
-            session_token_expires_at: Instant::now() + Duration::from_secs(60),
+            session_token_hash: sha256_hex("token".as_bytes()),
+            session_token_expires_at_epoch_ms: unix_epoch_ms_now() + 60_000,
             operator_calls_used,
             bytes_used,
             evidence_unit_ids: set,

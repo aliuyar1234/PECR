@@ -2,6 +2,7 @@ use std::time::Duration;
 
 use pecr_contracts::canonical;
 use pecr_contracts::{Budget, ClaimMap, EvidenceUnit, PolicySnapshot, TerminalMode};
+use sqlx::Row;
 use sqlx::postgres::PgPoolOptions;
 use ulid::Ulid;
 
@@ -44,6 +45,35 @@ pub struct FinalizeResultRecord<'a> {
     pub request_id: &'a str,
 }
 
+pub struct SessionRuntimeWrite<'a> {
+    pub session_id: &'a str,
+    pub tenant_id: &'a str,
+    pub session_token_hash: &'a str,
+    pub session_token_expires_at_epoch_ms: i64,
+    pub operator_calls_used: u32,
+    pub bytes_used: u64,
+    pub evidence_unit_ids: &'a [String],
+    pub finalized: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct SessionRuntimeRecord {
+    pub session_id: String,
+    pub trace_id: String,
+    pub principal_id: String,
+    pub tenant_id: String,
+    pub policy_snapshot_id: String,
+    pub policy_snapshot_hash: String,
+    pub as_of_time: String,
+    pub budget: Budget,
+    pub session_token_hash: String,
+    pub session_token_expires_at_epoch_ms: i64,
+    pub operator_calls_used: u32,
+    pub bytes_used: u64,
+    pub evidence_unit_ids: Vec<String>,
+    pub finalized: bool,
+}
+
 impl LedgerWriter {
     pub async fn connect(db_url: &str, write_timeout: Duration) -> Result<Self, LedgerError> {
         let pool = tokio::time::timeout(
@@ -72,6 +102,16 @@ impl LedgerWriter {
         tokio::time::timeout(Duration::from_secs(10), migrate(&self.pool))
             .await
             .map_err(|_| LedgerError::Timeout)??;
+        Ok(())
+    }
+
+    pub async fn ping(&self) -> Result<(), LedgerError> {
+        tokio::time::timeout(
+            self.write_timeout,
+            sqlx::query("SELECT 1").execute(&self.pool),
+        )
+        .await
+        .map_err(|_| LedgerError::Timeout)??;
         Ok(())
     }
 
@@ -311,6 +351,91 @@ impl LedgerWriter {
         .map_err(|_| LedgerError::Timeout)??;
 
         Ok(())
+    }
+
+    pub async fn upsert_session_runtime(
+        &self,
+        record: SessionRuntimeWrite<'_>,
+    ) -> Result<(), LedgerError> {
+        let evidence_unit_ids_json = serde_json::to_value(record.evidence_unit_ids)
+            .unwrap_or_else(|_| serde_json::json!([]));
+
+        tokio::time::timeout(
+            self.write_timeout,
+            sqlx::query(
+                "INSERT INTO pecr_session_runtime (session_id, tenant_id, session_token_hash, session_token_expires_at_epoch_ms, operator_calls_used, bytes_used, evidence_unit_ids_json, finalized, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now()) ON CONFLICT (session_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id, session_token_hash = EXCLUDED.session_token_hash, session_token_expires_at_epoch_ms = EXCLUDED.session_token_expires_at_epoch_ms, operator_calls_used = EXCLUDED.operator_calls_used, bytes_used = EXCLUDED.bytes_used, evidence_unit_ids_json = EXCLUDED.evidence_unit_ids_json, finalized = EXCLUDED.finalized, updated_at = now()",
+            )
+            .bind(record.session_id)
+            .bind(record.tenant_id)
+            .bind(record.session_token_hash)
+            .bind(record.session_token_expires_at_epoch_ms)
+            .bind(i64::from(record.operator_calls_used))
+            .bind(record.bytes_used as i64)
+            .bind(evidence_unit_ids_json)
+            .bind(record.finalized)
+            .execute(&self.pool),
+        )
+        .await
+        .map_err(|_| LedgerError::Timeout)??;
+
+        Ok(())
+    }
+
+    pub async fn load_session_runtime(
+        &self,
+        session_id: &str,
+    ) -> Result<Option<SessionRuntimeRecord>, LedgerError> {
+        let row = tokio::time::timeout(
+            self.write_timeout,
+            sqlx::query(
+                "SELECT s.session_id, s.trace_id, s.principal_id, s.policy_snapshot_id, s.budget_json, ps.policy_snapshot_hash, to_char(ps.as_of_time AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as as_of_time, r.tenant_id, r.session_token_hash, r.session_token_expires_at_epoch_ms, r.operator_calls_used, r.bytes_used, r.evidence_unit_ids_json, (s.finalized_at IS NOT NULL OR r.finalized) AS finalized FROM pecr_sessions s JOIN pecr_policy_snapshots ps ON ps.policy_snapshot_id = s.policy_snapshot_id JOIN pecr_session_runtime r ON r.session_id = s.session_id WHERE s.session_id = $1",
+            )
+            .bind(session_id)
+            .fetch_optional(&self.pool),
+        )
+        .await
+        .map_err(|_| LedgerError::Timeout)??;
+
+        let Some(row) = row else {
+            return Ok(None);
+        };
+
+        let budget_json: serde_json::Value = row.try_get("budget_json")?;
+        let budget = serde_json::from_value::<Budget>(budget_json).map_err(|err| {
+            LedgerError::Sqlx(sqlx::Error::Decode(Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid budget_json: {}", err),
+            ))))
+        })?;
+
+        let evidence_unit_ids_json: serde_json::Value = row.try_get("evidence_unit_ids_json")?;
+        let evidence_unit_ids = match evidence_unit_ids_json {
+            serde_json::Value::Array(items) => items
+                .into_iter()
+                .filter_map(|item| item.as_str().map(|s| s.to_string()))
+                .collect::<Vec<_>>(),
+            _ => Vec::new(),
+        };
+
+        let operator_calls_used = row.try_get::<i64, _>("operator_calls_used")?;
+        let bytes_used = row.try_get::<i64, _>("bytes_used")?;
+
+        Ok(Some(SessionRuntimeRecord {
+            session_id: row.try_get("session_id")?,
+            trace_id: row.try_get("trace_id")?,
+            principal_id: row.try_get("principal_id")?,
+            tenant_id: row.try_get("tenant_id")?,
+            policy_snapshot_id: row.try_get("policy_snapshot_id")?,
+            policy_snapshot_hash: row.try_get("policy_snapshot_hash")?,
+            as_of_time: row.try_get("as_of_time")?,
+            budget,
+            session_token_hash: row.try_get("session_token_hash")?,
+            session_token_expires_at_epoch_ms: row.try_get("session_token_expires_at_epoch_ms")?,
+            operator_calls_used: operator_calls_used.max(0) as u32,
+            bytes_used: bytes_used.max(0) as u64,
+            evidence_unit_ids,
+            finalized: row.try_get("finalized")?,
+        }))
     }
 
     pub async fn close(&self) {

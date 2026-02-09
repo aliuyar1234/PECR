@@ -9,6 +9,7 @@ use pecr_contracts::{
     Budget, Claim, ClaimMap, ClaimStatus, EvidenceUnit, EvidenceUnitRef, TerminalMode,
 };
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
 use ulid::Ulid;
@@ -58,6 +59,7 @@ pub async fn router(config: ControllerConfig) -> Result<Router, StartupError> {
 
     Ok(Router::new()
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/v1/run", post(run))
         .with_state(state))
@@ -65,6 +67,45 @@ pub async fn router(config: ControllerConfig) -> Result<Router, StartupError> {
 
 async fn healthz() -> &'static str {
     "ok"
+}
+
+#[derive(Debug, Serialize)]
+struct ReadyzResponse {
+    status: &'static str,
+    checks: BTreeMap<&'static str, bool>,
+}
+
+async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    let gateway_ready = {
+        let url = format!("{}/readyz", state.config.gateway_url.trim_end_matches('/'));
+        tokio::time::timeout(Duration::from_secs(2), state.http.get(url).send())
+            .await
+            .is_ok_and(|resp| resp.map(|r| r.status().is_success()).unwrap_or(false))
+    };
+
+    let auth_ready = match state.config.auth_mode {
+        AuthMode::Local => true,
+        AuthMode::Oidc => state.oidc.is_some(),
+    };
+
+    let mut checks = BTreeMap::new();
+    checks.insert("gateway", gateway_ready);
+    checks.insert("auth", auth_ready);
+
+    let all_ready = checks.values().all(|ok| *ok);
+    let status = if all_ready {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+
+    (
+        status,
+        Json(ReadyzResponse {
+            status: if all_ready { "ready" } else { "not_ready" },
+            checks,
+        }),
+    )
 }
 
 async fn metrics() -> impl IntoResponse {
