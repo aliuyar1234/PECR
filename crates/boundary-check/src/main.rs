@@ -3,8 +3,38 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use anyhow::{Context, Result};
 use cargo_metadata::MetadataCommand;
 
-const CONTROLLER_PACKAGE_NAME: &str = "pecr-controller";
-const FORBIDDEN_CONTROLLER_DEPENDENCIES: &[&str] = &["pecr-adapters", "pecr-ledger", "pecr-policy"];
+const BOUNDARY_RULES: &[(&str, &[&str])] = &[
+    (
+        "pecr-controller",
+        &[
+            "pecr-adapters",
+            "pecr-ledger",
+            "pecr-policy",
+            "pecr-gateway",
+        ],
+    ),
+    ("pecr-gateway", &["pecr-controller"]),
+    (
+        "pecr-contracts",
+        &[
+            "pecr-controller",
+            "pecr-gateway",
+            "pecr-ledger",
+            "pecr-adapters",
+            "pecr-policy",
+            "pecr-auth",
+        ],
+    ),
+    (
+        "pecr-ledger",
+        &[
+            "pecr-controller",
+            "pecr-gateway",
+            "pecr-adapters",
+            "pecr-policy",
+        ],
+    ),
+];
 
 fn main() -> Result<()> {
     let metadata = MetadataCommand::new()
@@ -15,17 +45,6 @@ fn main() -> Result<()> {
         .resolve
         .as_ref()
         .context("`cargo metadata` did not include a resolved dependency graph")?;
-
-    let controller = metadata
-        .packages
-        .iter()
-        .find(|p| p.name == CONTROLLER_PACKAGE_NAME)
-        .with_context(|| {
-            format!(
-                "package `{}` not found in workspace",
-                CONTROLLER_PACKAGE_NAME
-            )
-        })?;
 
     let id_to_name: HashMap<_, _> = metadata
         .packages
@@ -42,49 +61,52 @@ fn main() -> Result<()> {
         })
         .collect();
 
-    let mut visited = HashSet::new();
-    let mut queue = VecDeque::new();
-    queue.push_back(controller.id.clone());
-    visited.insert(controller.id.clone());
+    let mut all_violations = Vec::new();
 
-    let mut violations = Vec::new();
+    for (package_name, forbidden) in BOUNDARY_RULES {
+        let package = metadata
+            .packages
+            .iter()
+            .find(|p| p.name == *package_name)
+            .with_context(|| format!("package `{}` not found in workspace", package_name))?;
 
-    while let Some(current) = queue.pop_front() {
-        let Some(deps) = adjacency.get(&current) else {
-            continue;
-        };
+        let mut visited = HashSet::new();
+        let mut queue = VecDeque::new();
+        queue.push_back(package.id.clone());
+        visited.insert(package.id.clone());
 
-        for dep in deps.iter().cloned() {
-            if !visited.insert(dep.clone()) {
+        while let Some(current) = queue.pop_front() {
+            let Some(deps) = adjacency.get(&current) else {
                 continue;
-            }
+            };
 
-            if let Some(name) = id_to_name.get(&dep)
-                && FORBIDDEN_CONTROLLER_DEPENDENCIES.contains(name)
-            {
-                violations.push((*name).to_string());
-            }
+            for dep in deps.iter().cloned() {
+                if !visited.insert(dep.clone()) {
+                    continue;
+                }
 
-            queue.push_back(dep);
+                if let Some(name) = id_to_name.get(&dep)
+                    && forbidden.contains(name)
+                {
+                    all_violations.push(format!("{} -> {}", package_name, name));
+                }
+
+                queue.push_back(dep);
+            }
         }
     }
 
-    if !violations.is_empty() {
-        violations.sort();
-        violations.dedup();
+    if !all_violations.is_empty() {
+        all_violations.sort();
+        all_violations.dedup();
         eprintln!(
-            "FAIL: `{}` depends on forbidden crate(s): {}",
-            CONTROLLER_PACKAGE_NAME,
-            violations.join(", ")
+            "FAIL: forbidden workspace dependency edges found: {}",
+            all_violations.join(", ")
         );
         std::process::exit(1);
     }
 
-    println!(
-        "OK: `{}` has no dependency edge to {}",
-        CONTROLLER_PACKAGE_NAME,
-        FORBIDDEN_CONTROLLER_DEPENDENCIES.join(", ")
-    );
+    println!("OK: boundary rules satisfied");
 
     Ok(())
 }

@@ -7,8 +7,11 @@ on:
       - main
       - master
 
+permissions:
+  contents: read
+
 jobs:
-  rust:
+  quality:
     runs-on: ubuntu-latest
     services:
       postgres:
@@ -52,7 +55,35 @@ jobs:
           mkdir -p artifacts
           ./scripts/ci.sh 2>&1 | tee artifacts/ci.log
 
-      - name: Suite 7 (p99 + fault injection)
+      - name: Upload quality artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: ci-quality-artifacts
+          path: artifacts
+          if-no-files-found: error
+
+  perf:
+    needs: quality
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Ensure scripts executable
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x scripts/perf/suite7.sh
+
+      - name: Suite 7 (p99 + fault injection + regression lock)
         shell: bash
         env:
           BASELINE_VUS: "10"
@@ -65,6 +96,7 @@ jobs:
           PECR_PERF_REGRESSION_ABS_MS: "1000"
         run: |
           set -euo pipefail
+          mkdir -p artifacts
           set +e
           ./scripts/perf/suite7.sh 2>&1 | tee artifacts/suite7.log
           suite7_status=${PIPESTATUS[0]}
@@ -87,10 +119,18 @@ jobs:
 
           exit "${perf_status}"
 
-      - name: Upload CI artifacts
+      - name: Upload perf artifacts
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: ci-artifacts
+          name: ci-perf-artifacts
           path: artifacts
           if-no-files-found: error
+
+  contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Contract lock check
+        run: python3 scripts/contracts/check_contract_lock.py
