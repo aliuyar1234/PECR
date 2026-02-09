@@ -30,8 +30,8 @@ Notes:
 
 ## Service endpoints (docker compose)
 
-- Gateway: `http://127.0.0.1:8080` (`/healthz`, `/metrics`)
-- Controller: `http://127.0.0.1:8081` (`/healthz`, `/metrics`)
+- Gateway: `http://127.0.0.1:8080` (`/healthz`, `/readyz`, `/metrics`)
+- Controller: `http://127.0.0.1:8081` (`/healthz`, `/readyz`, `/metrics`)
 
 ## Auth modes
 
@@ -94,3 +94,6 @@ Tail latency regression / wrong terminal modes under faults:
 
 - `bash scripts/ci.sh`
 - `bash scripts/perf/suite7.sh`
+- Security workflows green in GitHub Actions:
+  - `security`
+  - `codeql`

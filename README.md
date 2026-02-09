@@ -193,6 +193,7 @@ More operational details: `RUNBOOK.md`.
 
 Gateway:
 - `GET /healthz`
+- `GET /readyz`
 - `GET /metrics`
 - `POST /v1/sessions`
 - `POST /v1/operators/{search|fetch_span|fetch_rows|aggregate|list_versions|diff|redact}`
@@ -200,8 +201,12 @@ Gateway:
 
 Controller:
 - `GET /healthz`
+- `GET /readyz`
 - `GET /metrics`
 - `POST /v1/run`
+
+Versioned API contract:
+- `docs/openapi/pecr.v1.yaml`
 
 ## Configuration (Quick Reference)
 
@@ -284,8 +289,11 @@ OPA returns `{ allow, cacheable, reason, redaction }`. Redaction directives supp
 
 ## Quality Gates
 
-- `bash scripts/ci.sh`: formatting, clippy, boundary fitness check, and the full test suite.
+- `bash scripts/ci.sh`: formatting, clippy, architecture boundary check, full tests, e2e smoke, contract lock, and image pinning policy checks.
 - `bash scripts/perf/suite7.sh`: k6‑based p99 run + fault injection + BVR/SER checks and perf regression comparison.
+- `.github/workflows/security.yml`: dependency audit, secret scanning, SBOM generation, and vulnerability budget enforcement.
+- `.github/workflows/codeql.yml`: static analysis for Rust, JavaScript, Python, and workflow logic.
+- Enterprise guardrail policy: `docs/enterprise/QUALITY_GUARDRAILS.md`.
 
 ## Repository Layout
 

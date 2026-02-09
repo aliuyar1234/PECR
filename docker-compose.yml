@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16-alpine
+    image: postgres:16.6-alpine
     environment:
       POSTGRES_USER: pecr
       POSTGRES_PASSWORD: pecr
@@ -17,7 +17,7 @@ services:
       - ./db/init:/docker-entrypoint-initdb.d:ro
 
   opa:
-    image: openpolicyagent/opa:latest
+    image: openpolicyagent/opa:0.66.0
     command:
       [
         "run",
@@ -37,7 +37,7 @@ services:
     environment:
       RUST_LOG: info
       PECR_BIND_ADDR: 0.0.0.0:8080
-      PECR_DEV_ALLOW_NONLOCAL_BIND: "1"
+      PECR_DEV_ALLOW_NONLOCAL_BIND: "${PECR_DEV_ALLOW_NONLOCAL_BIND:-1}"
       PECR_DB_URL: postgres://pecr:pecr@postgres:5432/pecr
       PECR_OPA_URL: "${PECR_OPA_URL:-http://opa:8181}"
       PECR_OPA_TIMEOUT_MS: "${PECR_OPA_TIMEOUT_MS:-200}"
@@ -46,7 +46,7 @@ services:
       PECR_CACHE_TTL_MS: "${PECR_CACHE_TTL_MS:-0}"
       PECR_PG_SAFEVIEW_QUERY_TIMEOUT_MS: "${PECR_PG_SAFEVIEW_QUERY_TIMEOUT_MS:-200}"
       PECR_EVIDENCE_PAYLOAD_STORE_MODE: metadata-only
-      PECR_AUTH_MODE: local
+      PECR_AUTH_MODE: "${PECR_AUTH_MODE:-local}"
       PECR_FS_CORPUS_PATH: /fixtures/fs_corpus
       PECR_AS_OF_TIME_DEFAULT: "1970-01-01T00:00:00Z"
     depends_on:
@@ -64,11 +64,11 @@ services:
     environment:
       RUST_LOG: info
       PECR_CONTROLLER_BIND_ADDR: 0.0.0.0:8081
-      PECR_DEV_ALLOW_NONLOCAL_BIND: "1"
+      PECR_DEV_ALLOW_NONLOCAL_BIND: "${PECR_DEV_ALLOW_NONLOCAL_BIND:-1}"
       PECR_GATEWAY_URL: http://gateway:8080
       PECR_MODEL_PROVIDER: mock
       PECR_BUDGET_DEFAULTS: '{"max_operator_calls":10,"max_bytes":1048576,"max_wallclock_ms":10000,"max_recursion_depth":5,"max_parallelism":4}'
-      PECR_AUTH_MODE: local
+      PECR_AUTH_MODE: "${PECR_AUTH_MODE:-local}"
     depends_on:
       gateway:
         condition: service_started
@@ -84,7 +84,7 @@ services:
       - ./target/perf:/results
 
   opa_blackhole:
-    image: python:3.12-alpine
+    image: python:3.12.8-alpine
     profiles: ["faults"]
     command:
       [
