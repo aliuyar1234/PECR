@@ -7,115 +7,53 @@
 
 PECR (Policy‑Enforced Context Runtime) is a **governance plane for context**: it turns heterogeneous systems‑of‑record into **policy‑correct, time‑correct, evidence‑auditable** context bundles — while keeping the model/controller **non‑privileged**.
 
-If you know “ChatGPT + RAG”: PECR is the missing runtime layer that makes retrieval **safe, reviewable, and repeatable** (deny‑by‑default policy, immutable evidence IDs, audit ledger, deterministic refusal modes).
+PECR adds the governance layer that plain retrieval pipelines typically miss: policy enforcement, immutable evidence, auditability, and deterministic terminal modes.
 
-This repository is the Rust implementation of PECR/CEGP (spec SSOT lives in a separate internal pack, `pcdr`).
+This repository contains the Rust implementation of PECR.
 
-## Maturity Snapshot (February 9, 2026)
+## System Overview
 
-PECR is a solo-built Rust project with enterprise-focused engineering standards.
+PECR enforces policy, provenance, and deterministic behavior for retrieval-based AI workflows.
+It separates orchestration from data access, so models/controllers can coordinate work without holding direct source credentials.
 
-- **Modular trust boundary**: privileged Gateway and non-privileged Controller are separated by design and verified in CI.
-- **Security-first runtime**: deny-by-default policy, fail-closed decisions, append-only audit ledger, and deterministic redaction/evidence hashing.
-- **Reliability hardening**: session bootstrap is transactional and per-session operator/finalize execution is serialized to prevent race-driven state drift.
-- **Quality automation**: formatting, clippy, boundary checks, unit/integration/e2e suites, contract-lock drift checks, and image pinning policy checks are all enforced.
-- **Contract discipline**: versioned OpenAPI and schema lockfiles keep interfaces stable and reviewable.
+## Architecture (High Level)
 
-Current positioning: strong enterprise-grade groundwork with a clear path to 9/10 in performance evidence and operations maturity.
+```mermaid
+flowchart LR
+    Client[Client / API Consumer]
 
-### Path To 9/10 Enterprise Readiness
+    subgraph NonPriv[Non-Privileged Zone]
+      Controller[PECR Controller<br/>Orchestration + Budget Loop]
+    end
 
-1. Add sustained-load SLO gates (p95/p99 latency + error budget) as merge blockers.
-2. Expand chaos and recovery verification (DB failover, OPA outage windows, backup/restore drills).
-3. Add dedicated high-concurrency integration tests for session/operator/finalize race resistance.
-4. Maintain a formal security assurance cadence (threat model updates, dependency/CVE review, hardening baseline checks).
+    subgraph Priv[Privileged Zone]
+      Gateway[PECR Gateway<br/>Policy Enforcement + Redaction + Evidence]
+      OPA[OPA Policy Engine]
+      Ledger[(PostgreSQL Ledger)]
+      Sources[(Systems of Record<br/>Filesystem / PostgreSQL / APIs)]
+    end
 
-## What You Get (Guarantees)
-
-- **Hard trust boundary**: privileged **Gateway** vs non‑privileged **Controller** (the controller holds no source credentials).
-- **Deny‑by‑default policy enforcement** (OPA) for session creation, every operator call, and finalize.
-- **State consistency under concurrency**: session runtime is initialized transactionally and per-session operations are serialized.
-- **EvidenceUnits**: immutable, versioned, **hashed after redaction**, bound to **policy snapshot** and **as‑of time**.
-- **Claim↔Evidence gate**: answers are compiled into atomic claims mapped to EvidenceUnit IDs (or you get a refusal terminal mode).
-- **Budgeted execution**: strict caps on operator calls, bytes, wallclock, recursion depth (plus parallelism).
-- **Auditability**: append‑only Postgres ledger + `trace_id` correlation across requests, evidence, and finalization.
-- **Release‑blocking suites**: leakage, injection, staleness/time‑travel correctness, claim↔evidence, cache bleed, telemetry leakage.
-- **Performance + fault injection harness**: k6 p99 run + injected OPA/Postgres faults + regression checks.
-
-## Why This Isn’t “Just RAG”
-
-**RAG is a retrieval strategy. PECR is the architecture around retrieval.**
-
-RAG *can* exist inside `search()` (dense/hybrid/BM25/vector). But PECR removes the “top‑k → stuff into prompt → hope” failure mode by enforcing:
-
-- **Policy**: who can retrieve what (and which fields must be redacted) is evaluated per call.
-- **Provenance**: retrieved material is packaged as **EvidenceUnits** with deterministic IDs/hashes.
-- **Time correctness**: evidence is anchored to an `as_of_time` so you can answer “as of last Tuesday” deterministically.
-- **Governance**: the final answer must pass a **Claim↔Evidence** coverage gate.
-- **Safe failure**: the system returns one of four terminal modes (no “partial success” ambiguity).
-
-Mini‑picture:
-
-```text
-+-----------------------------+
-| Controller (LLM optional)  |
-| - plans / calls operators  |
-| - never touches data stores|
-+--------------+-------------+
-               |
-               | operator calls only
-               v
-+-----------------------------+
-| PECR Gateway (privileged)   |
-| - allowlist + validation    |
-| - OPA policy + redaction    |
-| - EvidenceUnit emitter      |
-| - append-only ledger writer |
-+-----------------------------+
+    Client -->|POST /v1/run| Controller
+    Controller -->|typed operator calls| Gateway
+    Controller -->|finalize payload| Gateway
+    Gateway -->|policy decisions| OPA
+    Gateway -->|read with policy context| Sources
+    Gateway -->|append-only events + runtime state| Ledger
+    Gateway -->|terminal result| Controller
+    Controller -->|response| Client
 ```
 
-### Where PECR Shines
+Trust boundary: the controller is non-privileged and never accesses systems of record directly.
 
-- **Enterprise assistants** that must respect RBAC/ABAC and field‑level redaction across multiple systems‑of‑record.
-- **Regulated environments** (PII/finance/health) where provenance, auditability, and deterministic failure matter.
-- **Time‑travel answers** (“as of last week”) without silently mixing data from different points in time.
-- **Agentic workflows** where the model must not have direct access to databases, APIs, or credentials.
+## How the System Works
 
-## Architecture (Trust Boundary)
+1. A client request starts a session and captures policy/time context.
+2. The controller runs a budgeted loop and calls only typed gateway operators.
+3. The gateway enforces policy, applies redaction, and emits immutable evidence units.
+4. The controller submits `response_text` plus a `claim_map` to `/v1/finalize`.
+5. The gateway verifies claim-to-evidence coverage, writes audit events, and returns a terminal mode.
 
-```text
-+---------------------------+           mTLS            +------------------------------+
-| Controller (non-privileged)|  --------------------->  | PECR Gateway (privileged)    |
-| - Budgeted context loop    |                          | - Operator runtime (allowlist)|
-| - LLM provider (optional)  |                          | - Policy client (OPA)         |
-| - Claim draft + mapping    |                          | - EvidenceUnit emitter        |
-+-------------+-------------+                          | - Ledger writer (append-only)|
-              |                                        +---------------+--------------+
-              |                                                        |
-              |                                                        | SQL
-              |                                                        v
-              |                                        +------------------------------+
-              |                                        | PostgreSQL (ledger datastore)|
-              |                                        +------------------------------+
-              |
-              |  HTTP (policy queries)                  +------------------------------+
-              +---------------------------------------> | OPA (policy engine sidecar) |
-                                                         +------------------------------+
-
-Adapters live behind the Gateway operator boundary:
-- Filesystem adapter (deterministic dev/test)
-- Postgres safe-view adapter (structured rows/fields provenance)
-```
-
-## Critical Flow (End‑to‑End)
-
-1) **Session**: client starts a session via the Gateway; Gateway computes a **policy snapshot** and returns a capability token.
-2) **Context loop**: controller runs a budgeted loop by calling **typed operators** through the Gateway.
-3) **Evidence**: Gateway returns EvidenceUnits/refs (already policy‑enforced + redacted) and writes ledger events.
-4) **Finalize**: controller submits the candidate answer + ClaimMap to Gateway `/v1/finalize`.
-5) **Gate**: Gateway verifies Claim↔Evidence contracts, enforces terminal mode, appends ledger events, returns the final result.
-
-The controller’s `/v1/run` response shape:
+The controller `/v1/run` response shape:
 
 ```json
 {
@@ -125,6 +63,18 @@ The controller’s `/v1/run` response shape:
   "response_text": "UNKNOWN: ..."
 }
 ```
+
+## Engineering Properties
+
+- **Trust-domain separation**: privileged data access is isolated in the gateway; the controller remains non-privileged.
+- **Policy-first execution**: OPA decisions are enforced for session creation, operator calls, and finalize.
+- **Concurrent state integrity**: session runtime initialization is transactional and per-session operations are serialized.
+- **Evidence provenance model**: evidence units are immutable, versioned, and hashed after redaction under policy/time context.
+- **Deterministic finalization contract**: claim-to-evidence coverage is validated before returning terminal outcomes.
+- **Resource governance**: operator calls, bytes, wallclock, recursion depth, and optional parallelism are budgeted.
+- **Auditability**: append-only ledger records policy decisions, evidence events, and finalization events under a shared `trace_id`.
+- **Release discipline**: leakage, injection, staleness, cache-isolation, and telemetry suites are CI-blocking checks.
+- **Performance and resilience validation**: k6 p99 and fault-injection harnesses are part of the quality workflow.
 
 ## Core Concepts (Quick Glossary)
 
