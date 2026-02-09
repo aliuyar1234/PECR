@@ -143,11 +143,22 @@ pub struct Budget {
 }
 
 impl Budget {
+    pub const MAX_OPERATOR_CALLS_HARD_LIMIT: u32 = 10_000;
+    pub const MAX_BYTES_HARD_LIMIT: u64 = 64 * 1024 * 1024;
+    pub const MAX_WALLCLOCK_MS_HARD_LIMIT: u64 = 300_000;
+    pub const MAX_RECURSION_DEPTH_HARD_LIMIT: u32 = 20;
+
     pub fn validate(&self) -> Result<(), &'static str> {
-        if self.max_operator_calls > 10000 {
+        if self.max_operator_calls > Self::MAX_OPERATOR_CALLS_HARD_LIMIT {
             return Err("max_operator_calls out of range");
         }
-        if self.max_recursion_depth > 20 {
+        if self.max_bytes > Self::MAX_BYTES_HARD_LIMIT {
+            return Err("max_bytes out of range");
+        }
+        if self.max_wallclock_ms > Self::MAX_WALLCLOCK_MS_HARD_LIMIT {
+            return Err("max_wallclock_ms out of range");
+        }
+        if self.max_recursion_depth > Self::MAX_RECURSION_DEPTH_HARD_LIMIT {
             return Err("max_recursion_depth out of range");
         }
         if let Some(max_parallelism) = self.max_parallelism
@@ -183,5 +194,33 @@ mod tests {
         b.evaluated_at = "2099-01-01T00:00:00Z".to_string();
 
         assert_eq!(a.compute_hash(), b.compute_hash());
+    }
+
+    #[test]
+    fn budget_validate_rejects_excessive_max_bytes() {
+        let budget = Budget {
+            max_operator_calls: 10,
+            max_bytes: Budget::MAX_BYTES_HARD_LIMIT + 1,
+            max_wallclock_ms: 1000,
+            max_recursion_depth: 1,
+            max_parallelism: Some(4),
+        };
+
+        let err = budget.validate().expect_err("budget should be rejected");
+        assert_eq!(err, "max_bytes out of range");
+    }
+
+    #[test]
+    fn budget_validate_rejects_excessive_wallclock() {
+        let budget = Budget {
+            max_operator_calls: 10,
+            max_bytes: 1024,
+            max_wallclock_ms: Budget::MAX_WALLCLOCK_MS_HARD_LIMIT + 1,
+            max_recursion_depth: 1,
+            max_parallelism: Some(4),
+        };
+
+        let err = budget.validate().expect_err("budget should be rejected");
+        assert_eq!(err, "max_wallclock_ms out of range");
     }
 }
