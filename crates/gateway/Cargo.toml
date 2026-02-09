@@ -22,5 +22,5 @@ tracing-opentelemetry = "0.32.1"
 prometheus = "0.13"
 sha2 = "0.10"
 hex = "0.4"
-sqlx = { version = "0.7", default-features = false, features = ["postgres", "runtime-tokio"] }
+sqlx = { version = "0.8", default-features = false, features = ["postgres", "runtime-tokio"] }
 similar = "2"
