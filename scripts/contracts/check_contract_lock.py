@@ -20,10 +20,26 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def tracked_files() -> list[Path]:
-    files = [ROOT / "docs" / "openapi" / "pecr.v1.yaml"]
-    files.extend(sorted((ROOT / "crates" / "contracts" / "schemas").glob("*.json")))
-    return files
+def discover_contract_files() -> list[Path]:
+    files = set()
+    openapi_dir = ROOT / "docs" / "openapi"
+    if openapi_dir.exists():
+        files.update(openapi_dir.rglob("*.yaml"))
+        files.update(openapi_dir.rglob("*.yml"))
+        files.update(openapi_dir.rglob("*.json"))
+
+    crates_dir = ROOT / "crates"
+    if crates_dir.exists():
+        files.update(crates_dir.rglob("schemas/*.json"))
+
+    return sorted(path for path in files if path.is_file())
+
+
+def tracked_files(lock_files: dict[str, str]) -> list[Path]:
+    files = set(discover_contract_files())
+    for rel in lock_files:
+        files.add(ROOT / rel)
+    return sorted(files)
 
 
 def load_lock() -> dict:
@@ -45,7 +61,7 @@ def main() -> int:
     extra = []
 
     expected_rel = set()
-    for file_path in tracked_files():
+    for file_path in tracked_files(lock_files):
         rel = file_path.relative_to(ROOT).as_posix()
         expected_rel.add(rel)
         if not file_path.exists():

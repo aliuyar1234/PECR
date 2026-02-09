@@ -20,9 +20,18 @@ def sha256_file(path: Path) -> str:
 
 
 def tracked_files() -> list[Path]:
-    files = [ROOT / "docs" / "openapi" / "pecr.v1.yaml"]
-    files.extend(sorted((ROOT / "crates" / "contracts" / "schemas").glob("*.json")))
-    return files
+    files = set()
+    openapi_dir = ROOT / "docs" / "openapi"
+    if openapi_dir.exists():
+        files.update(openapi_dir.rglob("*.yaml"))
+        files.update(openapi_dir.rglob("*.yml"))
+        files.update(openapi_dir.rglob("*.json"))
+
+    crates_dir = ROOT / "crates"
+    if crates_dir.exists():
+        files.update(crates_dir.rglob("schemas/*.json"))
+
+    return sorted(path for path in files if path.is_file())
 
 
 def main() -> None:
