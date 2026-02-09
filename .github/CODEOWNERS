@@ -1,0 +1,26 @@
+# Global default owner
+* @aliuyar1234
+
+# Core services
+/crates/gateway/ @aliuyar1234
+/crates/controller/ @aliuyar1234
+/crates/ledger/ @aliuyar1234
+/crates/auth/ @aliuyar1234
+/crates/contracts/ @aliuyar1234
+/crates/policy/ @aliuyar1234
+/crates/adapters/ @aliuyar1234
+/crates/boundary-check/ @aliuyar1234
+/crates/e2e_smoke/ @aliuyar1234
+
+# Security and CI controls
+/.github/ @aliuyar1234
+/scripts/ @aliuyar1234
+/docker/ @aliuyar1234
+/docker-compose.yml @aliuyar1234
+/opa/ @aliuyar1234
+/db/ @aliuyar1234
+
+# Contract and API governance
+/docs/openapi/ @aliuyar1234
+/crates/contracts/schemas/ @aliuyar1234
+/contracts/contract-lock.json @aliuyar1234
