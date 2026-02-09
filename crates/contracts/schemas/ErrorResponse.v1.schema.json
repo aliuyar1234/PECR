@@ -1,0 +1,30 @@
+{
+  "$id": "pecr.schemas.ErrorResponse.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "code",
+    "message",
+    "terminal_mode_hint",
+    "retryable"
+  ],
+  "properties": {
+    "code": { "type": "string", "minLength": 1 },
+    "message": { "type": "string", "minLength": 1 },
+    "terminal_mode_hint": {
+      "$ref": "TerminalMode.v1.schema.json"
+    },
+    "retryable": { "type": "boolean" },
+    "detail": {
+      "oneOf": [
+        { "type": "object" },
+        { "type": "array" },
+        { "type": "string" },
+        { "type": "number" },
+        { "type": "integer" },
+        { "type": "boolean" },
+        { "type": "null" }
+      ]
+    }
+  }
+}

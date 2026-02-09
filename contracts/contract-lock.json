@@ -1,0 +1,16 @@
+{
+  "files": {
+    "crates/contracts/schemas/Budget.v1.schema.json": "e1594bf977d2a6d537c0364f2d8ff3f1125bf14cdac5e19a855a958441387bb2",
+    "crates/contracts/schemas/Claim.v1.schema.json": "20eb25cdb2208119c88bfc9b4736379a78c4ab066de336198d69f958fe462741",
+    "crates/contracts/schemas/ClaimMap.v1.schema.json": "04341798ae3f4a334ad92cc056ea8eb39e0d8abadaa8e8bb4a043f69e4bbbc1e",
+    "crates/contracts/schemas/ErrorResponse.v1.schema.json": "e38041b0c0ce0fd571db14d7d99d8bb0fcc44fc8f635485e3eb8cd6dbcb493b3",
+    "crates/contracts/schemas/EvidenceUnit.v1.schema.json": "d313aaefc76c0552cb05a731ec7603b957f1a7743d96e5eba934944064ad8c11",
+    "crates/contracts/schemas/EvidenceUnitRef.v1.schema.json": "17238d2cca62f884d2eb41eaf02c3ad00ee6e85593b8d2d1a3873d6e87a82f94",
+    "crates/contracts/schemas/PolicySnapshot.v1.schema.json": "294fd333c8e50bff947ce877a94335c9ef89c88ee2a5526ca38b1e964423763d",
+    "crates/contracts/schemas/TerminalMode.v1.schema.json": "330c335057f5b4c6e2ce1f8dc61f1583ee2f23cb4828d6be881d4957e7520a1c",
+    "crates/contracts/schemas/TraceEvent.v1.schema.json": "beced50b5ae0c2bc5523635db3a1735efd3e75be702f22fff874ce6f793747a7",
+    "docs/openapi/pecr.v1.yaml": "63b017786bd852ba0aa3cf1d457b0594f273879f461345cbd84a685d27026641"
+  },
+  "generated_by": "scripts/contracts/update_contract_lock.py",
+  "schema_version": 1
+}

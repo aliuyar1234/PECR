@@ -1,0 +1,300 @@
+openapi: 3.1.0
+info:
+  title: PECR API
+  version: 1.0.0
+  description: |
+    Versioned API contract for PECR v1.
+servers:
+  - url: http://127.0.0.1:8080
+    description: Gateway
+  - url: http://127.0.0.1:8081
+    description: Controller
+paths:
+  /healthz:
+    get:
+      summary: Liveness probe
+      operationId: healthz
+      responses:
+        "200":
+          description: Service process is running
+          content:
+            text/plain:
+              schema:
+                type: string
+                const: ok
+  /readyz:
+    get:
+      summary: Readiness probe
+      operationId: readyz
+      responses:
+        "200":
+          description: Service and dependencies are ready
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyzResponse"
+        "503":
+          description: One or more critical dependencies are unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReadyzResponse"
+  /metrics:
+    get:
+      summary: Prometheus metrics
+      operationId: metrics
+      responses:
+        "200":
+          description: Metrics scrape
+          content:
+            text/plain:
+              schema:
+                type: string
+  /v1/sessions:
+    post:
+      summary: Create policy-bound session
+      operationId: createSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [budget]
+              properties:
+                budget:
+                  $ref: ../../crates/contracts/schemas/Budget.v1.schema.json
+                as_of_time:
+                  type: string
+      responses:
+        "200":
+          description: Session created
+          headers:
+            x-pecr-session-token:
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [session_id, trace_id, policy_snapshot_id, budget]
+                properties:
+                  session_id:
+                    type: string
+                  trace_id:
+                    type: string
+                  policy_snapshot_id:
+                    type: string
+                  budget:
+                    $ref: ../../crates/contracts/schemas/Budget.v1.schema.json
+        "400":
+          description: Invalid input
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Denied by policy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Source unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/operators/{op_name}:
+    post:
+      summary: Execute allowlisted operator
+      operationId: callOperator
+      parameters:
+        - name: op_name
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_id, params]
+              properties:
+                session_id:
+                  type: string
+                params:
+                  type: object
+      responses:
+        "200":
+          description: Operator executed
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [terminal_mode, result]
+                properties:
+                  terminal_mode:
+                    $ref: ../../crates/contracts/schemas/TerminalMode.v1.schema.json
+                  result:
+                    type: object
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Denied by policy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "429":
+          description: Budget exceeded
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Source unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/finalize:
+    post:
+      summary: Finalize response with claim map gate
+      operationId: finalize
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [session_id, response_text, claim_map]
+              properties:
+                session_id:
+                  type: string
+                response_text:
+                  type: string
+                claim_map:
+                  $ref: ../../crates/contracts/schemas/ClaimMap.v1.schema.json
+      responses:
+        "200":
+          description: Finalized
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [terminal_mode, trace_id, claim_map, response_text]
+                properties:
+                  terminal_mode:
+                    $ref: ../../crates/contracts/schemas/TerminalMode.v1.schema.json
+                  trace_id:
+                    type: string
+                  claim_map:
+                    $ref: ../../crates/contracts/schemas/ClaimMap.v1.schema.json
+                  response_text:
+                    type: string
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Invalid credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "403":
+          description: Denied by policy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Source unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/run:
+    post:
+      summary: Controller end-to-end run
+      operationId: run
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              additionalProperties: false
+              required: [query]
+              properties:
+                query:
+                  type: string
+                budget:
+                  $ref: ../../crates/contracts/schemas/Budget.v1.schema.json
+      responses:
+        "200":
+          description: Finalized response
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [terminal_mode, trace_id, claim_map, response_text]
+                properties:
+                  terminal_mode:
+                    $ref: ../../crates/contracts/schemas/TerminalMode.v1.schema.json
+                  trace_id:
+                    type: string
+                  claim_map:
+                    $ref: ../../crates/contracts/schemas/ClaimMap.v1.schema.json
+                  response_text:
+                    type: string
+        "400":
+          description: Invalid request
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "502":
+          description: Gateway/source unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+components:
+  schemas:
+    ReadyzResponse:
+      type: object
+      additionalProperties: false
+      required: [status, checks]
+      properties:
+        status:
+          type: string
+          enum: [ready, not_ready]
+        checks:
+          type: object
+          additionalProperties:
+            type: boolean
+    ErrorResponse:
+      $ref: ../../crates/contracts/schemas/ErrorResponse.v1.schema.json
