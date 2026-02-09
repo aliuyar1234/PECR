@@ -18,11 +18,11 @@ use pecr_contracts::{
     Budget, ClaimMap, ClaimStatus, EvidenceContentType, EvidenceUnit, EvidenceUnitRef,
     PolicySnapshot, TerminalMode, TransformStep,
 };
-use pecr_ledger::{FinalizeResultRecord, LedgerWriter, SessionRuntimeWrite};
+use pecr_ledger::{CreateSessionRecord, FinalizeResultRecord, LedgerWriter, SessionRuntimeWrite};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use similar::TextDiff;
-use sqlx::{PgPool, Row};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use tokio::sync::RwLock;
 use tracing::Instrument;
 use ulid::Ulid;
@@ -397,14 +397,17 @@ async fn create_session(
             let started = Instant::now();
             state
                 .ledger
-                .create_session(
-                    &session_id,
-                    &trace_id,
-                    &principal_id,
-                    &req.budget,
-                    &policy_snapshot_id,
-                    &policy_snapshot,
-                )
+                .create_session(CreateSessionRecord {
+                    session_id: &session_id,
+                    trace_id: &trace_id,
+                    principal_id: &principal_id,
+                    budget: &req.budget,
+                    policy_snapshot_id: &policy_snapshot_id,
+                    policy_snapshot: &policy_snapshot,
+                    tenant_id: &policy_snapshot.tenant_id,
+                    session_token_hash: &session_token_hash,
+                    session_token_expires_at_epoch_ms,
+                })
                 .await
                 .map_err(|_| {
                     json_error(
@@ -423,35 +426,6 @@ async fn create_session(
         }
         .instrument(ledger_span)
         .await?;
-
-        let session = Session {
-            session_id: session_id.clone(),
-            trace_id: trace_id.clone(),
-            principal_id: principal_id.clone(),
-            tenant_id: policy_snapshot.tenant_id.clone(),
-            policy_snapshot_id: policy_snapshot_id.clone(),
-            policy_snapshot_hash: policy_snapshot.policy_snapshot_hash.clone(),
-            as_of_time: as_of_time.clone(),
-            budget: req.budget.clone(),
-            session_token_hash: session_token_hash.clone(),
-            session_token_expires_at_epoch_ms,
-            operator_calls_used: 0,
-            bytes_used: 0,
-            evidence_unit_ids: HashSet::new(),
-            finalized: false,
-        };
-
-        persist_session_runtime(&state, &session)
-            .await
-            .map_err(|_| {
-                json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ERR_LEDGER_UNAVAILABLE",
-                    "ledger unavailable".to_string(),
-                    TerminalMode::SourceUnavailable,
-                    true,
-                )
-            })?;
 
         let mut resp_headers = HeaderMap::new();
         let token_value = axum::http::HeaderValue::from_str(&session_token).map_err(|_| {
@@ -532,6 +506,7 @@ async fn call_operator(
                 false,
             )
         })?;
+        let _session_lock = acquire_session_lock(&state, &req.session_id).await?;
 
         let params_bytes = serde_json::to_vec(&req.params)
             .map(|v| v.len() as u64)
@@ -3597,6 +3572,7 @@ async fn finalize(
                 false,
             )
         })?;
+        let _session_lock = acquire_session_lock(&state, &req.session_id).await?;
 
         let mut session = load_session_runtime(&state, &req.session_id)
             .await?
@@ -3792,6 +3768,7 @@ async fn finalize(
             outcome = tracing::field::Empty,
         );
 
+        let state_for_finalize = state.clone();
         async move {
             let started = Instant::now();
 
@@ -3800,7 +3777,11 @@ async fn finalize(
                 response_text,
                 session_id: _,
             } = req;
-            let claim_map = finalize_gate(&session, claim_map, state.config.coverage_threshold)?;
+            let claim_map = finalize_gate(
+                &session,
+                claim_map,
+                state_for_finalize.config.coverage_threshold,
+            )?;
 
             let terminal_mode = claim_map.terminal_mode.as_str();
             tracing::Span::current().record("terminal_mode", terminal_mode);
@@ -3833,7 +3814,7 @@ async fn finalize(
 
             async {
                 let started = Instant::now();
-                state
+                state_for_finalize
                     .ledger
                     .record_finalize_result(FinalizeResultRecord {
                         trace_id: &session.trace_id,
@@ -3864,7 +3845,7 @@ async fn finalize(
             .await?;
 
             session.finalized = true;
-            persist_session_runtime(&state, &session)
+            persist_session_runtime(&state_for_finalize, &session)
                 .await
                 .map_err(|_| {
                     json_error(
@@ -3920,6 +3901,61 @@ fn unix_epoch_ms_now() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO);
     duration.as_millis().min(i64::MAX as u128) as i64
+}
+
+async fn acquire_session_lock<'a>(
+    state: &'a AppState,
+    session_id: &str,
+) -> Result<Transaction<'a, Postgres>, ApiError> {
+    let timeout = Duration::from_millis(state.config.ledger_write_timeout_ms.max(200));
+    let mut tx = tokio::time::timeout(timeout, state.pg_pool.begin())
+        .await
+        .map_err(|_| {
+            json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ERR_SOURCE_TIMEOUT",
+                "session lock acquisition timed out".to_string(),
+                TerminalMode::SourceUnavailable,
+                true,
+            )
+        })?
+        .map_err(|_| {
+            json_error(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "ERR_DB_UNAVAILABLE",
+                "failed to start session lock transaction".to_string(),
+                TerminalMode::SourceUnavailable,
+                true,
+            )
+        })?;
+
+    tokio::time::timeout(
+        timeout,
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(session_id)
+            .execute(&mut *tx),
+    )
+    .await
+    .map_err(|_| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ERR_SOURCE_TIMEOUT",
+            "session lock acquisition timed out".to_string(),
+            TerminalMode::SourceUnavailable,
+            true,
+        )
+    })?
+    .map_err(|_| {
+        json_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "ERR_DB_UNAVAILABLE",
+            "failed to acquire session lock".to_string(),
+            TerminalMode::SourceUnavailable,
+            true,
+        )
+    })?;
+
+    Ok(tx)
 }
 
 async fn persist_session_runtime(state: &AppState, session: &Session) -> Result<(), ApiError> {

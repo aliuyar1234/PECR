@@ -56,6 +56,18 @@ pub struct SessionRuntimeWrite<'a> {
     pub finalized: bool,
 }
 
+pub struct CreateSessionRecord<'a> {
+    pub session_id: &'a str,
+    pub trace_id: &'a str,
+    pub principal_id: &'a str,
+    pub budget: &'a Budget,
+    pub policy_snapshot_id: &'a str,
+    pub policy_snapshot: &'a PolicySnapshot,
+    pub tenant_id: &'a str,
+    pub session_token_hash: &'a str,
+    pub session_token_expires_at_epoch_ms: i64,
+}
+
 #[derive(Debug, Clone)]
 pub struct SessionRuntimeRecord {
     pub session_id: String,
@@ -115,18 +127,11 @@ impl LedgerWriter {
         Ok(())
     }
 
-    pub async fn create_session(
-        &self,
-        session_id: &str,
-        trace_id: &str,
-        principal_id: &str,
-        budget: &Budget,
-        policy_snapshot_id: &str,
-        policy_snapshot: &PolicySnapshot,
-    ) -> Result<(), LedgerError> {
-        let budget_json = serde_json::to_value(budget).unwrap_or_else(|_| serde_json::json!({}));
+    pub async fn create_session(&self, record: CreateSessionRecord<'_>) -> Result<(), LedgerError> {
+        let budget_json =
+            serde_json::to_value(record.budget).unwrap_or_else(|_| serde_json::json!({}));
         let input_json =
-            serde_json::to_value(policy_snapshot).unwrap_or_else(|_| serde_json::json!({}));
+            serde_json::to_value(record.policy_snapshot).unwrap_or_else(|_| serde_json::json!({}));
 
         tokio::time::timeout(self.write_timeout, async {
             let mut tx = self.pool.begin().await?;
@@ -134,11 +139,11 @@ impl LedgerWriter {
             sqlx::query(
                 "INSERT INTO pecr_policy_snapshots (policy_snapshot_id, policy_snapshot_hash, principal_id, as_of_time, policy_bundle_hash, input_json) VALUES ($1, $2, $3, $4::timestamptz, $5, $6)",
             )
-            .bind(policy_snapshot_id)
-            .bind(&policy_snapshot.policy_snapshot_hash)
-            .bind(principal_id)
-            .bind(&policy_snapshot.as_of_time)
-            .bind(&policy_snapshot.policy_bundle_hash)
+            .bind(record.policy_snapshot_id)
+            .bind(&record.policy_snapshot.policy_snapshot_hash)
+            .bind(record.principal_id)
+            .bind(&record.policy_snapshot.as_of_time)
+            .bind(&record.policy_snapshot.policy_bundle_hash)
             .bind(&input_json)
             .execute(&mut *tx)
             .await?;
@@ -146,11 +151,25 @@ impl LedgerWriter {
             sqlx::query(
                 "INSERT INTO pecr_sessions (session_id, trace_id, principal_id, policy_snapshot_id, budget_json) VALUES ($1, $2, $3, $4, $5)",
             )
-            .bind(session_id)
-            .bind(trace_id)
-            .bind(principal_id)
-            .bind(policy_snapshot_id)
+            .bind(record.session_id)
+            .bind(record.trace_id)
+            .bind(record.principal_id)
+            .bind(record.policy_snapshot_id)
             .bind(&budget_json)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO pecr_session_runtime (session_id, tenant_id, session_token_hash, session_token_expires_at_epoch_ms, operator_calls_used, bytes_used, evidence_unit_ids_json, finalized, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now())",
+            )
+            .bind(record.session_id)
+            .bind(record.tenant_id)
+            .bind(record.session_token_hash)
+            .bind(record.session_token_expires_at_epoch_ms)
+            .bind(0_i64)
+            .bind(0_i64)
+            .bind(serde_json::json!([]))
+            .bind(false)
             .execute(&mut *tx)
             .await?;
 
@@ -388,7 +407,7 @@ impl LedgerWriter {
         let row = tokio::time::timeout(
             self.write_timeout,
             sqlx::query(
-                "SELECT s.session_id, s.trace_id, s.principal_id, s.policy_snapshot_id, s.budget_json, ps.policy_snapshot_hash, to_char(ps.as_of_time AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as as_of_time, r.tenant_id, r.session_token_hash, r.session_token_expires_at_epoch_ms, r.operator_calls_used, r.bytes_used, r.evidence_unit_ids_json, (s.finalized_at IS NOT NULL OR r.finalized) AS finalized FROM pecr_sessions s JOIN pecr_policy_snapshots ps ON ps.policy_snapshot_id = s.policy_snapshot_id JOIN pecr_session_runtime r ON r.session_id = s.session_id WHERE s.session_id = $1",
+                "SELECT s.session_id, s.trace_id, s.principal_id, s.policy_snapshot_id, s.budget_json, ps.policy_snapshot_hash, to_char(ps.as_of_time AT TIME ZONE 'UTC', 'YYYY-MM-DD\"T\"HH24:MI:SS\"Z\"') as as_of_time, COALESCE(r.tenant_id, 'local') AS tenant_id, COALESCE(r.session_token_hash, '') AS session_token_hash, COALESCE(r.session_token_expires_at_epoch_ms, 0) AS session_token_expires_at_epoch_ms, COALESCE(r.operator_calls_used, 0) AS operator_calls_used, COALESCE(r.bytes_used, 0) AS bytes_used, COALESCE(r.evidence_unit_ids_json, '[]'::jsonb) AS evidence_unit_ids_json, (s.finalized_at IS NOT NULL OR COALESCE(r.finalized, false)) AS finalized FROM pecr_sessions s JOIN pecr_policy_snapshots ps ON ps.policy_snapshot_id = s.policy_snapshot_id LEFT JOIN pecr_session_runtime r ON r.session_id = s.session_id WHERE s.session_id = $1",
             )
             .bind(session_id)
             .fetch_optional(&self.pool),

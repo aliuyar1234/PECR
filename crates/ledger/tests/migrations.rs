@@ -220,7 +220,17 @@ async fn ledger_event_payload_hash_verifies() {
     snapshot.policy_snapshot_hash = snapshot.compute_hash();
 
     writer
-        .create_session("s1", "t1", "dev", &budget, "ps1", &snapshot)
+        .create_session(pecr_ledger::CreateSessionRecord {
+            session_id: "s1",
+            trace_id: "t1",
+            principal_id: "dev",
+            budget: &budget,
+            policy_snapshot_id: "ps1",
+            policy_snapshot: &snapshot,
+            tenant_id: "local",
+            session_token_hash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            session_token_expires_at_epoch_ms: 1_000_000,
+        })
         .await
         .expect("create session should succeed");
 
@@ -323,7 +333,17 @@ async fn session_runtime_round_trip() {
     snapshot.policy_snapshot_hash = snapshot.compute_hash();
 
     writer
-        .create_session("s1", "t1", "dev", &budget, "ps1", &snapshot)
+        .create_session(pecr_ledger::CreateSessionRecord {
+            session_id: "s1",
+            trace_id: "t1",
+            principal_id: "dev",
+            budget: &budget,
+            policy_snapshot_id: "ps1",
+            policy_snapshot: &snapshot,
+            tenant_id: "local",
+            session_token_hash: "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+            session_token_expires_at_epoch_ms: 1_000_000,
+        })
         .await
         .expect("create session should succeed");
 
