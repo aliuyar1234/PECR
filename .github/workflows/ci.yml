@@ -128,9 +128,25 @@ jobs:
           if-no-files-found: error
 
   contracts:
+    needs: quality
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
 
       - name: Contract lock check
         run: python3 scripts/contracts/check_contract_lock.py
+
+  gate:
+    if: always()
+    needs:
+      - quality
+      - perf
+      - contracts
+    runs-on: ubuntu-latest
+    steps:
+      - name: Enforce all CI gates passed
+        run: |
+          set -euo pipefail
+          test "${{ needs.quality.result }}" = "success"
+          test "${{ needs.perf.result }}" = "success"
+          test "${{ needs.contracts.result }}" = "success"
