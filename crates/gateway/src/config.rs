@@ -10,6 +10,10 @@ pub struct GatewayConfig {
     pub db_url: String,
     pub opa_url: String,
     pub opa_timeout_ms: u64,
+    pub opa_retry_max_attempts: u32,
+    pub opa_retry_base_backoff_ms: u64,
+    pub opa_circuit_breaker_failure_threshold: u32,
+    pub opa_circuit_breaker_open_ms: u64,
     pub policy_bundle_hash: String,
     pub ledger_write_timeout_ms: u64,
     pub cache_max_entries: usize,
@@ -101,6 +105,38 @@ impl GatewayConfig {
         let opa_url = require_nonempty(kv, "PECR_OPA_URL")?;
 
         let opa_timeout_ms = parse_u64(kv.get("PECR_OPA_TIMEOUT_MS"), 200, "PECR_OPA_TIMEOUT_MS")?;
+        let opa_retry_max_attempts = parse_u32(
+            kv.get("PECR_OPA_RETRY_MAX_ATTEMPTS"),
+            2,
+            "PECR_OPA_RETRY_MAX_ATTEMPTS",
+        )?;
+        if opa_retry_max_attempts > 10 {
+            return Err(StartupError {
+                code: "ERR_INVALID_CONFIG",
+                message: "PECR_OPA_RETRY_MAX_ATTEMPTS must be <= 10".to_string(),
+            });
+        }
+        let opa_retry_base_backoff_ms = parse_u64(
+            kv.get("PECR_OPA_RETRY_BASE_BACKOFF_MS"),
+            50,
+            "PECR_OPA_RETRY_BASE_BACKOFF_MS",
+        )?;
+        let opa_circuit_breaker_failure_threshold = parse_u32(
+            kv.get("PECR_OPA_CIRCUIT_BREAKER_FAILURE_THRESHOLD"),
+            8,
+            "PECR_OPA_CIRCUIT_BREAKER_FAILURE_THRESHOLD",
+        )?;
+        if opa_circuit_breaker_failure_threshold == 0 {
+            return Err(StartupError {
+                code: "ERR_INVALID_CONFIG",
+                message: "PECR_OPA_CIRCUIT_BREAKER_FAILURE_THRESHOLD must be >= 1".to_string(),
+            });
+        }
+        let opa_circuit_breaker_open_ms = parse_u64(
+            kv.get("PECR_OPA_CIRCUIT_BREAKER_OPEN_MS"),
+            1000,
+            "PECR_OPA_CIRCUIT_BREAKER_OPEN_MS",
+        )?;
 
         let policy_bundle_hash = require_nonempty(kv, "PECR_POLICY_BUNDLE_HASH")?;
         if !is_lower_hex_64(&policy_bundle_hash) {
@@ -211,6 +247,10 @@ impl GatewayConfig {
             db_url,
             opa_url,
             opa_timeout_ms,
+            opa_retry_max_attempts,
+            opa_retry_base_backoff_ms,
+            opa_circuit_breaker_failure_threshold,
+            opa_circuit_breaker_open_ms,
             policy_bundle_hash,
             ledger_write_timeout_ms,
             cache_max_entries,
@@ -336,6 +376,17 @@ fn parse_u64(value: Option<&String>, default: u64, key: &'static str) -> Result<
         None => Ok(default),
         Some(v) if v.trim().is_empty() => Ok(default),
         Some(v) => v.parse::<u64>().map_err(|_| StartupError {
+            code: "ERR_INVALID_CONFIG",
+            message: format!("{} must be an integer", key),
+        }),
+    }
+}
+
+fn parse_u32(value: Option<&String>, default: u32, key: &'static str) -> Result<u32, StartupError> {
+    match value {
+        None => Ok(default),
+        Some(v) if v.trim().is_empty() => Ok(default),
+        Some(v) => v.parse::<u32>().map_err(|_| StartupError {
             code: "ERR_INVALID_CONFIG",
             message: format!("{} must be an integer", key),
         }),

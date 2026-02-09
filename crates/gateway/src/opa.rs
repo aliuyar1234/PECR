@@ -60,6 +60,7 @@ pub enum OpaError {
     Http(reqwest::Error),
     BadStatus(reqwest::StatusCode),
     InvalidResponse,
+    CircuitOpen,
 }
 
 impl std::fmt::Display for OpaError {
@@ -69,6 +70,7 @@ impl std::fmt::Display for OpaError {
             OpaError::Http(err) => write!(f, "OPA HTTP error: {}", err),
             OpaError::BadStatus(status) => write!(f, "OPA returned status {}", status),
             OpaError::InvalidResponse => write!(f, "OPA returned invalid JSON response"),
+            OpaError::CircuitOpen => write!(f, "OPA circuit breaker is open"),
         }
     }
 }
@@ -97,6 +99,11 @@ pub struct OpaClient {
     cache: Arc<RwLock<HashMap<OpaCacheKey, CachedDecision>>>,
     cache_max_entries: usize,
     cache_ttl: Duration,
+    retry_max_attempts: u32,
+    retry_base_backoff: Duration,
+    circuit_breaker_failure_threshold: u32,
+    circuit_breaker_open_for: Duration,
+    breaker_state: Arc<RwLock<CircuitBreakerState>>,
 }
 
 #[derive(Clone)]
@@ -105,25 +112,54 @@ struct CachedDecision {
     expires_at: Instant,
 }
 
+#[derive(Debug, Clone)]
+struct CircuitBreakerState {
+    consecutive_failures: u32,
+    open_until: Option<Instant>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpaClientConfig {
+    pub base_url: String,
+    pub timeout: Duration,
+    pub cache_max_entries: usize,
+    pub cache_ttl: Duration,
+    pub retry_max_attempts: u32,
+    pub retry_base_backoff: Duration,
+    pub circuit_breaker_failure_threshold: u32,
+    pub circuit_breaker_open_for: Duration,
+}
+
 impl OpaClient {
-    pub fn new(
-        base_url: String,
-        timeout: Duration,
-        cache_max_entries: usize,
-        cache_ttl: Duration,
-    ) -> Result<Self, OpaError> {
+    pub fn new(config: OpaClientConfig) -> Result<Self, OpaError> {
         let http = reqwest::Client::builder()
-            .timeout(timeout)
+            .timeout(config.timeout)
             .build()
             .map_err(OpaError::Http)?;
 
         Ok(Self {
-            base_url,
+            base_url: config.base_url,
             http,
             cache: Arc::new(RwLock::new(HashMap::new())),
-            cache_max_entries,
-            cache_ttl,
+            cache_max_entries: config.cache_max_entries,
+            cache_ttl: config.cache_ttl,
+            retry_max_attempts: config.retry_max_attempts,
+            retry_base_backoff: config.retry_base_backoff,
+            circuit_breaker_failure_threshold: config.circuit_breaker_failure_threshold,
+            circuit_breaker_open_for: config.circuit_breaker_open_for,
+            breaker_state: Arc::new(RwLock::new(CircuitBreakerState {
+                consecutive_failures: 0,
+                open_until: None,
+            })),
         })
+    }
+
+    pub async fn ready(&self) -> Result<(), OpaError> {
+        let resp = self.http.get(self.health_url()).send().await?;
+        if !resp.status().is_success() {
+            return Err(OpaError::BadStatus(resp.status()));
+        }
+        Ok(())
     }
 
     pub async fn decide(
@@ -131,6 +167,10 @@ impl OpaClient {
         input: serde_json::Value,
         cache_key: Option<OpaCacheKey>,
     ) -> Result<OpaDecision, OpaError> {
+        if self.is_circuit_open().await {
+            return Err(OpaError::CircuitOpen);
+        }
+
         let cache_enabled =
             self.cache_max_entries > 0 && self.cache_ttl > Duration::ZERO && cache_key.is_some();
 
@@ -139,29 +179,90 @@ impl OpaClient {
             return Ok(decision);
         }
 
+        let mut attempt = 0_u32;
+        let mut last_err = None;
+        let max_attempts = self.retry_max_attempts.saturating_add(1);
         let url = self.decision_url();
-        let resp = self
-            .http
-            .post(url)
-            .json(&serde_json::json!({ "input": input }))
-            .send()
-            .await?;
+        let payload = serde_json::json!({ "input": input });
 
-        if !resp.status().is_success() {
-            return Err(OpaError::BadStatus(resp.status()));
+        while attempt < max_attempts {
+            let response = self.http.post(url.clone()).json(&payload).send().await;
+
+            match response {
+                Ok(resp) if resp.status().is_success() => {
+                    let decoded = resp
+                        .json::<OpaDataResponse<OpaDecision>>()
+                        .await
+                        .map_err(|_| OpaError::InvalidResponse)?;
+
+                    self.register_success().await;
+                    if cache_enabled && decoded.result.cacheable {
+                        self.put_cached(cache_key.unwrap(), decoded.result.clone())
+                            .await;
+                    }
+                    return Ok(decoded.result);
+                }
+                Ok(resp) => {
+                    let err = OpaError::BadStatus(resp.status());
+                    if !is_retryable(&err) {
+                        self.register_failure().await;
+                        return Err(err);
+                    }
+                    last_err = Some(err);
+                }
+                Err(err) => {
+                    let mapped = OpaError::from(err);
+                    if !is_retryable(&mapped) {
+                        self.register_failure().await;
+                        return Err(mapped);
+                    }
+                    last_err = Some(mapped);
+                }
+            }
+
+            attempt = attempt.saturating_add(1);
+            if attempt < max_attempts {
+                let shift = attempt.saturating_sub(1).min(8);
+                let factor = 1_u64 << shift;
+                let sleep_ms = self
+                    .retry_base_backoff
+                    .as_millis()
+                    .saturating_mul(factor as u128)
+                    .min(5_000) as u64;
+                tokio::time::sleep(Duration::from_millis(sleep_ms)).await;
+            }
         }
 
-        let decoded = resp
-            .json::<OpaDataResponse<OpaDecision>>()
-            .await
-            .map_err(|_| OpaError::InvalidResponse)?;
+        self.register_failure().await;
+        let err = last_err.unwrap_or(OpaError::Timeout);
+        Err(err)
+    }
 
-        if cache_enabled && decoded.result.cacheable {
-            self.put_cached(cache_key.unwrap(), decoded.result.clone())
-                .await;
+    async fn is_circuit_open(&self) -> bool {
+        let now = Instant::now();
+        let mut state = self.breaker_state.write().await;
+        if let Some(until) = state.open_until {
+            if until > now {
+                return true;
+            }
+            state.open_until = None;
+            state.consecutive_failures = 0;
         }
+        false
+    }
 
-        Ok(decoded.result)
+    async fn register_failure(&self) {
+        let mut state = self.breaker_state.write().await;
+        state.consecutive_failures = state.consecutive_failures.saturating_add(1);
+        if state.consecutive_failures >= self.circuit_breaker_failure_threshold {
+            state.open_until = Some(Instant::now() + self.circuit_breaker_open_for);
+        }
+    }
+
+    async fn register_success(&self) {
+        let mut state = self.breaker_state.write().await;
+        state.consecutive_failures = 0;
+        state.open_until = None;
     }
 
     fn decision_url(&self) -> String {
@@ -169,6 +270,10 @@ impl OpaClient {
             "{}/v1/data/pecr/authz/decision",
             self.base_url.trim_end_matches('/')
         )
+    }
+
+    fn health_url(&self) -> String {
+        format!("{}/health", self.base_url.trim_end_matches('/'))
     }
 
     async fn get_cached(&self, key: &OpaCacheKey) -> Option<OpaDecision> {
@@ -207,5 +312,13 @@ impl OpaClient {
                 overflow -= 1;
             }
         }
+    }
+}
+
+fn is_retryable(err: &OpaError) -> bool {
+    match err {
+        OpaError::Timeout | OpaError::Http(_) | OpaError::InvalidResponse => true,
+        OpaError::BadStatus(status) => status.is_server_error(),
+        OpaError::CircuitOpen => false,
     }
 }
