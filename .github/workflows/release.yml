@@ -1,0 +1,206 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing release tag (example: v1.2.3)
+        required: true
+        type: string
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  resolve_meta:
+    runs-on: ubuntu-latest
+    outputs:
+      owner_lc: ${{ steps.meta.outputs.owner_lc }}
+      tag: ${{ steps.meta.outputs.tag }}
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Resolve release metadata
+        id: meta
+        shell: bash
+        env:
+          TAG_INPUT: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          if [[ -n "${TAG_INPUT:-}" ]]; then
+            tag="${TAG_INPUT}"
+          else
+            tag="${GITHUB_REF_NAME}"
+          fi
+          owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
+          version="${tag#v}"
+
+          echo "owner_lc=${owner_lc}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+
+  build_binaries:
+    needs: resolve_meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.91.1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binaries
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --locked --release -p pecr-gateway
+          cargo build --locked --release -p pecr-controller --features rlm
+
+      - name: Package artifacts with checksums
+        shell: bash
+        env:
+          VERSION: ${{ needs.resolve_meta.outputs.version }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+
+          install -m 0755 target/release/pecr-gateway release/pecr-gateway
+          tar -C release -czf "release/pecr-gateway_${VERSION}_linux_amd64.tar.gz" pecr-gateway
+          rm -f release/pecr-gateway
+
+          install -m 0755 target/release/pecr-controller release/pecr-controller
+          tar -C release -czf "release/pecr-controller_${VERSION}_linux_amd64.tar.gz" pecr-controller
+          rm -f release/pecr-controller
+
+          (
+            cd release
+            sha256sum ./*.tar.gz > SHA256SUMS.txt
+          )
+
+      - name: Upload release binary artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-binaries
+          path: release
+          if-no-files-found: error
+
+  build_images:
+    needs: resolve_meta
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker metadata (gateway)
+        id: gateway_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ needs.resolve_meta.outputs.owner_lc }}/pecr-gateway
+          tags: |
+            type=raw,value=${{ needs.resolve_meta.outputs.tag }}
+            type=sha
+            type=raw,value=latest
+
+      - name: Build and push gateway image
+        id: gateway_build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/gateway.Dockerfile
+          push: true
+          tags: ${{ steps.gateway_meta.outputs.tags }}
+          labels: ${{ steps.gateway_meta.outputs.labels }}
+
+      - name: Docker metadata (controller)
+        id: controller_meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ghcr.io/${{ needs.resolve_meta.outputs.owner_lc }}/pecr-controller
+          tags: |
+            type=raw,value=${{ needs.resolve_meta.outputs.tag }}
+            type=sha
+            type=raw,value=latest
+
+      - name: Build and push controller image
+        id: controller_build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: docker/controller.Dockerfile
+          push: true
+          tags: ${{ steps.controller_meta.outputs.tags }}
+          labels: ${{ steps.controller_meta.outputs.labels }}
+
+      - name: Emit image digest manifest
+        shell: bash
+        env:
+          TAG: ${{ needs.resolve_meta.outputs.tag }}
+          OWNER: ${{ needs.resolve_meta.outputs.owner_lc }}
+          GATEWAY_DIGEST: ${{ steps.gateway_build.outputs.digest }}
+          CONTROLLER_DIGEST: ${{ steps.controller_build.outputs.digest }}
+        run: |
+          set -euo pipefail
+          mkdir -p release
+          cat > release/image-digests.txt <<EOF
+          tag=${TAG}
+          gateway=ghcr.io/${OWNER}/pecr-gateway@${GATEWAY_DIGEST}
+          controller=ghcr.io/${OWNER}/pecr-controller@${CONTROLLER_DIGEST}
+          EOF
+
+      - name: Upload release image manifest
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-images
+          path: release/image-digests.txt
+          if-no-files-found: error
+
+  publish_release:
+    needs:
+      - resolve_meta
+      - build_binaries
+      - build_images
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: release
+          merge-multiple: true
+
+      - name: Verify release payload
+        shell: bash
+        run: |
+          set -euo pipefail
+          ls -lah release
+          test -f release/SHA256SUMS.txt
+          test -f release/image-digests.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.resolve_meta.outputs.tag }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            release/*.tar.gz
+            release/SHA256SUMS.txt
+            release/image-digests.txt

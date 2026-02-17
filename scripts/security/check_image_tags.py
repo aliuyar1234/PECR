@@ -31,7 +31,7 @@ def image_name_without_tag(ref: str) -> str:
     return image
 
 
-def validate_ref(ref: str) -> str | None:
+def validate_ref(ref: str, require_digest: bool = False) -> str | None:
     ref = normalize_ref(ref)
     if not ref:
         return "empty image reference"
@@ -41,6 +41,9 @@ def validate_ref(ref: str) -> str | None:
         if not re.fullmatch(r"sha256:[0-9a-f]{64}", digest):
             return f"invalid digest pin: {ref}"
         return None
+
+    if require_digest:
+        return f"missing digest pin: {ref}"
 
     slash_idx = ref.rfind("/")
     colon_idx = ref.rfind(":")
@@ -77,7 +80,7 @@ def main() -> int:
             )
             if ref is None:
                 continue
-            violation = validate_ref(ref)
+            violation = validate_ref(ref, require_digest=bool(from_match))
             if violation is not None:
                 violations.append(f"{target.relative_to(ROOT)}:{idx} {violation}")
 

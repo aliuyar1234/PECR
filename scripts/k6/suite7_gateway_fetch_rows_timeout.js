@@ -6,17 +6,26 @@ const vus = parseInt(__ENV.VUS || "5", 10);
 const duration = __ENV.DURATION || "15s";
 const baseUrl = __ENV.BASE_URL || "http://gateway:8080";
 const principalId = __ENV.PRINCIPAL_ID || "dev";
+const localAuthSecret = __ENV.LOCAL_AUTH_SECRET || "";
 const expectedTerminalMode = __ENV.EXPECT_TERMINAL_MODE || "SOURCE_UNAVAILABLE";
+const viewId = __ENV.VIEW_ID || "safe_customer_view_public_slow";
+const enforceP99 = (__ENV.ENFORCE_P99 || "0") === "1";
+const p99BudgetMs = parseInt(__ENV.P99_BUDGET_MS || "1500", 10);
 const healthTimeoutMs = parseInt(__ENV.HEALTH_TIMEOUT_MS || "60000", 10);
 
 const wrongModeRate = new Rate("wrong_mode_rate");
 
+const thresholds = {
+  wrong_mode_rate: ["rate==0"],
+};
+if (enforceP99) {
+  thresholds.http_req_duration = [`p(99)<${p99BudgetMs}`];
+}
+
 export const options = {
   vus,
   duration,
-  thresholds: {
-    wrong_mode_rate: ["rate==0"],
-  },
+  thresholds,
 };
 
 function waitForHealthz() {
@@ -53,6 +62,15 @@ function headerValue(res, name) {
 }
 
 function createSession(requestId) {
+  const headers = {
+    "Content-Type": "application/json",
+    "x-pecr-principal-id": principalId,
+    "x-pecr-request-id": requestId,
+  };
+  if (localAuthSecret) {
+    headers["x-pecr-local-auth-secret"] = localAuthSecret;
+  }
+
   const res = http.post(
     `${baseUrl}/v1/sessions`,
     JSON.stringify({
@@ -65,11 +83,7 @@ function createSession(requestId) {
       },
     }),
     {
-      headers: {
-        "Content-Type": "application/json",
-        "x-pecr-principal-id": principalId,
-        "x-pecr-request-id": requestId,
-      },
+      headers,
       timeout: "10s",
     }
   );
@@ -101,23 +115,28 @@ export default function () {
     return;
   }
 
+  const headers = {
+    "Content-Type": "application/json",
+    "x-pecr-principal-id": principalId,
+    "x-pecr-request-id": requestId,
+    "x-pecr-session-token": session.sessionToken,
+  };
+  if (localAuthSecret) {
+    headers["x-pecr-local-auth-secret"] = localAuthSecret;
+  }
+
   const operatorRes = http.post(
     `${baseUrl}/v1/operators/fetch_rows`,
     JSON.stringify({
       session_id: session.sessionId,
       params: {
-        view_id: "safe_customer_view_public_slow",
+        view_id: viewId,
         fields: ["tenant_id", "customer_id", "status", "plan_tier", "updated_at"],
         filter_spec: { customer_id: "cust_public_1" },
       },
     }),
     {
-      headers: {
-        "Content-Type": "application/json",
-        "x-pecr-principal-id": principalId,
-        "x-pecr-request-id": requestId,
-        "x-pecr-session-token": session.sessionToken,
-      },
+      headers,
       timeout: "10s",
     }
   );

@@ -2642,6 +2642,317 @@ async fn observability_coverage_suite_required_signals_exist() {
     schema_pool.close().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failure_mode_suite_policy_deny_and_budget_exhaustion() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping failure mode suite; set PECR_TEST_DB_URL to enable");
+        return;
+    };
+
+    let request_id = format!("req_failure_modes_{}_{}", std::process::id(), next_suffix());
+    let fs_corpus_root = prepare_temp_fs_corpus();
+    let fs_corpus_path = fs_corpus_root.to_string_lossy().to_string();
+
+    let pg_fixtures_sql = std::fs::read_to_string(
+        workspace_root()
+            .join("db")
+            .join("init")
+            .join("002_safeview_fixtures.sql"),
+    )
+    .expect("postgres fixture SQL should be readable");
+
+    let (schema_pool, schema_name, schema_url) = create_test_schema(&db_url).await;
+    apply_pg_fixtures(&schema_url, &pg_fixtures_sql).await;
+
+    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
+
+    let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
+        ("PECR_BIND_ADDR".to_string(), "127.0.0.1:0".to_string()),
+        ("PECR_DB_URL".to_string(), schema_url.clone()),
+        ("PECR_OPA_URL".to_string(), format!("http://{}", opa_addr)),
+        (
+            "PECR_POLICY_BUNDLE_HASH".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ),
+        ("PECR_FS_CORPUS_PATH".to_string(), fs_corpus_path),
+        (
+            "PECR_AS_OF_TIME_DEFAULT".to_string(),
+            "1970-01-01T00:00:00Z".to_string(),
+        ),
+    ]))
+    .expect("gateway config should be valid");
+
+    let (gateway_addr, gateway_shutdown, gateway_task) = spawn_server(
+        pecr_gateway::http::router(gateway_config)
+            .await
+            .expect("gateway router should init"),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    wait_for_healthz(&client, gateway_addr).await;
+
+    // Policy deny path: guest principal is denied for operator_call by test OPA policy.
+    let (guest_session, guest_token, _, _) =
+        gateway_create_session(&client, gateway_addr, "guest", &request_id).await;
+
+    let denied = client
+        .post(format!("http://{}/v1/operators/fetch_rows", gateway_addr))
+        .header("x-pecr-principal-id", "guest")
+        .header("x-pecr-request-id", &request_id)
+        .header("x-pecr-session-token", &guest_token)
+        .json(&serde_json::json!({
+            "session_id": guest_session,
+            "params": {
+                "view_id": "safe_customer_view_public",
+                "fields": ["status"],
+                "filter_spec": {"customer_id": "cust_public_1"}
+            }
+        }))
+        .send()
+        .await
+        .expect("guest operator call should return a response");
+
+    assert_eq!(denied.status(), StatusCode::FORBIDDEN);
+    let denied_body = denied
+        .json::<serde_json::Value>()
+        .await
+        .expect("deny response should be JSON");
+    assert_eq!(
+        denied_body
+            .get("terminal_mode_hint")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        "INSUFFICIENT_PERMISSION"
+    );
+
+    // Budget exhaustion path: max_operator_calls=1 allows first call and rejects second call.
+    let budget_session_response = client
+        .post(format!("http://{}/v1/sessions", gateway_addr))
+        .header("x-pecr-principal-id", "dev")
+        .header("x-pecr-request-id", &request_id)
+        .json(&serde_json::json!({
+            "budget": {
+                "max_operator_calls": 1,
+                "max_bytes": 1048576,
+                "max_wallclock_ms": 10000,
+                "max_recursion_depth": 3
+            }
+        }))
+        .send()
+        .await
+        .expect("budget session request should succeed");
+    assert!(budget_session_response.status().is_success());
+
+    let budget_token = budget_session_response
+        .headers()
+        .get("x-pecr-session-token")
+        .and_then(|v| v.to_str().ok())
+        .expect("budget session must return token")
+        .to_string();
+
+    let budget_session_body = budget_session_response
+        .json::<serde_json::Value>()
+        .await
+        .expect("budget session body should be JSON");
+    let budget_session_id = budget_session_body
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .expect("budget session_id should exist")
+        .to_string();
+
+    let first = client
+        .post(format!(
+            "http://{}/v1/operators/list_versions",
+            gateway_addr
+        ))
+        .header("x-pecr-principal-id", "dev")
+        .header("x-pecr-request-id", &request_id)
+        .header("x-pecr-session-token", &budget_token)
+        .json(&serde_json::json!({
+            "session_id": budget_session_id,
+            "params": {"object_id": "public/public_1.txt"}
+        }))
+        .send()
+        .await
+        .expect("first list_versions call should succeed");
+    assert!(first.status().is_success());
+
+    let second = client
+        .post(format!("http://{}/v1/operators/list_versions", gateway_addr))
+        .header("x-pecr-principal-id", "dev")
+        .header("x-pecr-request-id", &request_id)
+        .header("x-pecr-session-token", &budget_token)
+        .json(&serde_json::json!({
+            "session_id": budget_session_body.get("session_id").and_then(|v| v.as_str()).unwrap_or_default(),
+            "params": {"object_id": "public/public_1.txt"}
+        }))
+        .send()
+        .await
+        .expect("second list_versions call should return a response");
+    assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
+    let second_body = second
+        .json::<serde_json::Value>()
+        .await
+        .expect("second response should be JSON");
+    assert_eq!(
+        second_body
+            .get("terminal_mode_hint")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        "INSUFFICIENT_EVIDENCE"
+    );
+
+    let _ = gateway_shutdown.send(());
+    let _ = opa_shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), gateway_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), opa_task).await;
+
+    let _ = std::fs::remove_dir_all(&fs_corpus_root);
+    drop_test_schema(&schema_pool, &schema_name).await;
+    schema_pool.close().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failure_mode_suite_source_unavailable_and_timeout() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping source unavailable suite; set PECR_TEST_DB_URL to enable");
+        return;
+    };
+
+    let request_id = format!(
+        "req_source_unavailable_{}_{}",
+        std::process::id(),
+        next_suffix()
+    );
+    let fs_corpus_root = prepare_temp_fs_corpus();
+    let fs_corpus_path = fs_corpus_root.to_string_lossy().to_string();
+
+    let pg_fixtures_sql = std::fs::read_to_string(
+        workspace_root()
+            .join("db")
+            .join("init")
+            .join("002_safeview_fixtures.sql"),
+    )
+    .expect("postgres fixture SQL should be readable");
+
+    let (schema_pool, schema_name, schema_url) = create_test_schema(&db_url).await;
+    apply_pg_fixtures(&schema_url, &pg_fixtures_sql).await;
+
+    // OPA unreachable -> source unavailable.
+    let unreachable_gateway = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
+        ("PECR_BIND_ADDR".to_string(), "127.0.0.1:0".to_string()),
+        ("PECR_DB_URL".to_string(), schema_url.clone()),
+        ("PECR_OPA_URL".to_string(), "http://127.0.0.1:9".to_string()),
+        ("PECR_OPA_TIMEOUT_MS".to_string(), "100".to_string()),
+        (
+            "PECR_POLICY_BUNDLE_HASH".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ),
+        ("PECR_FS_CORPUS_PATH".to_string(), fs_corpus_path.clone()),
+        (
+            "PECR_AS_OF_TIME_DEFAULT".to_string(),
+            "1970-01-01T00:00:00Z".to_string(),
+        ),
+    ]))
+    .expect("unreachable gateway config should be valid");
+
+    let (unreachable_addr, unreachable_shutdown, unreachable_task) = spawn_server(
+        pecr_gateway::http::router(unreachable_gateway)
+            .await
+            .expect("unreachable gateway router should init"),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    wait_for_healthz(&client, unreachable_addr).await;
+
+    let unavailable_response = client
+        .post(format!("http://{}/v1/sessions", unreachable_addr))
+        .header("x-pecr-principal-id", "dev")
+        .header("x-pecr-request-id", &request_id)
+        .json(&serde_json::json!({
+            "budget": {
+                "max_operator_calls": 10,
+                "max_bytes": 1048576,
+                "max_wallclock_ms": 1000,
+                "max_recursion_depth": 3
+            }
+        }))
+        .send()
+        .await
+        .expect("unavailable request should return a response");
+
+    assert!(matches!(
+        unavailable_response.status(),
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    ));
+
+    let _ = unreachable_shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), unreachable_task).await;
+
+    // OPA timeout path -> gateway timeout.
+    let slow_opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision_slow));
+    let (slow_opa_addr, slow_opa_shutdown, slow_opa_task) = spawn_server(slow_opa_app).await;
+
+    let timeout_gateway = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
+        ("PECR_BIND_ADDR".to_string(), "127.0.0.1:0".to_string()),
+        ("PECR_DB_URL".to_string(), schema_url.clone()),
+        (
+            "PECR_OPA_URL".to_string(),
+            format!("http://{}", slow_opa_addr),
+        ),
+        ("PECR_OPA_TIMEOUT_MS".to_string(), "25".to_string()),
+        (
+            "PECR_POLICY_BUNDLE_HASH".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ),
+        ("PECR_FS_CORPUS_PATH".to_string(), fs_corpus_path),
+        (
+            "PECR_AS_OF_TIME_DEFAULT".to_string(),
+            "1970-01-01T00:00:00Z".to_string(),
+        ),
+    ]))
+    .expect("timeout gateway config should be valid");
+
+    let (timeout_addr, timeout_shutdown, timeout_task) = spawn_server(
+        pecr_gateway::http::router(timeout_gateway)
+            .await
+            .expect("timeout gateway router should init"),
+    )
+    .await;
+
+    wait_for_healthz(&client, timeout_addr).await;
+
+    let timeout_response = client
+        .post(format!("http://{}/v1/sessions", timeout_addr))
+        .header("x-pecr-principal-id", "dev")
+        .header("x-pecr-request-id", &request_id)
+        .json(&serde_json::json!({
+            "budget": {
+                "max_operator_calls": 10,
+                "max_bytes": 1048576,
+                "max_wallclock_ms": 1000,
+                "max_recursion_depth": 3
+            }
+        }))
+        .send()
+        .await
+        .expect("timeout request should return a response");
+
+    assert_eq!(timeout_response.status(), StatusCode::GATEWAY_TIMEOUT);
+
+    let _ = timeout_shutdown.send(());
+    let _ = slow_opa_shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), timeout_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), slow_opa_task).await;
+
+    let _ = std::fs::remove_dir_all(&fs_corpus_root);
+    drop_test_schema(&schema_pool, &schema_name).await;
+    schema_pool.close().await;
+}
+
 async fn apply_pg_fixtures(db_url: &str, sql: &str) {
     let pool = PgPool::connect(db_url)
         .await
@@ -2898,6 +3209,26 @@ async fn opa_decision(
                 "cacheable": cacheable,
                 "reason": if allow { "test_allow" } else { "test_deny" },
                 "redaction": redaction
+            }
+        })),
+    )
+}
+
+async fn opa_decision_slow(
+    Json(body): Json<serde_json::Value>,
+) -> (StatusCode, Json<serde_json::Value>) {
+    let input = body.get("input").cloned().unwrap_or(serde_json::json!({}));
+    tokio::time::sleep(Duration::from_millis(250)).await;
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "result": {
+                "allow": true,
+                "cacheable": false,
+                "reason": "slow_allow",
+                "redaction": {},
+                "input_echo_action": input.get("action").cloned().unwrap_or(serde_json::Value::Null)
             }
         })),
     )

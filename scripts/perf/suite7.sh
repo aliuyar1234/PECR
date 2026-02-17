@@ -8,26 +8,69 @@ BASELINE_VUS="${BASELINE_VUS:-10}"
 BASELINE_DURATION="${BASELINE_DURATION:-10s}"
 FAULT_VUS="${FAULT_VUS:-10}"
 FAULT_DURATION="${FAULT_DURATION:-5s}"
-P99_BUDGET_MS="${P99_BUDGET_MS:-2000}"
-BVR_THRESHOLD="${BVR_THRESHOLD:-0.01}"
-SER_THRESHOLD="${SER_THRESHOLD:-0.01}"
+CONTROLLER_P99_BUDGET_MS="${CONTROLLER_P99_BUDGET_MS:-${P99_BUDGET_MS:-1500}}"
+GATEWAY_P99_BUDGET_MS="${GATEWAY_P99_BUDGET_MS:-900}"
+BVR_THRESHOLD="${BVR_THRESHOLD:-0.005}"
+SER_THRESHOLD="${SER_THRESHOLD:-0.005}"
+WAIT_TIMEOUT_SECS="${WAIT_TIMEOUT_SECS:-90}"
+RETRY_ATTEMPTS="${RETRY_ATTEMPTS:-3}"
+RETRY_SLEEP_SECS="${RETRY_SLEEP_SECS:-2}"
+PECR_LOCAL_AUTH_SHARED_SECRET="${PECR_LOCAL_AUTH_SHARED_SECRET:-suite7-local-auth-secret}"
+METRICS_PRINCIPAL_ID="${METRICS_PRINCIPAL_ID:-dev}"
+METRICS_AUTH_HEADER="${METRICS_AUTH_HEADER:-}"
+export PECR_LOCAL_AUTH_SHARED_SECRET
 
 OUT_DIR="target/perf"
 
 mkdir -p "$OUT_DIR"
 chmod 777 "$OUT_DIR"
 
+docker_compose() {
+  docker compose "$@"
+}
+
+retry_cmd() {
+  local attempts="${RETRY_ATTEMPTS}"
+  local try=1
+  while true; do
+    if "$@"; then
+      return 0
+    fi
+    if (( try >= attempts )); then
+      return 1
+    fi
+    try=$((try + 1))
+    sleep "${RETRY_SLEEP_SECS}"
+  done
+}
+
+suite7_cleanup() {
+  local exit_code="$1"
+  set +e
+
+  if (( exit_code != 0 )); then
+    docker_compose ps >"${OUT_DIR}/compose_ps.txt" 2>&1 || true
+    docker_compose logs --no-color --timestamps >"${OUT_DIR}/compose_logs.txt" 2>&1 || true
+  fi
+
+  if [[ "${PECR_PERF_KEEP_STACK:-0}" != "1" ]]; then
+    docker_compose down -v --remove-orphans >/dev/null 2>&1 || true
+  fi
+}
+
+trap 'suite7_cleanup $?' EXIT
+
 if [[ "${COLD_START:-0}" == "1" ]]; then
-  docker compose down -v
+  retry_cmd docker_compose down -v --remove-orphans || true
 fi
 
-docker compose up -d --build
+retry_cmd docker_compose up -d --build
 
 wait_for_postgres() {
   local deadline
-  deadline=$((SECONDS + 60))
+  deadline=$((SECONDS + WAIT_TIMEOUT_SECS))
   while ((SECONDS < deadline)); do
-    if docker compose exec -T postgres pg_isready -U pecr -d pecr >/dev/null 2>&1; then
+    if docker_compose exec -T postgres pg_isready -U pecr -d pecr >/dev/null 2>&1; then
       return 0
     fi
     sleep 1
@@ -40,7 +83,7 @@ wait_for_http() {
   local name="$1"
   local url="$2"
   local deadline
-  deadline=$((SECONDS + 60))
+  deadline=$((SECONDS + WAIT_TIMEOUT_SECS))
   while ((SECONDS < deadline)); do
     if curl -fsS --max-time 2 "$url" >/dev/null 2>&1; then
       return 0
@@ -52,30 +95,42 @@ wait_for_http() {
 }
 
 ensure_safeview_fixtures() {
-  docker compose exec -T postgres psql -U pecr -d pecr -f /docker-entrypoint-initdb.d/002_safeview_fixtures.sql >/dev/null
+  retry_cmd docker_compose exec -T postgres \
+    psql -U pecr -d pecr -f /docker-entrypoint-initdb.d/002_safeview_fixtures.sql >/dev/null
 }
 
 recreate_gateway() {
-  docker compose up -d --no-deps --force-recreate gateway
+  retry_cmd docker_compose up -d --no-deps --force-recreate gateway
+  wait_for_http "gateway" "http://127.0.0.1:8080/healthz"
 }
 
 scrape_metrics() {
   local url="$1"
   local out="$2"
-  curl -fsS "$url" >"$out"
+  local curl_args=()
+  if [[ -n "${METRICS_AUTH_HEADER}" ]]; then
+    curl_args+=(-H "Authorization: ${METRICS_AUTH_HEADER}")
+  else
+    curl_args+=(-H "x-pecr-principal-id: ${METRICS_PRINCIPAL_ID}")
+    if [[ -n "${PECR_LOCAL_AUTH_SHARED_SECRET}" ]]; then
+      curl_args+=(-H "x-pecr-local-auth-secret: ${PECR_LOCAL_AUTH_SHARED_SECRET}")
+    fi
+  fi
+  curl -fsS "${curl_args[@]}" "$url" >"$out"
 }
 
 run_k6_controller() {
   local name="$1"
   local expected="$2"
   local enforce_p99="$3"
-  docker compose --profile perf run --rm -T \
+  docker_compose --profile perf run --rm -T \
     -e BASE_URL="http://controller:8081" \
     -e PRINCIPAL_ID="dev" \
+    -e LOCAL_AUTH_SECRET="${PECR_LOCAL_AUTH_SHARED_SECRET}" \
     -e QUERY="smoke" \
     -e EXPECT_TERMINAL_MODE="$expected" \
     -e ENFORCE_P99="$enforce_p99" \
-    -e P99_BUDGET_MS="$P99_BUDGET_MS" \
+    -e P99_BUDGET_MS="$CONTROLLER_P99_BUDGET_MS" \
     -e VUS="$FAULT_VUS" \
     -e DURATION="$FAULT_DURATION" \
     k6 run --summary-trend-stats "min,avg,med,max,p(90),p(95),p(99)" \
@@ -83,28 +138,38 @@ run_k6_controller() {
 }
 
 run_k6_controller_baseline() {
-  docker compose --profile perf run --rm -T \
+  docker_compose --profile perf run --rm -T \
     -e BASE_URL="http://controller:8081" \
     -e PRINCIPAL_ID="dev" \
+    -e LOCAL_AUTH_SECRET="${PECR_LOCAL_AUTH_SHARED_SECRET}" \
     -e QUERY="smoke" \
     -e EXPECT_TERMINAL_MODE="INSUFFICIENT_EVIDENCE" \
     -e ENFORCE_P99="1" \
-    -e P99_BUDGET_MS="$P99_BUDGET_MS" \
+    -e P99_BUDGET_MS="$CONTROLLER_P99_BUDGET_MS" \
     -e VUS="$BASELINE_VUS" \
     -e DURATION="$BASELINE_DURATION" \
     k6 run --summary-trend-stats "min,avg,med,max,p(90),p(95),p(99)" \
       --summary-export "/results/suite7_baseline.summary.json" /scripts/suite7_controller_run.js
 }
 
-run_k6_gateway_safeview_timeout() {
-  docker compose --profile perf run --rm -T \
+run_k6_gateway_fetch_rows() {
+  local name="$1"
+  local expected="$2"
+  local view_id="$3"
+  local enforce_p99="$4"
+  local p99_budget_ms="$5"
+  docker_compose --profile perf run --rm -T \
     -e BASE_URL="http://gateway:8080" \
     -e PRINCIPAL_ID="dev" \
-    -e EXPECT_TERMINAL_MODE="SOURCE_UNAVAILABLE" \
+    -e LOCAL_AUTH_SECRET="${PECR_LOCAL_AUTH_SHARED_SECRET}" \
+    -e EXPECT_TERMINAL_MODE="$expected" \
+    -e VIEW_ID="$view_id" \
+    -e ENFORCE_P99="$enforce_p99" \
+    -e P99_BUDGET_MS="$p99_budget_ms" \
     -e VUS="$FAULT_VUS" \
     -e DURATION="$FAULT_DURATION" \
     k6 run --summary-trend-stats "min,avg,med,max,p(90),p(95),p(99)" \
-      --summary-export "/results/suite7_fault_pg_statement_timeout.summary.json" /scripts/suite7_gateway_fetch_rows_timeout.js
+      --summary-export "/results/${name}.summary.json" /scripts/suite7_gateway_fetch_rows_timeout.js
 }
 
 wait_for_postgres
@@ -112,7 +177,7 @@ ensure_safeview_fixtures
 wait_for_http "gateway" "http://127.0.0.1:8080/healthz"
 wait_for_http "controller" "http://127.0.0.1:8081/healthz"
 
-echo "[suite7] baseline (p99 budget ${P99_BUDGET_MS}ms; vus=${BASELINE_VUS}; duration=${BASELINE_DURATION})"
+echo "[suite7] baseline controller (p99 budget ${CONTROLLER_P99_BUDGET_MS}ms; vus=${BASELINE_VUS}; duration=${BASELINE_DURATION})"
 scrape_metrics "http://127.0.0.1:8080/metrics" "${OUT_DIR}/metrics_gateway.before.prom"
 scrape_metrics "http://127.0.0.1:8081/metrics" "${OUT_DIR}/metrics_controller.before.prom"
 run_k6_controller_baseline
@@ -127,29 +192,43 @@ python3 scripts/perf/check_bvr_ser.py \
   --ser-threshold "${SER_THRESHOLD}" \
   --output-json "${OUT_DIR}/suite7_metrics_gates.json"
 
+echo "[suite7] baseline gateway fetch_rows (p99 budget ${GATEWAY_P99_BUDGET_MS}ms; vus=${FAULT_VUS}; duration=${FAULT_DURATION})"
+run_k6_gateway_fetch_rows \
+  "suite7_gateway_baseline" \
+  "SUPPORTED" \
+  "safe_customer_view_public" \
+  "1" \
+  "$GATEWAY_P99_BUDGET_MS"
+
 echo "[suite7] fault: opa unavailable"
-docker compose stop opa
+retry_cmd docker_compose stop opa
 run_k6_controller "suite7_fault_opa_unavailable" "SOURCE_UNAVAILABLE" "0"
-docker compose start opa
+retry_cmd docker_compose start opa
+wait_for_http "gateway" "http://127.0.0.1:8080/healthz"
 
 echo "[suite7] fault: opa timeout"
-docker compose --profile faults up -d --force-recreate opa_blackhole
+retry_cmd docker_compose --profile faults up -d --force-recreate opa_blackhole
 PECR_OPA_URL="http://opa_blackhole:8181" PECR_OPA_TIMEOUT_MS="50" recreate_gateway
 run_k6_controller "suite7_fault_opa_timeout" "SOURCE_UNAVAILABLE" "0"
 recreate_gateway
-docker compose --profile faults stop opa_blackhole
+retry_cmd docker_compose --profile faults stop opa_blackhole
 
 echo "[suite7] fault: postgres unavailable"
-docker compose stop postgres
+retry_cmd docker_compose stop postgres
 run_k6_controller "suite7_fault_postgres_unavailable" "SOURCE_UNAVAILABLE" "0"
-docker compose start postgres
+retry_cmd docker_compose start postgres
 wait_for_postgres
 ensure_safeview_fixtures
 recreate_gateway
 
 echo "[suite7] fault: adapter statement_timeout (pg_safeview)"
 PECR_PG_SAFEVIEW_QUERY_TIMEOUT_MS="5" recreate_gateway
-run_k6_gateway_safeview_timeout
+run_k6_gateway_fetch_rows \
+  "suite7_fault_pg_statement_timeout" \
+  "SOURCE_UNAVAILABLE" \
+  "safe_customer_view_public_slow" \
+  "0" \
+  "$GATEWAY_P99_BUDGET_MS"
 recreate_gateway
 
 echo "[suite7] done; summaries in ${OUT_DIR}"

@@ -90,10 +90,21 @@ jobs:
           BASELINE_DURATION: "10s"
           FAULT_VUS: "10"
           FAULT_DURATION: "5s"
-          P99_BUDGET_MS: "2000"
-          PECR_PERF_REGRESSION_P95_FACTOR: "3.0"
-          PECR_PERF_REGRESSION_P99_FACTOR: "3.0"
-          PECR_PERF_REGRESSION_ABS_MS: "1000"
+          COLD_START: "1"
+          WAIT_TIMEOUT_SECS: "120"
+          RETRY_ATTEMPTS: "4"
+          RETRY_SLEEP_SECS: "3"
+          COMPOSE_PROJECT_NAME: "pecr-perf-${{ github.run_id }}-${{ github.run_attempt }}"
+          CONTROLLER_P99_BUDGET_MS: "1500"
+          GATEWAY_P99_BUDGET_MS: "900"
+          BVR_THRESHOLD: "0.005"
+          SER_THRESHOLD: "0.005"
+          PECR_PERF_REGRESSION_P90_FACTOR: "1.8"
+          PECR_PERF_REGRESSION_P95_FACTOR: "1.8"
+          PECR_PERF_REGRESSION_P99_FACTOR: "1.8"
+          PECR_PERF_REGRESSION_ABS_MS: "400"
+          PECR_PERF_MIN_RATE_FACTOR: "0.85"
+          PECR_PERF_RATE_ABS_DROP: "5"
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -118,6 +129,54 @@ jobs:
           set -e
 
           exit "${perf_status}"
+
+      - name: Perf stack cleanup
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          docker compose down -v --remove-orphans
+
+      - name: Publish perf signal summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          summary_file="target/perf/suite7_baseline.summary.json"
+
+          {
+            echo "### Suite 7 Performance Signal"
+            echo
+            if [[ -f "${summary_file}" ]]; then
+              python3 - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("target/perf/suite7_baseline.summary.json")
+data = json.loads(path.read_text(encoding="utf-8"))
+metrics = data.get("metrics", {})
+dur = metrics.get("http_req_duration", {})
+p95 = dur.get("p(95)", "n/a")
+p99 = dur.get("p(99)", "n/a")
+print(f"- `http_req_duration p95`: {p95}")
+print(f"- `http_req_duration p99`: {p99}")
+PY
+            else
+              echo "- Summary JSON: missing (`target/perf/suite7_baseline.summary.json`)"
+              echo "::warning::Missing Suite 7 summary JSON (target/perf/suite7_baseline.summary.json)"
+            fi
+
+            if [[ -f artifacts/perf_regression.log ]] && grep -q "FAIL:" artifacts/perf_regression.log; then
+              echo "- Regression gate: FAILED (see \`artifacts/perf_regression.log\`)"
+              echo "::error title=Performance regression detected::Suite 7 regression gate failed. See artifacts/perf_regression.log."
+            elif [[ -f artifacts/perf_regression.log ]]; then
+              echo "- Regression gate: passed"
+              echo "::notice title=Performance regression gate::Suite 7 regression gate passed."
+            else
+              echo "- Regression gate: no log produced"
+            fi
+          } | tee artifacts/perf_signal_summary.md >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload perf artifacts
         if: always()

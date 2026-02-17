@@ -6,6 +6,7 @@ const vus = parseInt(__ENV.VUS || "10", 10);
 const duration = __ENV.DURATION || "20s";
 const baseUrl = __ENV.BASE_URL || "http://controller:8081";
 const principalId = __ENV.PRINCIPAL_ID || "dev";
+const localAuthSecret = __ENV.LOCAL_AUTH_SECRET || "";
 const query = __ENV.QUERY || "smoke";
 const expectedTerminalMode = __ENV.EXPECT_TERMINAL_MODE || "";
 const enforceP99 = (__ENV.ENFORCE_P99 || "1") === "1";
@@ -55,13 +56,17 @@ function extractTerminalMode(res) {
 
 export default function () {
   const requestId = `k6-${__VU}-${__ITER}-${Date.now()}`;
+  const headers = {
+    "Content-Type": "application/json",
+    "x-pecr-principal-id": principalId,
+    "x-pecr-request-id": requestId,
+  };
+  if (localAuthSecret) {
+    headers["x-pecr-local-auth-secret"] = localAuthSecret;
+  }
 
   const res = http.post(`${baseUrl}/v1/run`, JSON.stringify({ query }), {
-    headers: {
-      "Content-Type": "application/json",
-      "x-pecr-principal-id": principalId,
-      "x-pecr-request-id": requestId,
-    },
+    headers,
     timeout: "30s",
   });
 
