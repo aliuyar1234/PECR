@@ -223,4 +223,68 @@ mod tests {
         let err = budget.validate().expect_err("budget should be rejected");
         assert_eq!(err, "max_wallclock_ms out of range");
     }
+
+    #[test]
+    fn budget_validate_rejects_invalid_parallelism_range() {
+        let too_low = Budget {
+            max_operator_calls: 10,
+            max_bytes: 1024,
+            max_wallclock_ms: 1000,
+            max_recursion_depth: 1,
+            max_parallelism: Some(0),
+        };
+        let too_high = Budget {
+            max_operator_calls: 10,
+            max_bytes: 1024,
+            max_wallclock_ms: 1000,
+            max_recursion_depth: 1,
+            max_parallelism: Some(257),
+        };
+
+        assert_eq!(
+            too_low.validate().expect_err("parallelism=0 must fail"),
+            "max_parallelism out of range"
+        );
+        assert_eq!(
+            too_high.validate().expect_err("parallelism=257 must fail"),
+            "max_parallelism out of range"
+        );
+    }
+
+    #[test]
+    fn budget_validate_accepts_boundary_values() {
+        let budget = Budget {
+            max_operator_calls: Budget::MAX_OPERATOR_CALLS_HARD_LIMIT,
+            max_bytes: Budget::MAX_BYTES_HARD_LIMIT,
+            max_wallclock_ms: 0,
+            max_recursion_depth: Budget::MAX_RECURSION_DEPTH_HARD_LIMIT,
+            max_parallelism: Some(256),
+        };
+
+        budget
+            .validate()
+            .expect("boundary values should be accepted");
+    }
+
+    #[test]
+    fn policy_snapshot_hash_changes_when_policy_input_changes() {
+        let base = PolicySnapshot {
+            policy_snapshot_hash: "unused".to_string(),
+            principal_id: "principal".to_string(),
+            tenant_id: "tenant".to_string(),
+            principal_roles: vec!["viewer".to_string()],
+            principal_attrs_hash:
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+            policy_bundle_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                .to_string(),
+            as_of_time: "1970-01-01T00:00:00Z".to_string(),
+            evaluated_at: "1970-01-01T00:00:01Z".to_string(),
+        };
+
+        let mut changed = base.clone();
+        changed.policy_bundle_hash =
+            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
+
+        assert_ne!(base.compute_hash(), changed.compute_hash());
+    }
 }

@@ -1,9 +1,9 @@
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::collections::HashSet;
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Path, State};
@@ -15,14 +15,14 @@ use hex::ToHex;
 use pecr_auth::{OidcAuthenticator, Principal};
 use pecr_contracts::canonical;
 use pecr_contracts::{
-    Budget, ClaimMap, ClaimStatus, EvidenceContentType, EvidenceUnit, EvidenceUnitRef,
-    PolicySnapshot, TerminalMode, TransformStep,
+    Budget, EvidenceContentType, EvidenceUnit, EvidenceUnitRef, PolicySnapshot, TerminalMode,
+    TransformStep,
 };
-use pecr_ledger::{CreateSessionRecord, FinalizeResultRecord, LedgerWriter, SessionRuntimeWrite};
+use pecr_ledger::{CreateSessionRecord, FinalizeResultRecord, LedgerWriter};
 use serde::{Deserialize, Serialize};
 use sha2::Digest;
 use similar::TextDiff;
-use sqlx::{PgPool, Postgres, Row, Transaction};
+use sqlx::{PgPool, Row};
 use tokio::sync::RwLock;
 use tracing::Instrument;
 use ulid::Ulid;
@@ -30,6 +30,29 @@ use ulid::Ulid;
 use crate::config::{AuthMode, GatewayConfig, StartupError};
 use crate::opa::{OpaCacheKey, OpaClient, OpaClientConfig};
 use crate::operator_cache::{OperatorCache, OperatorCacheKey};
+use crate::rate_limit::RateLimiter;
+
+mod finalize;
+mod operator;
+mod policy;
+mod session;
+
+use self::finalize::{FinalizeRequest, FinalizeResponse, finalize_gate};
+use self::operator::is_allowlisted_operator;
+use self::policy::{
+    apply_field_redaction, apply_field_redaction_to_evidence_unit, compute_content_hash,
+    compute_evidence_unit_id, parse_field_redaction, redact_span_or_row_spec_fields,
+};
+use self::session::{
+    acquire_session_lock, load_session_runtime, persist_session_runtime, unix_epoch_ms_now,
+};
+
+#[cfg(test)]
+use self::session::Session;
+#[cfg(test)]
+use pecr_contracts::{ClaimMap, ClaimStatus};
+#[cfg(test)]
+use pecr_policy::FieldRedaction;
 
 #[derive(Clone)]
 pub struct AppState {
@@ -38,6 +61,7 @@ pub struct AppState {
     ledger: LedgerWriter,
     opa: OpaClient,
     operator_cache: OperatorCache,
+    rate_limiter: RateLimiter,
     pg_pool: PgPool,
     fs_versions: Arc<RwLock<FsVersionCache>>,
     pg_versions: Arc<RwLock<FsVersionCache>>,
@@ -45,24 +69,6 @@ pub struct AppState {
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
 type FilterEq = (String, String);
-
-#[derive(Debug, Clone)]
-struct Session {
-    session_id: String,
-    trace_id: String,
-    principal_id: String,
-    tenant_id: String,
-    policy_snapshot_id: String,
-    policy_snapshot_hash: String,
-    as_of_time: String,
-    budget: Budget,
-    session_token_hash: String,
-    session_token_expires_at_epoch_ms: i64,
-    operator_calls_used: u32,
-    bytes_used: u64,
-    evidence_unit_ids: HashSet<String>,
-    finalized: bool,
-}
 
 pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
     let oidc = if config.auth_mode == AuthMode::Oidc {
@@ -88,9 +94,9 @@ pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
         Duration::from_millis(config.ledger_write_timeout_ms),
     )
     .await
-    .map_err(|_| StartupError {
+    .map_err(|err| StartupError {
         code: "ERR_LEDGER_UNAVAILABLE",
-        message: "failed to initialize ledger".to_string(),
+        message: format!("failed to initialize ledger: {}", err),
     })?;
 
     let opa = OpaClient::new(OpaClientConfig {
@@ -114,10 +120,15 @@ pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
             code: "ERR_DB_UNAVAILABLE",
             message: "failed to initialize safe-view database pool".to_string(),
         })?;
+    validate_safeview_schema(&pg_pool).await?;
 
     let operator_cache = OperatorCache::new(
         config.cache_max_entries,
         Duration::from_millis(config.cache_ttl_ms),
+    );
+    let rate_limiter = RateLimiter::new(
+        Duration::from_secs(config.rate_limit_window_secs.max(1)),
+        16_384,
     );
 
     let fs_versions = Arc::new(RwLock::new(FsVersionCache::new(
@@ -136,6 +147,7 @@ pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
         ledger,
         opa,
         operator_cache,
+        rate_limiter,
         pg_pool,
         fs_versions,
         pg_versions,
@@ -194,7 +206,13 @@ async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
     )
 }
 
-async fn metrics() -> impl IntoResponse {
+async fn metrics(State(state): State<AppState>, headers: HeaderMap) -> impl IntoResponse {
+    if state.config.metrics_require_auth
+        && let Err(err) = extract_principal(&state, &headers).await
+    {
+        return err.into_response();
+    }
+
     match crate::metrics::render() {
         Ok((body, content_type)) => {
             let mut headers = HeaderMap::new();
@@ -230,6 +248,20 @@ async fn create_session(
 ) -> Result<(HeaderMap, Json<CreateSessionResponse>), (StatusCode, Json<ErrorResponse>)> {
     let principal = extract_principal(&state, &headers).await?;
     let principal_id = principal.principal_id.clone();
+
+    if !state.rate_limiter.allow(
+        format!("sessions:{}", principal_id).as_str(),
+        state.config.rate_limit_sessions_per_window,
+    ) {
+        return Err(json_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            "ERR_RATE_LIMITED",
+            "rate limit exceeded for session creation".to_string(),
+            TerminalMode::InsufficientPermission,
+            true,
+        ));
+    }
+
     let request_id = extract_request_id(&headers);
     let trace_id = extract_trace_id(&headers);
 
@@ -494,6 +526,23 @@ async fn call_operator(
     let handler_result = (async move {
         let principal = extract_principal(&state, &headers).await?;
         let principal_id = principal.principal_id.clone();
+
+        if !state
+            .rate_limiter
+            .allow(
+                format!("operators:{}", principal_id).as_str(),
+                state.config.rate_limit_operators_per_window,
+            )
+        {
+            return Err(json_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "ERR_RATE_LIMITED",
+                "rate limit exceeded for operator calls".to_string(),
+                TerminalMode::InsufficientPermission,
+                true,
+            ));
+        }
+
         let request_id = extract_request_id(&headers);
         let session_token = extract_session_token(&headers)?;
 
@@ -1957,7 +2006,7 @@ impl FsVersionCache {
     }
 }
 
-fn read_object_bytes_from_fs(
+async fn read_object_bytes_from_fs(
     fs_corpus_path: &str,
     object_id: &str,
 ) -> Result<Vec<u8>, (StatusCode, Json<ErrorResponse>)> {
@@ -1973,7 +2022,7 @@ fn read_object_bytes_from_fs(
     }
 
     let base = std::path::Path::new(fs_corpus_path);
-    let base_canon = base.canonicalize().map_err(|_| {
+    let base_canon = tokio::fs::canonicalize(base).await.map_err(|_| {
         json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "ERR_INTERNAL",
@@ -1984,7 +2033,7 @@ fn read_object_bytes_from_fs(
     })?;
 
     let full_path = base.join(object_rel);
-    let full_canon = full_path.canonicalize().map_err(|_| {
+    let full_canon = tokio::fs::canonicalize(full_path).await.map_err(|_| {
         json_error(
             StatusCode::NOT_FOUND,
             "ERR_SOURCE_UNAVAILABLE",
@@ -2004,7 +2053,7 @@ fn read_object_bytes_from_fs(
         ));
     }
 
-    std::fs::read(&full_canon).map_err(|_| {
+    tokio::fs::read(&full_canon).await.map_err(|_| {
         json_error(
             StatusCode::NOT_FOUND,
             "ERR_SOURCE_UNAVAILABLE",
@@ -2036,7 +2085,7 @@ async fn list_versions_from_fs(
             )
         })?;
 
-    let bytes = read_object_bytes_from_fs(fs_corpus_path, object_id)?;
+    let bytes = read_object_bytes_from_fs(fs_corpus_path, object_id).await?;
 
     let version_id = sha256_hex(&bytes);
     let metadata_hash = sha256_hex(object_id.as_bytes());
@@ -2139,7 +2188,7 @@ async fn diff_from_fs(
             return Ok(bytes);
         }
 
-        let bytes = read_object_bytes_from_fs(fs_corpus_path, object_id)?;
+        let bytes = read_object_bytes_from_fs(fs_corpus_path, object_id).await?;
         let current_version = sha256_hex(&bytes);
         if current_version != version_id {
             return Err(json_error(
@@ -2286,7 +2335,7 @@ async fn fetch_span_from_fs(
         if let Some(bytes) = fs_versions.read().await.get(object_id, &version_id) {
             (bytes.to_vec(), version_id)
         } else {
-            let bytes = read_object_bytes_from_fs(fs_corpus_path, object_id)?;
+            let bytes = read_object_bytes_from_fs(fs_corpus_path, object_id).await?;
             let version_id = sha256_hex(&bytes);
 
             let mut cache = fs_versions.write().await;
@@ -2296,7 +2345,7 @@ async fn fetch_span_from_fs(
             (bytes, version_id)
         }
     } else {
-        let bytes = read_object_bytes_from_fs(fs_corpus_path, object_id)?;
+        let bytes = read_object_bytes_from_fs(fs_corpus_path, object_id).await?;
         let version_id = sha256_hex(&bytes);
 
         let mut cache = fs_versions.write().await;
@@ -2644,6 +2693,90 @@ fn safeview_spec(view_id: &str) -> Option<SafeViewSpec> {
         }),
         _ => None,
     }
+}
+
+const ALLOWLISTED_SAFEVIEW_IDS: &[&str] = &[
+    "safe_customer_view_public",
+    "safe_customer_view_public_slow",
+    "safe_customer_view_admin",
+    "safe_customer_view_support",
+    "safe_customer_view_injection",
+];
+
+async fn validate_safeview_schema(pool: &PgPool) -> Result<(), StartupError> {
+    for view_id in ALLOWLISTED_SAFEVIEW_IDS {
+        let spec = safeview_spec(view_id).ok_or_else(|| StartupError {
+            code: "ERR_INTERNAL",
+            message: format!("internal safe-view allowlist mismatch for `{}`", view_id),
+        })?;
+
+        let rows = sqlx::query(
+            "SELECT column_name \
+             FROM information_schema.columns \
+             WHERE table_schema = current_schema() AND table_name = $1",
+        )
+        .bind(spec.view_id)
+        .fetch_all(pool)
+        .await
+        .map_err(|_| StartupError {
+            code: "ERR_DB_UNAVAILABLE",
+            message: format!(
+                "failed to introspect safe-view schema for `{}`",
+                spec.view_id
+            ),
+        })?;
+
+        if rows.is_empty() {
+            return Err(StartupError {
+                code: "ERR_INVALID_CONFIG",
+                message: format!(
+                    "safe-view schema mismatch: required view `{}` does not exist in current schema",
+                    spec.view_id
+                ),
+            });
+        }
+
+        let available_columns = rows
+            .into_iter()
+            .filter_map(|row| row.try_get::<String, _>("column_name").ok())
+            .map(|c| c.to_ascii_lowercase())
+            .collect::<BTreeSet<_>>();
+
+        let missing = missing_safeview_columns(spec, &available_columns);
+        if !missing.is_empty() {
+            return Err(StartupError {
+                code: "ERR_INVALID_CONFIG",
+                message: format!(
+                    "safe-view schema mismatch for `{}`: missing columns [{}]",
+                    spec.view_id,
+                    missing.join(", ")
+                ),
+            });
+        }
+    }
+
+    Ok(())
+}
+
+fn missing_safeview_columns(
+    spec: SafeViewSpec,
+    available_columns: &BTreeSet<String>,
+) -> Vec<String> {
+    let mut required_columns = BTreeSet::<&str>::new();
+    required_columns.extend(spec.primary_key_fields.iter().copied());
+    required_columns.extend(spec.allowlisted_fields.iter().copied());
+    required_columns.extend(spec.allowlisted_filter_fields.iter().copied());
+    required_columns.extend(spec.allowlisted_group_by_fields.iter().copied());
+    required_columns.insert(spec.version_field);
+    for metric in spec.allowlisted_metrics {
+        required_columns.insert(metric.field);
+    }
+
+    required_columns
+        .into_iter()
+        .filter(|field| !available_columns.contains(*field))
+        .map(str::to_string)
+        .collect()
 }
 
 fn parse_safeview_string(
@@ -3440,116 +3573,6 @@ async fn aggregate_from_pg_safeview(
     })
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct FinalizeRequest {
-    session_id: String,
-    response_text: String,
-    claim_map: ClaimMap,
-}
-
-#[derive(Debug, Serialize)]
-struct FinalizeResponse {
-    terminal_mode: TerminalMode,
-    trace_id: String,
-    claim_map: ClaimMap,
-    response_text: String,
-}
-
-fn claim_status_str(status: ClaimStatus) -> &'static str {
-    match status {
-        ClaimStatus::Supported => "SUPPORTED",
-        ClaimStatus::Assumption => "ASSUMPTION",
-        ClaimStatus::Unknown => "UNKNOWN",
-    }
-}
-
-fn claim_id_for(claim_text: &str, status: ClaimStatus, evidence_unit_ids: &[String]) -> String {
-    canonical::hash_canonical_json(&serde_json::json!({
-        "claim_text": claim_text,
-        "status": claim_status_str(status),
-        "evidence_unit_ids": evidence_unit_ids,
-    }))
-}
-
-fn finalize_gate(
-    session: &Session,
-    mut claim_map: ClaimMap,
-    coverage_threshold: f64,
-) -> Result<ClaimMap, ApiError> {
-    claim_map.coverage_threshold = coverage_threshold;
-
-    let mut supported_claims: u64 = 0;
-    let mut covered_supported_claims: u64 = 0;
-
-    for claim in &mut claim_map.claims {
-        let trimmed = claim.claim_text.trim();
-        if trimmed.is_empty() {
-            return Err(json_error(
-                StatusCode::BAD_REQUEST,
-                "ERR_INVALID_PARAMS",
-                "claim.claim_text must be non-empty".to_string(),
-                TerminalMode::InsufficientEvidence,
-                false,
-            ));
-        }
-        claim.claim_text = trimmed.to_string();
-
-        claim.evidence_unit_ids.sort();
-        claim.evidence_unit_ids.dedup();
-
-        for evidence_unit_id in &claim.evidence_unit_ids {
-            if !canonical::is_sha256_hex(evidence_unit_id) {
-                return Err(json_error(
-                    StatusCode::BAD_REQUEST,
-                    "ERR_INVALID_PARAMS",
-                    "claim.evidence_unit_ids must be sha256 hex".to_string(),
-                    TerminalMode::InsufficientEvidence,
-                    false,
-                ));
-            }
-
-            if !session.evidence_unit_ids.contains(evidence_unit_id) {
-                return Err(json_error(
-                    StatusCode::BAD_REQUEST,
-                    "ERR_INVALID_PARAMS",
-                    "claim references evidence not emitted in this trace".to_string(),
-                    TerminalMode::InsufficientEvidence,
-                    false,
-                ));
-            }
-        }
-
-        if claim.status == ClaimStatus::Supported {
-            if claim.evidence_unit_ids.is_empty() {
-                claim.status = ClaimStatus::Unknown;
-            } else {
-                supported_claims = supported_claims.saturating_add(1);
-                covered_supported_claims = covered_supported_claims.saturating_add(1);
-            }
-        }
-
-        claim.claim_id = claim_id_for(&claim.claim_text, claim.status, &claim.evidence_unit_ids);
-    }
-
-    claim_map.coverage_observed =
-        covered_supported_claims as f64 / std::cmp::max(1, supported_claims) as f64;
-
-    let budget_violation = session.operator_calls_used > session.budget.max_operator_calls
-        || session.bytes_used > session.budget.max_bytes;
-
-    claim_map.terminal_mode = if !budget_violation
-        && supported_claims > 0
-        && claim_map.coverage_observed >= coverage_threshold
-    {
-        TerminalMode::Supported
-    } else {
-        TerminalMode::InsufficientEvidence
-    };
-
-    Ok(claim_map)
-}
-
 async fn finalize(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -3560,6 +3583,20 @@ async fn finalize(
     let handler_result = (async move {
         let principal = extract_principal(&state, &headers).await?;
         let principal_id = principal.principal_id.clone();
+
+        if !state.rate_limiter.allow(
+            format!("finalize:{}", principal_id).as_str(),
+            state.config.rate_limit_finalize_per_window,
+        ) {
+            return Err(json_error(
+                StatusCode::TOO_MANY_REQUESTS,
+                "ERR_RATE_LIMITED",
+                "rate limit exceeded for finalize calls".to_string(),
+                TerminalMode::InsufficientPermission,
+                true,
+            ));
+        }
+
         let request_id = extract_request_id(&headers);
         let session_token = extract_session_token(&headers)?;
 
@@ -3896,156 +3933,13 @@ async fn finalize(
     handler_result
 }
 
-fn unix_epoch_ms_now() -> i64 {
-    let duration = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or(Duration::ZERO);
-    duration.as_millis().min(i64::MAX as u128) as i64
-}
-
-async fn acquire_session_lock<'a>(
-    state: &'a AppState,
-    session_id: &str,
-) -> Result<Transaction<'a, Postgres>, ApiError> {
-    let timeout = Duration::from_millis(state.config.ledger_write_timeout_ms.max(200));
-    let mut tx = tokio::time::timeout(timeout, state.pg_pool.begin())
-        .await
-        .map_err(|_| {
-            json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ERR_SOURCE_TIMEOUT",
-                "session lock acquisition timed out".to_string(),
-                TerminalMode::SourceUnavailable,
-                true,
-            )
-        })?
-        .map_err(|_| {
-            json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ERR_DB_UNAVAILABLE",
-                "failed to start session lock transaction".to_string(),
-                TerminalMode::SourceUnavailable,
-                true,
-            )
-        })?;
-
-    tokio::time::timeout(
-        timeout,
-        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
-            .bind(session_id)
-            .execute(&mut *tx),
-    )
-    .await
-    .map_err(|_| {
-        json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "ERR_SOURCE_TIMEOUT",
-            "session lock acquisition timed out".to_string(),
-            TerminalMode::SourceUnavailable,
-            true,
-        )
-    })?
-    .map_err(|_| {
-        json_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "ERR_DB_UNAVAILABLE",
-            "failed to acquire session lock".to_string(),
-            TerminalMode::SourceUnavailable,
-            true,
-        )
-    })?;
-
-    Ok(tx)
-}
-
-async fn persist_session_runtime(state: &AppState, session: &Session) -> Result<(), ApiError> {
-    let mut evidence_unit_ids = session
-        .evidence_unit_ids
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    evidence_unit_ids.sort();
-    evidence_unit_ids.dedup();
-
-    state
-        .ledger
-        .upsert_session_runtime(SessionRuntimeWrite {
-            session_id: session.session_id.as_str(),
-            tenant_id: session.tenant_id.as_str(),
-            session_token_hash: session.session_token_hash.as_str(),
-            session_token_expires_at_epoch_ms: session.session_token_expires_at_epoch_ms,
-            operator_calls_used: session.operator_calls_used,
-            bytes_used: session.bytes_used,
-            evidence_unit_ids: &evidence_unit_ids,
-            finalized: session.finalized,
-        })
-        .await
-        .map_err(|_| {
-            json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ERR_LEDGER_UNAVAILABLE",
-                "ledger unavailable".to_string(),
-                TerminalMode::SourceUnavailable,
-                true,
-            )
-        })
-}
-
-async fn load_session_runtime(
-    state: &AppState,
-    session_id: &str,
-) -> Result<Option<Session>, ApiError> {
-    let record = state
-        .ledger
-        .load_session_runtime(session_id)
-        .await
-        .map_err(|_| {
-            json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ERR_LEDGER_UNAVAILABLE",
-                "ledger unavailable".to_string(),
-                TerminalMode::SourceUnavailable,
-                true,
-            )
-        })?;
-
-    let Some(record) = record else {
-        return Ok(None);
-    };
-
-    if record.budget.validate().is_err() {
-        return Err(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ERR_INTERNAL",
-            "stored session budget is invalid".to_string(),
-            TerminalMode::SourceUnavailable,
-            false,
-        ));
-    }
-
-    let evidence_unit_ids = record.evidence_unit_ids.into_iter().collect::<HashSet<_>>();
-
-    Ok(Some(Session {
-        session_id: record.session_id,
-        trace_id: record.trace_id,
-        principal_id: record.principal_id,
-        tenant_id: record.tenant_id,
-        policy_snapshot_id: record.policy_snapshot_id,
-        policy_snapshot_hash: record.policy_snapshot_hash,
-        as_of_time: record.as_of_time,
-        budget: record.budget,
-        session_token_hash: record.session_token_hash,
-        session_token_expires_at_epoch_ms: record.session_token_expires_at_epoch_ms,
-        operator_calls_used: record.operator_calls_used,
-        bytes_used: record.bytes_used,
-        evidence_unit_ids,
-        finalized: record.finalized,
-    }))
-}
-
 async fn extract_principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, ApiError> {
     match state.config.auth_mode {
         AuthMode::Local => {
+            validate_local_auth_shared_secret(
+                headers,
+                state.config.local_auth_shared_secret.as_deref(),
+            )?;
             let principal_id = extract_principal_id(headers)?;
             Ok(Principal {
                 principal_id,
@@ -4092,6 +3986,42 @@ async fn extract_principal(state: &AppState, headers: &HeaderMap) -> Result<Prin
                 })
         }
     }
+}
+
+fn validate_local_auth_shared_secret(
+    headers: &HeaderMap,
+    expected_secret: Option<&str>,
+) -> Result<(), ApiError> {
+    let Some(expected_secret) = expected_secret else {
+        return Ok(());
+    };
+
+    let provided_secret = headers
+        .get("x-pecr-local-auth-secret")
+        .and_then(|v| v.to_str().ok())
+        .map(|v| v.trim())
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| {
+            json_error(
+                StatusCode::UNAUTHORIZED,
+                "ERR_AUTH_REQUIRED",
+                "missing local auth secret".to_string(),
+                TerminalMode::InsufficientPermission,
+                false,
+            )
+        })?;
+
+    if provided_secret != expected_secret {
+        return Err(json_error(
+            StatusCode::UNAUTHORIZED,
+            "ERR_AUTH_INVALID",
+            "invalid local auth secret".to_string(),
+            TerminalMode::InsufficientPermission,
+            false,
+        ));
+    }
+
+    Ok(())
 }
 
 fn extract_principal_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
@@ -4207,268 +4137,6 @@ fn sanitize_as_of_time(raw: &str) -> Option<String> {
     Some(raw.to_string())
 }
 
-#[derive(Debug, Clone)]
-enum FieldRedaction {
-    Allow(Vec<String>),
-    Deny(Vec<String>),
-}
-
-impl FieldRedaction {
-    fn keeps_key(&self, key: &str) -> bool {
-        match self {
-            FieldRedaction::Allow(fields) => {
-                fields.binary_search_by(|f| f.as_str().cmp(key)).is_ok()
-            }
-            FieldRedaction::Deny(fields) => {
-                fields.binary_search_by(|f| f.as_str().cmp(key)).is_err()
-            }
-        }
-    }
-
-    fn apply_to_field_list(&self, fields: &[String]) -> Vec<String> {
-        let mut out = Vec::with_capacity(fields.len());
-        for field in fields {
-            if self.keeps_key(field.as_str()) {
-                out.push(field.clone());
-            }
-        }
-        out
-    }
-
-    fn params_value(&self) -> serde_json::Value {
-        match self {
-            FieldRedaction::Allow(fields) => serde_json::json!({ "allow_fields": fields }),
-            FieldRedaction::Deny(fields) => serde_json::json!({ "deny_fields": fields }),
-        }
-    }
-}
-
-fn parse_field_redaction(
-    redaction: Option<&serde_json::Value>,
-) -> Result<Option<FieldRedaction>, ApiError> {
-    let Some(redaction) = redaction else {
-        return Ok(None);
-    };
-
-    let Some(obj) = redaction.as_object() else {
-        return Err(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ERR_INTERNAL",
-            "policy redaction must be an object".to_string(),
-            TerminalMode::InsufficientPermission,
-            false,
-        ));
-    };
-
-    if obj.is_empty() {
-        return Ok(None);
-    }
-
-    let parse_fields = |key: &str| -> Result<Option<Vec<String>>, ApiError> {
-        let Some(value) = obj.get(key) else {
-            return Ok(None);
-        };
-        let Some(arr) = value.as_array() else {
-            return Err(json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "ERR_INTERNAL",
-                format!("policy redaction `{}` must be an array", key),
-                TerminalMode::InsufficientPermission,
-                false,
-            ));
-        };
-
-        let mut out = Vec::with_capacity(arr.len());
-        for raw in arr {
-            let field = raw
-                .as_str()
-                .map(|s| s.trim())
-                .filter(|s| !s.is_empty())
-                .ok_or_else(|| {
-                    json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "ERR_INTERNAL",
-                        format!("policy redaction `{}` must be a string array", key),
-                        TerminalMode::InsufficientPermission,
-                        false,
-                    )
-                })?;
-            out.push(field.to_string());
-        }
-
-        out.sort();
-        out.dedup();
-        if out.is_empty() {
-            Ok(None)
-        } else {
-            Ok(Some(out))
-        }
-    };
-
-    let allow_fields = parse_fields("allow_fields")?;
-    let deny_fields = parse_fields("deny_fields")?;
-
-    if allow_fields.is_some() && deny_fields.is_some() {
-        return Err(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ERR_INTERNAL",
-            "policy redaction cannot specify both allow_fields and deny_fields".to_string(),
-            TerminalMode::InsufficientPermission,
-            false,
-        ));
-    }
-
-    Ok(match (allow_fields, deny_fields) {
-        (Some(fields), None) => Some(FieldRedaction::Allow(fields)),
-        (None, Some(fields)) => Some(FieldRedaction::Deny(fields)),
-        _ => None,
-    })
-}
-
-fn apply_field_redaction(
-    value: &serde_json::Value,
-    redaction: &FieldRedaction,
-) -> serde_json::Value {
-    match value {
-        serde_json::Value::Object(map) => {
-            let mut out = serde_json::Map::with_capacity(map.len());
-            for (k, v) in map {
-                if redaction.keeps_key(k.as_str()) {
-                    out.insert(k.clone(), apply_field_redaction(v, redaction));
-                }
-            }
-            serde_json::Value::Object(out)
-        }
-        serde_json::Value::Array(values) => serde_json::Value::Array(
-            values
-                .iter()
-                .map(|v| apply_field_redaction(v, redaction))
-                .collect::<Vec<_>>(),
-        ),
-        _ => value.clone(),
-    }
-}
-
-fn redact_span_or_row_spec_fields(
-    span_or_row_spec: &serde_json::Value,
-    redaction: &FieldRedaction,
-) -> serde_json::Value {
-    let Some(obj) = span_or_row_spec.as_object() else {
-        return span_or_row_spec.clone();
-    };
-
-    let Some(fields_value) = obj.get("fields") else {
-        return span_or_row_spec.clone();
-    };
-    let Some(fields) = fields_value.as_array() else {
-        return span_or_row_spec.clone();
-    };
-
-    let mut parsed = fields
-        .iter()
-        .filter_map(|v| v.as_str())
-        .map(|v| v.trim())
-        .filter(|v| !v.is_empty())
-        .map(|v| v.to_string())
-        .collect::<Vec<_>>();
-    parsed.sort();
-    parsed.dedup();
-
-    let redacted_fields = redaction.apply_to_field_list(&parsed);
-
-    let mut out = obj.clone();
-    out.insert(
-        "fields".to_string(),
-        serde_json::Value::Array(
-            redacted_fields
-                .into_iter()
-                .map(serde_json::Value::String)
-                .collect(),
-        ),
-    );
-    serde_json::Value::Object(out)
-}
-
-fn compute_content_hash(
-    content_type: EvidenceContentType,
-    content: &serde_json::Value,
-) -> Result<String, ApiError> {
-    match content_type {
-        EvidenceContentType::ApplicationJson => Ok(canonical::hash_canonical_json(content)),
-        EvidenceContentType::TextPlain => {
-            let text = content.as_str().ok_or_else(|| {
-                json_error(
-                    StatusCode::BAD_REQUEST,
-                    "ERR_INVALID_PARAMS",
-                    "text/plain evidence content must be a string".to_string(),
-                    TerminalMode::InsufficientEvidence,
-                    false,
-                )
-            })?;
-            let canonical_text = canonical::canonicalize_text_plain(text);
-            Ok(canonical::sha256_hex(canonical_text.as_bytes()))
-        }
-    }
-}
-
-fn compute_evidence_unit_id(evidence: &EvidenceUnit) -> String {
-    let identity = serde_json::json!({
-        "source_system": evidence.source_system.as_str(),
-        "object_id": evidence.object_id.as_str(),
-        "version_id": evidence.version_id.as_str(),
-        "span_or_row_spec": &evidence.span_or_row_spec,
-        "content_hash": evidence.content_hash.as_str(),
-        "as_of_time": evidence.as_of_time.as_str(),
-        "policy_snapshot_hash": evidence.policy_snapshot_hash.as_str(),
-        "transform_chain": &evidence.transform_chain,
-    });
-    canonical::hash_canonical_json(&identity)
-}
-
-fn apply_field_redaction_to_evidence_unit(
-    mut evidence: EvidenceUnit,
-    redaction: &FieldRedaction,
-) -> Result<EvidenceUnit, ApiError> {
-    if evidence.content_type != EvidenceContentType::ApplicationJson {
-        return Ok(evidence);
-    }
-
-    let Some(content) = evidence.content.as_ref() else {
-        return Ok(evidence);
-    };
-
-    let redacted_content = apply_field_redaction(content, redaction);
-    if redacted_content == *content {
-        return Ok(evidence);
-    }
-
-    evidence.content = Some(redacted_content);
-    evidence.content_hash = compute_content_hash(
-        EvidenceContentType::ApplicationJson,
-        evidence.content.as_ref().unwrap(),
-    )?;
-    evidence.span_or_row_spec =
-        redact_span_or_row_spec_fields(&evidence.span_or_row_spec, redaction);
-
-    let step_params = redaction.params_value();
-    let step_hash = canonical::hash_canonical_json(&step_params);
-    evidence.transform_chain.push(TransformStep {
-        transform_type: "redaction".to_string(),
-        transform_hash: step_hash,
-        params: Some(step_params),
-    });
-
-    evidence.evidence_unit_id = compute_evidence_unit_id(&evidence);
-    Ok(evidence)
-}
-
-fn is_allowlisted_operator(op_name: &str) -> bool {
-    matches!(
-        op_name,
-        "search" | "fetch_span" | "fetch_rows" | "aggregate" | "list_versions" | "diff" | "redact"
-    )
-}
-
 #[derive(Debug, Serialize)]
 struct ErrorResponse {
     code: String,
@@ -4527,6 +4195,8 @@ fn opa_error_response(err: &crate::opa::OpaError) -> (StatusCode, Json<ErrorResp
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::collections::HashSet;
 
     fn make_session(
         evidence_unit_ids: &[&str],
@@ -4814,5 +4484,34 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert_eq!(fields, vec![serde_json::Value::String("ok".to_string())]);
+    }
+
+    #[test]
+    fn safeview_schema_missing_columns_are_detected() {
+        let spec = safeview_spec("safe_customer_view_public").expect("spec must exist");
+        let available = BTreeSet::from([
+            "tenant_id".to_string(),
+            "customer_id".to_string(),
+            "status".to_string(),
+            "plan_tier".to_string(),
+        ]);
+
+        let missing = missing_safeview_columns(spec, &available);
+        assert!(missing.contains(&"updated_at".to_string()));
+    }
+
+    #[test]
+    fn safeview_schema_complete_columns_pass() {
+        let spec = safeview_spec("safe_customer_view_public").expect("spec must exist");
+        let available = BTreeSet::from([
+            "tenant_id".to_string(),
+            "customer_id".to_string(),
+            "status".to_string(),
+            "plan_tier".to_string(),
+            "updated_at".to_string(),
+        ]);
+
+        let missing = missing_safeview_columns(spec, &available);
+        assert!(missing.is_empty());
     }
 }

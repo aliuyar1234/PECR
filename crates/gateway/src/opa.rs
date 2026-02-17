@@ -2,20 +2,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use pecr_policy::PolicyDecision as OpaDecision;
 use serde::Deserialize;
 use tokio::sync::RwLock;
-
-#[derive(Debug, Clone, Deserialize)]
-pub struct OpaDecision {
-    pub allow: bool,
-    #[serde(default)]
-    pub cacheable: bool,
-    #[serde(default)]
-    pub reason: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    pub redaction: Option<serde_json::Value>,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct OpaCacheKey {

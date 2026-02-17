@@ -423,21 +423,10 @@ impl LedgerWriter {
         };
 
         let budget_json: serde_json::Value = row.try_get("budget_json")?;
-        let budget = serde_json::from_value::<Budget>(budget_json).map_err(|err| {
-            LedgerError::Sqlx(sqlx::Error::Decode(Box::new(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                format!("invalid budget_json: {}", err),
-            ))))
-        })?;
+        let budget = parse_budget_json_value(budget_json)?;
 
         let evidence_unit_ids_json: serde_json::Value = row.try_get("evidence_unit_ids_json")?;
-        let evidence_unit_ids = match evidence_unit_ids_json {
-            serde_json::Value::Array(items) => items
-                .into_iter()
-                .filter_map(|item| item.as_str().map(|s| s.to_string()))
-                .collect::<Vec<_>>(),
-            _ => Vec::new(),
-        };
+        let evidence_unit_ids = parse_evidence_unit_ids_value(evidence_unit_ids_json);
 
         let operator_calls_used = row.try_get::<i64, _>("operator_calls_used")?;
         let bytes_used = row.try_get::<i64, _>("bytes_used")?;
@@ -475,4 +464,56 @@ pub async fn migrate_url(db_url: &str) -> Result<(), sqlx::Error> {
     migrate(&pool).await?;
     pool.close().await;
     Ok(())
+}
+
+fn parse_budget_json_value(value: serde_json::Value) -> Result<Budget, LedgerError> {
+    serde_json::from_value::<Budget>(value).map_err(|err| {
+        LedgerError::Sqlx(sqlx::Error::Decode(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid budget_json: {}", err),
+        ))))
+    })
+}
+
+fn parse_evidence_unit_ids_value(value: serde_json::Value) -> Vec<String> {
+    match value {
+        serde_json::Value::Array(items) => items
+            .into_iter()
+            .filter_map(|item| item.as_str().map(|s| s.to_string()))
+            .collect::<Vec<_>>(),
+        _ => Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_budget_json_value_accepts_valid_budget() {
+        let budget = parse_budget_json_value(serde_json::json!({
+            "max_operator_calls": 5,
+            "max_bytes": 1024,
+            "max_wallclock_ms": 1000,
+            "max_recursion_depth": 3,
+            "max_parallelism": 2
+        }))
+        .expect("budget should parse");
+
+        assert_eq!(budget.max_operator_calls, 5);
+        assert_eq!(budget.max_bytes, 1024);
+    }
+
+    #[test]
+    fn parse_budget_json_value_rejects_invalid_shape() {
+        let err = parse_budget_json_value(serde_json::json!({ "oops": true })).unwrap_err();
+        assert!(matches!(err, LedgerError::Sqlx(sqlx::Error::Decode(_))));
+    }
+
+    #[test]
+    fn parse_evidence_unit_ids_value_filters_non_string_entries() {
+        let ids = parse_evidence_unit_ids_value(serde_json::json!(["a", 1, null, "b"]));
+
+        assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
 }

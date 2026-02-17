@@ -21,7 +21,9 @@ pub struct GatewayConfig {
     pub session_token_ttl_secs: u64,
     pub evidence_payload_store_mode: EvidencePayloadStoreMode,
     pub auth_mode: AuthMode,
+    pub local_auth_shared_secret: Option<String>,
     pub oidc: Option<OidcConfig>,
+    pub metrics_require_auth: bool,
     pub fs_corpus_path: String,
     pub fs_version_cache_max_bytes: usize,
     pub fs_version_cache_max_versions_per_object: usize,
@@ -30,6 +32,10 @@ pub struct GatewayConfig {
     pub pg_safeview_max_rows: usize,
     pub pg_safeview_max_fields: usize,
     pub pg_safeview_max_groups: usize,
+    pub rate_limit_window_secs: u64,
+    pub rate_limit_sessions_per_window: u32,
+    pub rate_limit_operators_per_window: u32,
+    pub rate_limit_finalize_per_window: u32,
     pub coverage_threshold: f64,
     pub as_of_time_default: String,
 }
@@ -86,16 +92,23 @@ impl GatewayConfig {
 
         let auth_mode = parse_auth_mode(kv.get("PECR_AUTH_MODE"))?;
 
+        let local_auth_shared_secret = kv
+            .get("PECR_LOCAL_AUTH_SHARED_SECRET")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
         let dev_allow_nonlocal_bind =
             parse_bool(kv.get("PECR_DEV_ALLOW_NONLOCAL_BIND")).unwrap_or(false);
 
         if !bind_addr.ip().is_loopback() && auth_mode != AuthMode::Oidc {
-            if dev_allow_nonlocal_bind && is_unspecified_ip(bind_addr.ip()) {
-                // Explicit dev-only escape hatch for docker compose / local containers.
-            } else {
+            let can_run_local_nonloopback = dev_allow_nonlocal_bind
+                && is_unspecified_ip(bind_addr.ip())
+                && local_auth_shared_secret.is_some();
+            if !can_run_local_nonloopback {
                 return Err(StartupError {
                     code: "ERR_NONLOCAL_BIND_REQUIRES_AUTH",
-                    message: "non-local bind requires production auth mode; refuse startup"
+                    message: "non-local bind requires oidc auth, or dev override + PECR_LOCAL_AUTH_SHARED_SECRET"
                         .to_string(),
                 });
             }
@@ -174,6 +187,9 @@ impl GatewayConfig {
             None
         };
 
+        let metrics_require_auth = parse_bool(kv.get("PECR_METRICS_REQUIRE_AUTH"))
+            .unwrap_or(!bind_addr.ip().is_loopback());
+
         let fs_corpus_path = kv
             .get("PECR_FS_CORPUS_PATH")
             .map(|s| s.trim())
@@ -223,6 +239,30 @@ impl GatewayConfig {
             "PECR_PG_SAFEVIEW_MAX_GROUPS",
         )?;
 
+        let rate_limit_window_secs = parse_u64(
+            kv.get("PECR_RATE_LIMIT_WINDOW_SECS"),
+            60,
+            "PECR_RATE_LIMIT_WINDOW_SECS",
+        )?;
+
+        let rate_limit_sessions_per_window = parse_u32(
+            kv.get("PECR_RATE_LIMIT_SESSIONS_PER_WINDOW"),
+            60,
+            "PECR_RATE_LIMIT_SESSIONS_PER_WINDOW",
+        )?;
+
+        let rate_limit_operators_per_window = parse_u32(
+            kv.get("PECR_RATE_LIMIT_OPERATORS_PER_WINDOW"),
+            240,
+            "PECR_RATE_LIMIT_OPERATORS_PER_WINDOW",
+        )?;
+
+        let rate_limit_finalize_per_window = parse_u32(
+            kv.get("PECR_RATE_LIMIT_FINALIZE_PER_WINDOW"),
+            120,
+            "PECR_RATE_LIMIT_FINALIZE_PER_WINDOW",
+        )?;
+
         let coverage_threshold = parse_f64(
             kv.get("PECR_COVERAGE_THRESHOLD"),
             0.95,
@@ -258,7 +298,9 @@ impl GatewayConfig {
             session_token_ttl_secs,
             evidence_payload_store_mode,
             auth_mode,
+            local_auth_shared_secret,
             oidc,
+            metrics_require_auth,
             fs_corpus_path,
             fs_version_cache_max_bytes,
             fs_version_cache_max_versions_per_object,
@@ -267,6 +309,10 @@ impl GatewayConfig {
             pg_safeview_max_rows,
             pg_safeview_max_fields,
             pg_safeview_max_groups,
+            rate_limit_window_secs,
+            rate_limit_sessions_per_window,
+            rate_limit_operators_per_window,
+            rate_limit_finalize_per_window,
             coverage_threshold,
             as_of_time_default,
         })
@@ -598,6 +644,20 @@ mod tests {
         env.insert("PECR_BIND_ADDR".to_string(), "0.0.0.0:8080".to_string());
         let err = GatewayConfig::from_kv(&env).unwrap_err();
         assert_eq!(err.code, "ERR_NONLOCAL_BIND_REQUIRES_AUTH");
+    }
+
+    #[test]
+    fn non_local_bind_dev_override_requires_shared_secret() {
+        let mut env = minimal_ok_env();
+        env.insert("PECR_BIND_ADDR".to_string(), "0.0.0.0:8080".to_string());
+        env.insert("PECR_DEV_ALLOW_NONLOCAL_BIND".to_string(), "1".to_string());
+        env.insert(
+            "PECR_LOCAL_AUTH_SHARED_SECRET".to_string(),
+            "dev-secret".to_string(),
+        );
+        let cfg = GatewayConfig::from_kv(&env).expect("config should load");
+        assert_eq!(cfg.auth_mode, AuthMode::Local);
+        assert_eq!(cfg.local_auth_shared_secret.as_deref(), Some("dev-secret"));
     }
 
     #[test]

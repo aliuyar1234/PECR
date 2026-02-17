@@ -171,28 +171,29 @@ impl OidcAuthenticator {
         {
             let cache = self.jwks.read().await;
             if let Some(jwk) = cache.jwk_for_kid(kid) {
-                return DecodingKey::from_jwk(jwk).map_err(|_| AuthError {
-                    code: "ERR_AUTH_INVALID",
-                    message: "failed to parse JWK decoding key".to_string(),
-                });
+                return decoding_key_from_jwk(jwk);
             }
         }
 
-        {
-            let mut cache = self.jwks.write().await;
-            let refresh_needed = cache
+        let refresh_needed = {
+            let cache = self.jwks.read().await;
+            cache
                 .fetched_at
                 .map(|t| t.elapsed() > self.config.jwks_refresh_ttl)
-                .unwrap_or(true);
-            if refresh_needed {
-                cache.refresh(&self.http, &self.config).await?;
-            }
+                .unwrap_or(true)
+        };
 
+        if refresh_needed {
+            let jwks = JwksCache::fetch_jwks(&self.http, &self.config).await?;
+            let mut cache = self.jwks.write().await;
+            cache.jwks = Some(jwks);
+            cache.fetched_at = Some(Instant::now());
+        }
+
+        {
+            let cache = self.jwks.read().await;
             if let Some(jwk) = cache.jwk_for_kid(kid) {
-                return DecodingKey::from_jwk(jwk).map_err(|_| AuthError {
-                    code: "ERR_AUTH_INVALID",
-                    message: "failed to parse JWK decoding key".to_string(),
-                });
+                return decoding_key_from_jwk(jwk);
             }
         }
 
@@ -213,13 +214,24 @@ impl JwksCache {
         http: &reqwest::Client,
         config: &OidcConfig,
     ) -> Result<(), AuthError> {
-        let jwks = if let Some(jwks_json) = config.jwks_json.as_ref() {
-            serde_json::from_str::<JwkSet>(jwks_json).map_err(|_| AuthError {
+        let jwks = Self::fetch_jwks(http, config).await?;
+
+        self.jwks = Some(jwks);
+        self.fetched_at = Some(Instant::now());
+        Ok(())
+    }
+
+    async fn fetch_jwks(http: &reqwest::Client, config: &OidcConfig) -> Result<JwkSet, AuthError> {
+        if let Some(jwks_json) = config.jwks_json.as_ref() {
+            return serde_json::from_str::<JwkSet>(jwks_json).map_err(|_| AuthError {
                 code: "ERR_INVALID_CONFIG",
                 message: "PECR_OIDC_JWKS_JSON is not valid JWKS JSON".to_string(),
-            })?
-        } else if let Some(url) = config.jwks_url.as_ref() {
-            http.get(url)
+            });
+        }
+
+        if let Some(url) = config.jwks_url.as_ref() {
+            return http
+                .get(url)
                 .send()
                 .await
                 .map_err(|_| AuthError {
@@ -236,18 +248,21 @@ impl JwksCache {
                 .map_err(|_| AuthError {
                     code: "ERR_AUTH_UNAVAILABLE",
                     message: "failed to parse JWKS JSON".to_string(),
-                })?
-        } else {
-            return Err(AuthError {
-                code: "ERR_INVALID_CONFIG",
-                message: "oidc requires jwks_url or jwks_json".to_string(),
-            });
-        };
+                });
+        }
 
-        self.jwks = Some(jwks);
-        self.fetched_at = Some(Instant::now());
-        Ok(())
+        Err(AuthError {
+            code: "ERR_INVALID_CONFIG",
+            message: "oidc requires jwks_url or jwks_json".to_string(),
+        })
     }
+}
+
+fn decoding_key_from_jwk(jwk: &jsonwebtoken::jwk::Jwk) -> Result<DecodingKey, AuthError> {
+    DecodingKey::from_jwk(jwk).map_err(|_| AuthError {
+        code: "ERR_AUTH_INVALID",
+        message: "failed to parse JWK decoding key".to_string(),
+    })
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<String, AuthError> {
@@ -371,5 +386,50 @@ mod tests {
 
         let missing = claim_string_vec(&claims, "missing").unwrap();
         assert!(missing.is_empty());
+    }
+
+    #[test]
+    fn bearer_token_rejects_empty_bearer_token() {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, "Bearer   ".parse().unwrap());
+
+        let err = bearer_token(&headers).unwrap_err();
+        assert_eq!(err.code, "ERR_AUTH_INVALID");
+    }
+
+    #[test]
+    fn claim_string_rejects_missing_claim() {
+        let claims = serde_json::json!({ "sub": "alice" });
+        let err = claim_string(&claims, "tenant").unwrap_err();
+        assert_eq!(err.code, "ERR_AUTH_INVALID");
+    }
+
+    #[test]
+    fn claim_string_vec_rejects_non_string_array_items() {
+        let claims = serde_json::json!({ "groups": ["ok", 1] });
+        let err = claim_string_vec(&claims, "groups").unwrap_err();
+        assert_eq!(err.code, "ERR_AUTH_INVALID");
+    }
+
+    #[test]
+    fn attrs_hash_is_deterministic_for_same_claim_set() {
+        let claims = serde_json::json!({
+            "tenant": "t1",
+            "groups": ["admin", "ops"],
+            "unused": "x"
+        });
+
+        let mut claims_order_variation = serde_json::Map::new();
+        claims_order_variation.insert("groups".to_string(), serde_json::json!(["admin", "ops"]));
+        claims_order_variation.insert("tenant".to_string(), serde_json::json!("t1"));
+        claims_order_variation.insert("unused".to_string(), serde_json::json!("x"));
+
+        let hash_a = attrs_hash(&claims, &["tenant".to_string(), "groups".to_string()]);
+        let hash_b = attrs_hash(
+            &serde_json::Value::Object(claims_order_variation),
+            &["groups".to_string(), "tenant".to_string()],
+        );
+
+        assert_eq!(hash_a, hash_b);
     }
 }

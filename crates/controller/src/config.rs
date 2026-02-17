@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use pecr_auth::OidcConfig;
 use pecr_contracts::Budget;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
 pub struct ControllerConfig {
@@ -12,8 +13,27 @@ pub struct ControllerConfig {
     pub controller_engine: ControllerEngine,
     pub model_provider: ModelProvider,
     pub budget_defaults: Budget,
+    pub baseline_plan: Vec<BaselinePlanStep>,
     pub auth_mode: AuthMode,
+    pub local_auth_shared_secret: Option<String>,
     pub oidc: Option<OidcConfig>,
+    pub metrics_require_auth: bool,
+    pub rate_limit_window_secs: u64,
+    pub rate_limit_run_per_window: u32,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum BaselinePlanStep {
+    Operator {
+        op_name: String,
+        #[serde(default = "default_plan_params")]
+        params: serde_json::Value,
+    },
+    SearchRefFetchSpan {
+        #[serde(default = "default_max_refs")]
+        max_refs: usize,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -74,16 +94,23 @@ impl ControllerConfig {
 
         let auth_mode = parse_auth_mode(kv.get("PECR_AUTH_MODE"))?;
 
+        let local_auth_shared_secret = kv
+            .get("PECR_LOCAL_AUTH_SHARED_SECRET")
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
         let dev_allow_nonlocal_bind =
             parse_bool(kv.get("PECR_DEV_ALLOW_NONLOCAL_BIND")).unwrap_or(false);
 
         if !bind_addr.ip().is_loopback() && auth_mode != AuthMode::Oidc {
-            if dev_allow_nonlocal_bind && is_unspecified_ip(bind_addr.ip()) {
-                // Explicit dev-only escape hatch for docker compose / local containers.
-            } else {
+            let can_run_local_nonloopback = dev_allow_nonlocal_bind
+                && is_unspecified_ip(bind_addr.ip())
+                && local_auth_shared_secret.is_some();
+            if !can_run_local_nonloopback {
                 return Err(StartupError {
                     code: "ERR_NONLOCAL_BIND_REQUIRES_AUTH",
-                    message: "non-local bind requires production auth mode; refuse startup"
+                    message: "non-local bind requires oidc auth, or dev override + PECR_LOCAL_AUTH_SHARED_SECRET"
                         .to_string(),
                 });
             }
@@ -133,6 +160,7 @@ impl ControllerConfig {
             code: "ERR_INVALID_BUDGET",
             message: format!("PECR_BUDGET_DEFAULTS invalid: {}", reason),
         })?;
+        let baseline_plan = parse_baseline_plan(kv.get("PECR_BASELINE_PLAN"))?;
 
         let oidc = if auth_mode == AuthMode::Oidc {
             Some(parse_oidc_config(kv)?)
@@ -140,14 +168,32 @@ impl ControllerConfig {
             None
         };
 
+        let metrics_require_auth = parse_bool(kv.get("PECR_METRICS_REQUIRE_AUTH"))
+            .unwrap_or(!bind_addr.ip().is_loopback());
+        let rate_limit_window_secs = parse_u64(
+            kv.get("PECR_RATE_LIMIT_WINDOW_SECS"),
+            60,
+            "PECR_RATE_LIMIT_WINDOW_SECS",
+        )?;
+        let rate_limit_run_per_window = parse_u32(
+            kv.get("PECR_RATE_LIMIT_RUN_PER_WINDOW"),
+            60,
+            "PECR_RATE_LIMIT_RUN_PER_WINDOW",
+        )?;
+
         Ok(Self {
             bind_addr,
             gateway_url,
             controller_engine,
             model_provider,
             budget_defaults,
+            baseline_plan,
             auth_mode,
+            local_auth_shared_secret,
             oidc,
+            metrics_require_auth,
+            rate_limit_window_secs,
+            rate_limit_run_per_window,
         })
     }
 }
@@ -244,6 +290,92 @@ fn parse_u64(value: Option<&String>, default: u64, key: &'static str) -> Result<
             message: format!("{} must be an integer", key),
         }),
     }
+}
+
+fn parse_u32(value: Option<&String>, default: u32, key: &'static str) -> Result<u32, StartupError> {
+    match value {
+        None => Ok(default),
+        Some(v) if v.trim().is_empty() => Ok(default),
+        Some(v) => v.parse::<u32>().map_err(|_| StartupError {
+            code: "ERR_INVALID_CONFIG",
+            message: format!("{} must be an integer", key),
+        }),
+    }
+}
+
+fn default_plan_params() -> serde_json::Value {
+    serde_json::json!({})
+}
+
+fn default_max_refs() -> usize {
+    2
+}
+
+pub fn default_baseline_plan() -> Vec<BaselinePlanStep> {
+    vec![
+        BaselinePlanStep::Operator {
+            op_name: "list_versions".to_string(),
+            params: serde_json::json!({ "object_id": "public/public_1.txt" }),
+        },
+        BaselinePlanStep::Operator {
+            op_name: "fetch_rows".to_string(),
+            params: serde_json::json!({
+                "view_id": "safe_customer_view_public",
+                "filter_spec": { "customer_id": "cust_public_1" },
+                "fields": ["status", "plan_tier"]
+            }),
+        },
+        BaselinePlanStep::Operator {
+            op_name: "search".to_string(),
+            params: serde_json::json!({ "query": "$query", "limit": 5 }),
+        },
+        BaselinePlanStep::SearchRefFetchSpan { max_refs: 2 },
+    ]
+}
+
+fn parse_baseline_plan(value: Option<&String>) -> Result<Vec<BaselinePlanStep>, StartupError> {
+    let Some(raw) = value.map(|s| s.trim()).filter(|s| !s.is_empty()) else {
+        return Ok(default_baseline_plan());
+    };
+
+    let plan = serde_json::from_str::<Vec<BaselinePlanStep>>(raw).map_err(|_| StartupError {
+        code: "ERR_INVALID_CONFIG",
+        message: "PECR_BASELINE_PLAN must be valid JSON plan array".to_string(),
+    })?;
+
+    if plan.is_empty() {
+        return Err(StartupError {
+            code: "ERR_INVALID_CONFIG",
+            message: "PECR_BASELINE_PLAN must contain at least one step".to_string(),
+        });
+    }
+
+    for step in &plan {
+        match step {
+            BaselinePlanStep::Operator { op_name, .. } => {
+                let op_name = op_name.trim();
+                if op_name.is_empty() {
+                    return Err(StartupError {
+                        code: "ERR_INVALID_CONFIG",
+                        message: "PECR_BASELINE_PLAN operator step requires non-empty op_name"
+                            .to_string(),
+                    });
+                }
+            }
+            BaselinePlanStep::SearchRefFetchSpan { max_refs } => {
+                if *max_refs == 0 {
+                    return Err(StartupError {
+                        code: "ERR_INVALID_CONFIG",
+                        message:
+                            "PECR_BASELINE_PLAN search_ref_fetch_span step requires max_refs > 0"
+                                .to_string(),
+                    });
+                }
+            }
+        }
+    }
+
+    Ok(plan)
 }
 
 fn parse_model_provider(value: Option<&String>) -> Result<ModelProvider, StartupError> {
@@ -456,9 +588,54 @@ mod tests {
     }
 
     #[test]
+    fn non_local_bind_dev_override_requires_shared_secret() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_CONTROLLER_BIND_ADDR".to_string(),
+            "0.0.0.0:8081".to_string(),
+        );
+        env.insert("PECR_DEV_ALLOW_NONLOCAL_BIND".to_string(), "1".to_string());
+        env.insert(
+            "PECR_LOCAL_AUTH_SHARED_SECRET".to_string(),
+            "dev-secret".to_string(),
+        );
+        let cfg = ControllerConfig::from_kv(&env).expect("config should load");
+        assert_eq!(cfg.auth_mode, AuthMode::Local);
+        assert_eq!(cfg.local_auth_shared_secret.as_deref(), Some("dev-secret"));
+    }
+
+    #[test]
     fn invalid_controller_engine_fails() {
         let mut env = minimal_ok_env();
         env.insert("PECR_CONTROLLER_ENGINE".to_string(), "nope".to_string());
+        let err = ControllerConfig::from_kv(&env).unwrap_err();
+        assert_eq!(err.code, "ERR_INVALID_CONFIG");
+    }
+
+    #[test]
+    fn baseline_plan_can_be_overridden_via_config() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_BASELINE_PLAN".to_string(),
+            r#"[
+                {"kind":"operator","op_name":"search","params":{"query":"$query","limit":1}},
+                {"kind":"search_ref_fetch_span","max_refs":1}
+            ]"#
+            .to_string(),
+        );
+
+        let cfg = ControllerConfig::from_kv(&env).expect("config should load");
+        assert_eq!(cfg.baseline_plan.len(), 2);
+    }
+
+    #[test]
+    fn baseline_plan_rejects_invalid_step_values() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_BASELINE_PLAN".to_string(),
+            r#"[{"kind":"search_ref_fetch_span","max_refs":0}]"#.to_string(),
+        );
+
         let err = ControllerConfig::from_kv(&env).unwrap_err();
         assert_eq!(err.code, "ERR_INVALID_CONFIG");
     }

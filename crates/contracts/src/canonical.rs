@@ -101,4 +101,29 @@ mod tests {
             "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
         );
     }
+
+    #[test]
+    fn is_sha256_hex_rejects_uppercase_and_wrong_lengths() {
+        assert!(!is_sha256_hex("ABCDEF"));
+        assert!(!is_sha256_hex(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015a"
+        ));
+        assert!(!is_sha256_hex(
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad00"
+        ));
+    }
+
+    #[test]
+    fn canonical_hash_is_stable_across_key_order_variants() {
+        let a = serde_json::json!({
+            "z": 1,
+            "a": {"y": true, "b": [2, 1]}
+        });
+        let b = serde_json::json!({
+            "a": {"b": [2, 1], "y": true},
+            "z": 1
+        });
+
+        assert_eq!(hash_canonical_json(&a), hash_canonical_json(&b));
+    }
 }
