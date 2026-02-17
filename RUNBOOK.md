@@ -11,7 +11,7 @@ This repo follows the SSOT runbook baseline in `pcdr/spec/12_RUNBOOK.md`.
 ## Deterministic local run
 
 1) Start services:
-- `docker compose up -d`
+- `export PECR_LOCAL_AUTH_SHARED_SECRET='replace-with-random-secret'; docker compose up -d`
 
 Notes:
 - Postgres is exposed on `127.0.0.1:${PECR_POSTGRES_PORT:-55432}` by default (override via `PECR_POSTGRES_PORT`).
@@ -36,6 +36,8 @@ Notes:
 ## Auth modes
 
 Default docker compose uses `PECR_AUTH_MODE=local`.
+- For local auth on non-loopback binds, set `PECR_LOCAL_AUTH_SHARED_SECRET` and send `x-pecr-local-auth-secret` on client requests.
+- Metrics default to auth-required on non-loopback binds (`PECR_METRICS_REQUIRE_AUTH=1`).
 
 OIDC mode (RS256 / JWKS) is available in both gateway and controller:
 - Set `PECR_AUTH_MODE=oidc`
@@ -89,6 +91,22 @@ Suspected injection/tool misuse:
 
 Tail latency regression / wrong terminal modes under faults:
 - Run Suite 7: `bash scripts/perf/suite7.sh`
+
+## Module ownership and coupling checklist
+
+Use this checklist before merging cross-module changes:
+- Controller boundary: `crates/controller` must not directly access ledgers/sources; only gateway HTTP.
+- Gateway policy path: `crates/gateway` policy decisions must flow through OPA + `crates/policy` types.
+- Data ownership: schema or migration changes in `db/init` and `crates/ledger/migrations` require ledger test pass.
+- Contracts first: when payloads change, update `crates/contracts` schemas and keep OpenAPI aligned.
+- Boundary enforcement: run `cargo test -p pecr-boundary-check` if coupling changed.
+
+Operational ownership by area:
+- Orchestration: `crates/controller`
+- Policy runtime: `crates/policy`, `opa/bundle`, policy wiring in `crates/gateway`
+- Data/audit plane: `crates/ledger`, `db/init`, `crates/ledger/migrations`
+- API/contracts: `docs/openapi`, `crates/contracts/schemas`
+- Build/release: `.github/workflows`, `scripts/`
 
 ## Release checklist (repo-local)
 

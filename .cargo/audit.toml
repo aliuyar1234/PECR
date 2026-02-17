@@ -1,0 +1,5 @@
+[advisories]
+# RUSTSEC-2023-0071 (rsa timing side-channel) is currently reported via sqlx's
+# optional MySQL dependency metadata. This workspace only enables sqlx Postgres
+# features, and `cargo tree -i sqlx-mysql` resolves to no reachable edges.
+ignore = ["RUSTSEC-2023-0071"]

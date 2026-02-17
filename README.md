@@ -110,6 +110,7 @@ Prerequisites:
 ### 1) Start the stack
 
 ```bash
+export PECR_LOCAL_AUTH_SHARED_SECRET='replace-with-random-secret'
 docker compose up -d
 ```
 
@@ -121,6 +122,7 @@ Postgres is exposed as `127.0.0.1:${PECR_POSTGRES_PORT:-55432}` (override with `
 curl -sS -X POST http://127.0.0.1:8081/v1/run \
   -H 'content-type: application/json' \
   -H 'x-pecr-principal-id: dev' \
+  -H "x-pecr-local-auth-secret: ${PECR_LOCAL_AUTH_SHARED_SECRET}" \
   -H 'x-pecr-request-id: demo' \
   -d '{"query":"smoke"}'
 ```
@@ -128,10 +130,11 @@ curl -sS -X POST http://127.0.0.1:8081/v1/run \
 PowerShell:
 
 ```powershell
+$env:PECR_LOCAL_AUTH_SHARED_SECRET = "replace-with-random-secret"
 $body = @{ query = "smoke" } | ConvertTo-Json
 Invoke-RestMethod -Method Post `
   -Uri "http://127.0.0.1:8081/v1/run" `
-  -Headers @{ "x-pecr-principal-id"="dev"; "x-pecr-request-id"="demo" } `
+  -Headers @{ "x-pecr-principal-id"="dev"; "x-pecr-local-auth-secret"=$env:PECR_LOCAL_AUTH_SHARED_SECRET; "x-pecr-request-id"="demo" } `
   -ContentType "application/json" `
   -Body $body
 ```
@@ -187,6 +190,7 @@ Gateway (minimum):
 - `PECR_OPA_URL`
 - `PECR_POLICY_BUNDLE_HASH` (64 lowercase hex chars)
 - `PECR_FS_CORPUS_PATH` (defaults to `fixtures/fs_corpus`)
+- `PECR_LOCAL_AUTH_SHARED_SECRET` when using local auth with non-loopback bind
 
 Controller (minimum):
 - `PECR_GATEWAY_URL`
@@ -219,6 +223,7 @@ For the full set of env vars and defaults, see:
 - `PECR_AUTH_MODE=local` (default)
 - Client supplies `x-pecr-principal-id` on requests.
 - Gateway issues an opaque capability token via `x-pecr-session-token` (required for operator calls).
+- When local auth is used with non-loopback bind, clients must also supply `x-pecr-local-auth-secret`.
 
 ### OIDC/JWT mode (production baseline)
 
@@ -255,6 +260,7 @@ OPA returns `{ allow, cacheable, reason, redaction }`. Redaction directives supp
 
 - JSON logs via `tracing` (no raw evidence payloads by default; suites verify canaries do not leak).
 - Prometheus metrics on `/metrics`.
+- Metrics can require auth (`PECR_METRICS_REQUIRE_AUTH=1` for non-loopback binds by default).
 - Optional OTLP traces: set `PECR_OTEL_ENABLED=1` and configure your collector using standard `OTEL_*` environment variables.
 
 ## Quality Gates
@@ -279,6 +285,22 @@ OPA returns `{ allow, cacheable, reason, redaction }`. Redaction directives supp
 - `db/init`: deterministic SQL fixtures and schema init
 - `scripts`: CI + perf harnesses (`scripts/ci.sh`, `scripts/perf/suite7.sh`)
 - `perf/baselines`: perf regression baselines for Suite 7
+
+## Module Boundaries And Ownership
+
+The table below documents intended coupling and change ownership. Boundary rules are enforced by
+`crates/boundary-check` in CI.
+
+| Module | Primary responsibility | Allowed runtime dependencies | Forbidden coupling | Ownership scope |
+|---|---|---|---|---|
+| `crates/controller` | Non-privileged orchestration and budget loop | `crates/contracts`, `crates/auth`, outbound HTTP to gateway | Direct datastore/source access; direct imports from `gateway`/`ledger` | Orchestration and model-loop maintainers |
+| `crates/gateway` | Privileged policy enforcement, source adapters, evidence emission | `crates/contracts`, `crates/auth`, `crates/ledger`, `crates/policy`, OPA/Postgres/filesystem | Importing controller internals; bypassing OPA decisions for protected actions | Gateway and policy-runtime maintainers |
+| `crates/policy` + `opa/bundle` | Shared policy decision model and policy bundle semantics | `serde`, `serde_json` (crate); OPA/Rego runtime (bundle) | Service-specific transport logic | Policy maintainers |
+| `crates/ledger` + `db/init` + `crates/ledger/migrations` | Append-only audit/runtime persistence and schema evolution | Postgres/sqlx | Embedding gateway/controller policy logic in SQL paths | Data/audit maintainers |
+| `crates/contracts` | Canonical schemas, hashing/canonicalization, API invariants | Schema JSON + serde types | Runtime side effects, IO logic | Contracts/API maintainers |
+| `scripts/*` + workflows | CI, perf, security, release automation | Workspace CLI + Docker | Silent policy bypasses or untracked gate changes | Build/release maintainers |
+
+Cross-module changes should be split by concern: contracts first, runtime second, docs/runbook third.
 
 ## Development
 

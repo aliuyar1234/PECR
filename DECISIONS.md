@@ -17,3 +17,20 @@ The SSOT spec pack and its decision log live in the sibling repo `pcdr`.
 **SSOT references**
 - SSOT decision: `pcdr/DECISIONS.md` (D-0007)
 - SSOT security requirements: `pcdr/spec/06_SECURITY_AND_THREAT_MODEL.md` (Sandboxing and egress controls; RLM optional)
+
+## D-0002 â€” Explicit module ownership and boundary map
+
+**Decision**
+- Adopt an explicit module ownership and coupling map in `README.md` and `RUNBOOK.md`.
+- Treat `crates/policy` as the shared policy decision contract between OPA responses and gateway enforcement code.
+- Keep controller/gateway separation as a hard architectural boundary, with `crates/boundary-check` as CI enforcement.
+
+**Why**
+- Reduce ambiguity around cross-module edits and ownership handoffs.
+- Prevent accidental architectural drift where policy/data concerns leak into the wrong runtime.
+- Improve incident response speed by clarifying who owns each domain when regressions occur.
+
+**Affected areas**
+- `README.md` (module boundaries and ownership table)
+- `RUNBOOK.md` (coupling checklist and operational ownership map)
+- `crates/policy` (shared policy decision types and redaction parsing)

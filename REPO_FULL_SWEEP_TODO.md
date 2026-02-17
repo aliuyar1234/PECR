@@ -89,3 +89,17 @@ This checklist captures every issue identified in the full repository analysis.
 
 - [x] Re-run Docker stack + integration validation after fixes (`docker compose`, `/readyz`, `e2e_smoke`, ledger migrations tests, `scripts/ci.sh`) to confirm no runtime regressions remain.
   Refs: `docker-compose.yml`, `crates/e2e_smoke/tests/smoke.rs`, `crates/ledger/tests/migrations.rs`, `scripts/ci.sh`
+
+## Post-Pentest Remediation (2026-02-17)
+
+- [x] Fix controller compile regression introduced during local-auth hardening (`apply_gateway_auth` callsite argument mismatch in orchestration flow).
+  Refs: `crates/controller/src/http/orchestration.rs`, `crates/controller/src/http.rs`
+
+- [x] Upgrade vulnerable dependency paths and regenerate lockfile (`sqlx` line to 0.8.x, `prometheus` 0.14 without default features, `time` transitive refresh to 0.3.47).
+  Refs: `crates/gateway/Cargo.toml`, `crates/controller/Cargo.toml`, `crates/ledger/Cargo.toml`, `crates/e2e_smoke/Cargo.toml`, `Cargo.lock`
+
+- [x] Add explicit RustSec audit policy for non-fixable/unreachable advisory path (`RUSTSEC-2023-0071` via optional `sqlx-mysql` metadata edge).
+  Refs: `.cargo/audit.toml`
+
+- [x] Run critical live pentest checks against Docker stack: local-auth secret enforcement, metrics auth gating, rate-limit enforcement, token/session mismatch rejection, path traversal rejection, SQL injection probe, OPA outage fail-closed behavior.
+  Refs: `crates/gateway/src/http.rs`, `crates/controller/src/http.rs`, `crates/gateway/src/config.rs`, `crates/controller/src/config.rs`, `docker-compose.yml`
