@@ -89,8 +89,11 @@ pub struct SessionRuntimeRecord {
 impl LedgerWriter {
     pub async fn connect(db_url: &str, write_timeout: Duration) -> Result<Self, LedgerError> {
         let pool = tokio::time::timeout(
-            Duration::from_secs(2),
-            PgPoolOptions::new().max_connections(8).connect(db_url),
+            Duration::from_secs(15),
+            PgPoolOptions::new()
+                .max_connections(8)
+                .acquire_timeout(Duration::from_secs(10))
+                .connect(db_url),
         )
         .await
         .map_err(|_| LedgerError::Timeout)??;
@@ -111,7 +114,7 @@ impl LedgerWriter {
     }
 
     pub async fn migrate(&self) -> Result<(), LedgerError> {
-        tokio::time::timeout(Duration::from_secs(10), migrate(&self.pool))
+        tokio::time::timeout(Duration::from_secs(30), migrate(&self.pool))
             .await
             .map_err(|_| LedgerError::Timeout)??;
         Ok(())

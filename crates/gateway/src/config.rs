@@ -155,7 +155,7 @@ impl GatewayConfig {
 
         let ledger_write_timeout_ms = parse_u64(
             kv.get("PECR_LEDGER_WRITE_TIMEOUT_MS"),
-            500,
+            2000,
             "PECR_LEDGER_WRITE_TIMEOUT_MS",
         )?;
 

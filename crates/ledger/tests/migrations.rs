@@ -192,7 +192,7 @@ async fn ledger_event_payload_hash_verifies() {
 
     let writer = pecr_ledger::LedgerWriter::connect_and_migrate(
         &schema_url,
-        std::time::Duration::from_millis(500),
+        std::time::Duration::from_millis(2000),
     )
     .await
     .expect("ledger writer init should succeed");
@@ -305,7 +305,7 @@ async fn session_runtime_round_trip() {
 
     let writer = pecr_ledger::LedgerWriter::connect_and_migrate(
         &schema_url,
-        std::time::Duration::from_millis(500),
+        std::time::Duration::from_millis(2000),
     )
     .await
     .expect("ledger writer init should succeed");
