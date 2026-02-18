@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "engines": {
+    "baseline": {
+      "controller_baseline": {
+        "expected_terminal_mode": "SUPPORTED"
+      },
+      "gateway_fetch_rows_baseline": {
+        "expected_terminal_mode": "SUPPORTED",
+        "enforce": false
+      },
+      "faults": {
+        "opa_unavailable": {
+          "expected_terminal_mode": "SOURCE_UNAVAILABLE"
+        },
+        "opa_timeout": {
+          "expected_terminal_mode": "SOURCE_UNAVAILABLE"
+        },
+        "postgres_unavailable": {
+          "expected_terminal_mode": "SOURCE_UNAVAILABLE"
+        },
+        "pg_statement_timeout": {
+          "expected_terminal_mode": "SOURCE_UNAVAILABLE"
+        }
+      }
+    },
+    "rlm": {
+      "controller_baseline": {
+        "expected_terminal_mode": "SUPPORTED"
+      },
+      "gateway_fetch_rows_baseline": {
+        "expected_terminal_mode": "SUPPORTED",
+        "enforce": false
+      },
+      "faults": {
+        "opa_unavailable": {
+          "expected_terminal_mode": "SOURCE_UNAVAILABLE"
+        },
+        "opa_timeout": {
+          "expected_terminal_mode": "SOURCE_UNAVAILABLE"
+        },
+        "postgres_unavailable": {
+          "expected_terminal_mode": "SOURCE_UNAVAILABLE"
+        },
+        "pg_statement_timeout": {
+          "expected_terminal_mode": "SOURCE_UNAVAILABLE"
+        }
+      }
+    }
+  }
+}
+

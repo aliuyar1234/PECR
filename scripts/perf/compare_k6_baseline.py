@@ -165,37 +165,6 @@ def main() -> int:
     else:
         print("throughput floor: skipped (http_reqs.rate missing)")
 
-    alarm = {
-        "label": args.alarm_label,
-        "baseline_file": str(baseline_path),
-        "current_file": str(current_path),
-        "baseline": {"p90_ms": base_p90, "p95_ms": base_p95, "p99_ms": base_p99, "rate": base_rate},
-        "current": {"p90_ms": cur_p90, "p95_ms": cur_p95, "p99_ms": cur_p99, "rate": cur_rate},
-        "thresholds": {
-            "p90_ms": allow_p90,
-            "p95_ms": allow_p95,
-            "p99_ms": allow_p99,
-            "min_rate": min_allowed_rate,
-            "p90_factor": p90_factor,
-            "p95_factor": p95_factor,
-            "p99_factor": p99_factor,
-            "abs_ms": abs_ms,
-            "min_rate_factor": min_rate_factor,
-            "rate_abs_drop": rate_abs_drop,
-        },
-        "checks": {
-            "p90_ok": ok_p90,
-            "p95_ok": ok_p95,
-            "p99_ok": ok_p99,
-            "rate_ok": ok_rate,
-        },
-    }
-
-    if args.output_json.strip():
-        output_path = Path(args.output_json)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(json.dumps(alarm, indent=2) + "\n", encoding="utf-8")
-
     emit_annotations = args.github_annotations or os.environ.get("GITHUB_ACTIONS", "").lower() == "true"
     failed_checks: list[str] = []
 
@@ -234,6 +203,39 @@ def main() -> int:
                     f"({current_path})."
                 ),
             )
+
+    alarm = {
+        "label": args.alarm_label,
+        "baseline_file": str(baseline_path),
+        "current_file": str(current_path),
+        "baseline": {"p90_ms": base_p90, "p95_ms": base_p95, "p99_ms": base_p99, "rate": base_rate},
+        "current": {"p90_ms": cur_p90, "p95_ms": cur_p95, "p99_ms": cur_p99, "rate": cur_rate},
+        "thresholds": {
+            "p90_ms": allow_p90,
+            "p95_ms": allow_p95,
+            "p99_ms": allow_p99,
+            "min_rate": min_allowed_rate,
+            "p90_factor": p90_factor,
+            "p95_factor": p95_factor,
+            "p99_factor": p99_factor,
+            "abs_ms": abs_ms,
+            "min_rate_factor": min_rate_factor,
+            "rate_abs_drop": rate_abs_drop,
+        },
+        "checks": {
+            "p90_ok": ok_p90,
+            "p95_ok": ok_p95,
+            "p99_ok": ok_p99,
+            "rate_ok": ok_rate,
+        },
+        "failed_checks": failed_checks,
+        "status": "PASS" if not failed_checks else "FAIL",
+    }
+
+    if args.output_json.strip():
+        output_path = Path(args.output_json)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_path.write_text(json.dumps(alarm, indent=2) + "\n", encoding="utf-8")
 
     if not failed_checks:
         print("perf regression gate: PASS")

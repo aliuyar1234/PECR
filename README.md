@@ -28,20 +28,20 @@ PECR is an AI runtime with two orchestration paths (baseline and RLM), wrapped b
 flowchart LR
     Client["Client / Agent UI"]
 
-    subgraph AIPlane["AI Execution Plane (Non-Privileged)"]
+    subgraph AIPlane["AI Execution Plane - Non Privileged"]
       Controller["PECR Controller API"]
       Baseline["Baseline Planner Loop"]
-      RLM["RLM Planner Bridge<br/>(vendored upstream rlm)"]
+      RLM["RLM Planner Bridge (vendored upstream rlm)"]
       Scheduler["Budget Scheduler + Batch Executor"]
       Replay["Replay Store + Evaluation APIs"]
     end
 
-    subgraph Governance["Policy + Evidence Plane (Privileged)"]
+    subgraph Governance["Policy + Evidence Plane - Privileged"]
       Gateway["PECR Gateway"]
       OPA["OPA Policy Engine"]
       Evidence["Redaction + Evidence Builder"]
       Finalize["Claim-Evidence Finalize Gate"]
-      Ledger[("Append-Only Ledger")]
+      Ledger["Append-Only Ledger"]
     end
 
     subgraph SoR["Systems of Record"]
@@ -116,7 +116,7 @@ Controller:
 - `GET /v1/evaluations/{evaluation_id}`
 - `GET /v1/evaluations/scorecards`
 
-## Quickstart (Local)
+## 5-Minute Fast Start (Local)
 
 ### Prerequisites
 
@@ -126,14 +126,30 @@ Controller:
 
 ### 1) Start the stack
 
+Bash:
+
 ```bash
-export PECR_LOCAL_AUTH_SHARED_SECRET='replace-with-random-secret'
-docker compose up -d
+export PECR_LOCAL_AUTH_SHARED_SECRET='pecr-dev-local-secret'
+docker compose up -d --build
 ```
 
-Postgres is exposed on `127.0.0.1:${PECR_POSTGRES_PORT:-55432}`.
+PowerShell:
 
-### 2) Run a smoke request
+```powershell
+$env:PECR_LOCAL_AUTH_SHARED_SECRET='pecr-dev-local-secret'
+docker compose up -d --build
+```
+
+Postgres is exposed on `127.0.0.1:${PECR_POSTGRES_PORT:-55432}` by default.
+
+### 2) Verify health endpoints
+
+```bash
+curl -fsS http://127.0.0.1:8080/healthz
+curl -fsS http://127.0.0.1:8081/healthz
+```
+
+### 3) Run a smoke request
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8081/v1/run \
@@ -144,19 +160,40 @@ curl -sS -X POST http://127.0.0.1:8081/v1/run \
   -d '{"query":"smoke"}'
 ```
 
-### 3) Run local quality gates
+### 4) Run local quality + perf smoke
 
 ```bash
 PECR_TEST_DB_URL=postgres://pecr:pecr@localhost:55432/pecr bash scripts/ci.sh
-```
-
-### 4) Run perf and fault harness
-
-```bash
-bash scripts/perf/suite7.sh
+SUITE7_SKIP_FAULTS=1 bash scripts/perf/suite7.sh
 ```
 
 Outputs: `target/perf/`
+
+## Baseline vs RLM Execution Paths
+
+| Path | Engine | Enablement | Typical use |
+|---|---|---|---|
+| Baseline | `baseline` | Default (`PECR_CONTROLLER_ENGINE` unset or `baseline`) | Deterministic default production path |
+| RLM | `rlm` | `PECR_CONTROLLER_ENGINE=rlm` and `PECR_RLM_SANDBOX_ACK=1` (controller built with `--features rlm`) | Higher-capability planning with adaptive/batch controls |
+
+Perf harness commands:
+
+```bash
+# Baseline
+bash scripts/perf/suite7.sh
+
+# RLM baseline matrix lane
+PECR_CONTROLLER_ENGINE_OVERRIDE=rlm \
+PECR_RLM_SANDBOX_ACK=1 \
+SUITE7_SKIP_FAULTS=1 \
+CONTROLLER_BASELINE_SUMMARY_NAME=suite7_rlm_baseline.summary.json \
+GATEWAY_BASELINE_SUMMARY_NAME=suite7_rlm_gateway_baseline.summary.json \
+METRICS_GATES_FILE=target/perf/suite7_rlm_metrics_gates.json \
+bash scripts/perf/suite7.sh
+```
+
+Suite7 expectations are versioned in `perf/config/suite7_expectations.v1.json`.
+Terminal-mode assertions are explicit opt-in via `SUITE7_ENFORCE_TERMINAL_MODE_ASSERTIONS=1`.
 
 ## Replay and Evaluation Tooling
 
@@ -238,6 +275,16 @@ Operational runbook: `RUNBOOK.md`
 - Release provenance and attestation verification in release workflow.
 - Artifact provenance policy: `docs/standards/ARTIFACT_PROVENANCE_POLICY.md`
 
+## Operator Troubleshooting (CI/Perf/Release)
+
+| Symptom | Inspect first | Operator action |
+|---|---|---|
+| Perf gate fails in CI | `artifacts/perf/perf_failure_reasons.json`, `artifacts/perf/benchmark_matrix.md` | Re-run `scripts/perf/suite7.sh` locally, compare against `perf/baselines/suite7_baseline.summary.json`, and review `failed_checks`/`failure_reasons` artifacts. |
+| Release publish fails while fetching artifacts | Release job step `Fetch release artifacts with retry/backoff and validate checksums` | Re-run release via `workflow_dispatch` using `mode=republish`, `tag=<release-tag>`, and `source_run_id=<previous-run-id>`. |
+| Release attestation verification fails | `scripts/security/verify_release_attestations.py` output in release logs | Re-run dispatch with correct `source_ref` for the artifact-producing run (for tag-triggered runs, use `refs/tags/<tag>`). |
+| Post-release smoke check fails | `scripts/security/release_smoke_check.py` logs | Verify `release/SHA256SUMS.txt`, `release/image-digests.txt`, and GH release assets; then republish from existing artifacts after correcting manifest/asset mismatch. |
+| Terminal-mode assertions are noisy | `perf/config/suite7_expectations.v1.json` + Suite7 env in CI | Keep mode assertions opt-in (`SUITE7_ENFORCE_TERMINAL_MODE_ASSERTIONS=0` by default) and only enable when validating mode-specific behavior. |
+
 ## Repository Layout
 
 - `crates/controller`: non-privileged orchestration and budget scheduler
@@ -259,17 +306,24 @@ cargo test --workspace
 bash scripts/ci.sh
 ```
 
-## Documentation Map
+## Docs Index
 
 - Architecture:
   - `docs/architecture/controller_state_machine.md`
   - `docs/architecture/request_path_blocking_audit.md`
-- Standards:
-  - `docs/standards/POLICY_SIMULATION_CONTRACT.md`
-  - `docs/standards/ROLLOUT_CONTROL_PLANE_CONTRACT.md`
-  - `docs/standards/OBSERVABILITY_STACK_TARGET.md`
+- Runbook:
+  - `RUNBOOK.md`
+- Replay/Eval:
+  - `scripts/replay/replay_eval_cli.py`
+  - `scripts/replay/regression_gate.py`
   - `docs/standards/REPLAY_PERSISTENCE_MODEL.md`
   - `docs/standards/EVALUATION_DATA_LIFECYCLE.md`
+- Release:
+  - `.github/workflows/release.yml`
+  - `scripts/security/verify_release_attestations.py`
+  - `scripts/security/release_smoke_check.py`
   - `docs/standards/ARTIFACT_PROVENANCE_POLICY.md`
-- Guardrails:
+- Operability and quality:
+  - `RUNBOOK.md`
+  - `docs/observability/README.md`
   - `docs/enterprise/QUALITY_GUARDRAILS.md`

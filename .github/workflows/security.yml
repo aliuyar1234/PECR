@@ -73,7 +73,8 @@ jobs:
         run: |
           python3 -m py_compile \
             scripts/security/check_image_tags.py \
-            scripts/security/verify_release_attestations.py
+            scripts/security/verify_release_attestations.py \
+            scripts/security/release_smoke_check.py
 
       - name: Upload Trivy JSON
         if: always()

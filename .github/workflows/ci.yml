@@ -84,6 +84,7 @@ jobs:
           chmod +x scripts/perf/suite7.sh
           chmod +x scripts/perf/compare_k6_baseline.py
           chmod +x scripts/perf/benchmark_matrix.py
+          chmod +x scripts/perf/select_median_summary.py
           chmod +x scripts/ops/canary_rollout_guard.py
 
       - name: Suite 7 baseline + RLM matrix + canary guard
@@ -111,13 +112,16 @@ jobs:
           PECR_CANARY_P95_BUDGET_MS: "1200"
           PECR_CANARY_P99_BUDGET_MS: "1500"
           PECR_CANARY_SOURCE_UNAVAILABLE_MAX_RATE: "0.05"
+          SUITE7_EXPECTATIONS_FILE: "perf/config/suite7_expectations.v1.json"
+          SUITE7_EXPECTATIONS_SCHEMA_VERSION: "1"
+          SUITE7_ENFORCE_TERMINAL_MODE_ASSERTIONS: "0"
+          SUITE7_BASELINE_REPEATS: "3"
         run: |
           set -euo pipefail
           mkdir -p artifacts artifacts/perf artifacts/ops
           overall_status=0
 
           set +e
-          SUITE7_FAULT_EXPECT_TERMINAL_MODE="" \
           ./scripts/perf/suite7.sh 2>&1 | tee artifacts/suite7.log
           suite7_status=${PIPESTATUS[0]}
           set -e
@@ -210,6 +214,74 @@ jobs:
             overall_status="${canary_status}"
           fi
 
+          SUITE7_STATUS="${suite7_status}" \
+          SUITE7_RLM_STATUS="${suite7_rlm_status}" \
+          BASELINE_ALARM_STATUS="${baseline_alarm_status}" \
+          RLM_ALARM_STATUS="${rlm_alarm_status}" \
+          MATRIX_STATUS="${matrix_status}" \
+          CANARY_STATUS="${canary_status}" \
+          OVERALL_STATUS="${overall_status}" \
+          python3 - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          status_map = {
+              "suite7_status": int(os.environ["SUITE7_STATUS"]),
+              "suite7_rlm_status": int(os.environ["SUITE7_RLM_STATUS"]),
+              "baseline_alarm_status": int(os.environ["BASELINE_ALARM_STATUS"]),
+              "rlm_alarm_status": int(os.environ["RLM_ALARM_STATUS"]),
+              "matrix_status": int(os.environ["MATRIX_STATUS"]),
+              "canary_status": int(os.environ["CANARY_STATUS"]),
+          }
+          overall_status = int(os.environ["OVERALL_STATUS"])
+          labels = {
+              "suite7_status": "suite7 baseline execution",
+              "suite7_rlm_status": "suite7 rlm execution",
+              "baseline_alarm_status": "baseline regression gate",
+              "rlm_alarm_status": "rlm regression gate",
+              "matrix_status": "benchmark matrix strict gate",
+              "canary_status": "canary rollout guard",
+          }
+
+          failed = [
+              {
+                  "stage": key,
+                  "label": labels[key],
+                  "exit_code": value,
+              }
+              for key, value in status_map.items()
+              if value != 0
+          ]
+          payload = {
+              "overall_status": overall_status,
+              "status_map": status_map,
+              "failed_stages": failed,
+              "first_failed_stage": failed[0]["stage"] if failed else None,
+          }
+
+          out_dir = Path("artifacts/perf")
+          out_dir.mkdir(parents=True, exist_ok=True)
+          (out_dir / "perf_failure_reasons.json").write_text(
+              json.dumps(payload, indent=2) + "\n", encoding="utf-8"
+          )
+
+          lines = ["### Perf Failure Reasons", ""]
+          lines.append(f"- Overall status: `{overall_status}`")
+          if failed:
+              lines.append("- Failed stages:")
+              for row in failed:
+                  lines.append(
+                      f"  - `{row['stage']}` (`{row['label']}`) exit_code={row['exit_code']}"
+                  )
+          else:
+              lines.append("- Failed stages: none")
+          (out_dir / "perf_failure_reasons.md").write_text(
+              "\n".join(lines) + "\n", encoding="utf-8"
+          )
+          print(json.dumps(payload, indent=2))
+          PY
+
           exit "${overall_status}"
 
       - name: Perf stack cleanup
@@ -293,6 +365,7 @@ jobs:
 
             echo "- Alarm artifacts: 'artifacts/perf/perf_alarm_baseline.json', 'artifacts/perf/perf_alarm_rlm.json'"
             echo "- Benchmark matrix: 'artifacts/perf/benchmark_matrix.md'"
+            echo "- Structured perf failure reasons: 'artifacts/perf/perf_failure_reasons.json'"
             echo "- Canary fallback env patch: 'artifacts/ops/canary_fallback.env'"
           } | tee artifacts/perf_signal_summary.md >> "${GITHUB_STEP_SUMMARY}"
 

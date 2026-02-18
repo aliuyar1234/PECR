@@ -41,6 +41,10 @@ CI also enforces RLM verification via `scripts/rlm/verify_vendor_rlm.py` inside 
 
 - `bash scripts/perf/suite7.sh`
 - Outputs: `target/perf/` (k6 summaries + metric snapshots)
+- Versioned expectations config: `perf/config/suite7_expectations.v1.json`
+- Optional stability knobs:
+  - `SUITE7_BASELINE_REPEATS=3` (median-of-N baseline selection)
+  - `SUITE7_ENFORCE_TERMINAL_MODE_ASSERTIONS=1` (opt-in mode assertions)
 - Baseline-vs-RLM matrix (CI-equivalent):
   - `PECR_CONTROLLER_ENGINE_OVERRIDE=rlm PECR_RLM_SANDBOX_ACK=1 SUITE7_SKIP_FAULTS=1 CONTROLLER_BASELINE_SUMMARY_NAME=suite7_rlm_baseline.summary.json GATEWAY_BASELINE_SUMMARY_NAME=suite7_rlm_gateway_baseline.summary.json METRICS_GATES_FILE=target/perf/suite7_rlm_metrics_gates.json bash scripts/perf/suite7.sh`
   - `python3 scripts/perf/compare_k6_baseline.py --baseline perf/baselines/suite7_baseline.summary.json --current target/perf/suite7_rlm_baseline.summary.json --alarm-label rlm --output-json target/perf/perf_alarm_rlm.json`
@@ -202,9 +206,26 @@ The blocking gate runs:
 
 Manual operator invocation (for incident triage or re-verification in CI jobs):
 - `python3 scripts/security/verify_release_attestations.py --release-dir release --repo <owner/repo> --signer-workflow <owner/repo/.github/workflows/release.yml> --source-ref <refs/tags/vX.Y.Z>`
+- `python3 scripts/security/release_smoke_check.py --release-dir release --repo <owner/repo> --tag <vX.Y.Z>`
+
+Workflow dispatch republish path (no retag required):
+- Trigger `.github/workflows/release.yml` with:
+  - `mode=republish`
+  - `tag=<vX.Y.Z>`
+  - `source_run_id=<existing-release-run-id>`
+  - Optional: `source_ref` (defaults to `refs/tags/<tag>`)
 
 Policy reference:
 - `docs/standards/ARTIFACT_PROVENANCE_POLICY.md`
+
+## CI/Perf/Release troubleshooting quick table
+
+| Symptom | Inspect | First action |
+|---|---|---|
+| Perf job fails unexpectedly | `artifacts/perf/perf_failure_reasons.json` and `artifacts/perf/benchmark_matrix.md` | Reproduce with `bash scripts/perf/suite7.sh`; compare generated summaries against `perf/baselines/suite7_baseline.summary.json`. |
+| Release publish fails after successful builds | `Fetch release artifacts with retry/backoff and validate checksums` step in release workflow | Re-run release workflow with `mode=republish` and `source_run_id` from the successful artifact-producing run. |
+| Release provenance check fails | `Verify release provenance attestations` logs | Ensure `source_ref` matches the artifact-producing run and rerun dispatch with corrected `source_ref`. |
+| Post-release smoke check fails | `Post-release smoke check` logs | Verify GH release assets, `SHA256SUMS.txt`, and `image-digests.txt` consistency, then republish from existing artifacts. |
 
 ## Release checklist (repo-local)
 

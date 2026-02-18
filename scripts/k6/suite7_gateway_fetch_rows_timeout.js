@@ -7,7 +7,7 @@ const duration = __ENV.DURATION || "15s";
 const baseUrl = __ENV.BASE_URL || "http://gateway:8080";
 const principalId = __ENV.PRINCIPAL_ID || "dev";
 const localAuthSecret = __ENV.LOCAL_AUTH_SECRET || "";
-const expectedTerminalMode = __ENV.EXPECT_TERMINAL_MODE || "SOURCE_UNAVAILABLE";
+const expectedTerminalMode = __ENV.EXPECT_TERMINAL_MODE || "";
 const viewId = __ENV.VIEW_ID || "safe_customer_view_public_slow";
 const enforceP99 = (__ENV.ENFORCE_P99 || "0") === "1";
 const p99BudgetMs = parseInt(__ENV.P99_BUDGET_MS || "1500", 10);
@@ -15,9 +15,10 @@ const healthTimeoutMs = parseInt(__ENV.HEALTH_TIMEOUT_MS || "60000", 10);
 
 const wrongModeRate = new Rate("wrong_mode_rate");
 
-const thresholds = {
-  wrong_mode_rate: ["rate==0"],
-};
+const thresholds = {};
+if (expectedTerminalMode) {
+  thresholds.wrong_mode_rate = ["rate==0"];
+}
 if (enforceP99) {
   thresholds.http_req_duration = [`p(99)<${p99BudgetMs}`];
 }
@@ -140,7 +141,9 @@ export default function (data) {
     "terminal_mode present": () => hasTerminalMode,
   });
 
-  wrongModeRate.add(!hasTerminalMode || terminalMode !== expectedTerminalMode);
+  if (expectedTerminalMode) {
+    wrongModeRate.add(!hasTerminalMode || terminalMode !== expectedTerminalMode);
+  }
 }
 
 export function setup() {

@@ -208,6 +208,16 @@ def main() -> int:
             "rate_abs_drop": rate_abs_drop,
         },
         "rows": rows,
+        "failure_reasons": [
+            {
+                "label": row["label"],
+                "path": row["path"],
+                "status": row["status"],
+                "checks": row.get("checks", {}),
+            }
+            for row in rows
+            if row.get("status") != "PASS"
+        ],
     }
 
     output_json = Path(args.output_json)
