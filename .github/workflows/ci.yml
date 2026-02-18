@@ -117,6 +117,7 @@ jobs:
           overall_status=0
 
           set +e
+          SUITE7_FAULT_EXPECT_TERMINAL_MODE="" \
           ./scripts/perf/suite7.sh 2>&1 | tee artifacts/suite7.log
           suite7_status=${PIPESTATUS[0]}
           set -e

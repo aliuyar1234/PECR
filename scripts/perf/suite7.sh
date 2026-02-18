@@ -23,6 +23,8 @@ PECR_RLM_SANDBOX_ACK="${PECR_RLM_SANDBOX_ACK:-1}"
 CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE="${CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE:-}"
 RLM_BASELINE_EXPECT_TERMINAL_MODE="${RLM_BASELINE_EXPECT_TERMINAL_MODE:-}"
 SUITE7_ENFORCE_GATEWAY_FETCH_ROWS="${SUITE7_ENFORCE_GATEWAY_FETCH_ROWS:-0}"
+SUITE7_FAULT_EXPECT_TERMINAL_MODE="${SUITE7_FAULT_EXPECT_TERMINAL_MODE:-SOURCE_UNAVAILABLE}"
+SUITE7_FAULT_GATEWAY_EXPECT_TERMINAL_MODE="${SUITE7_FAULT_GATEWAY_EXPECT_TERMINAL_MODE:-${SUITE7_FAULT_EXPECT_TERMINAL_MODE}}"
 export PECR_LOCAL_AUTH_SHARED_SECRET
 
 OUT_DIR="target/perf"
@@ -260,20 +262,20 @@ if [[ "${SUITE7_SKIP_FAULTS}" == "1" ]]; then
 else
   echo "[suite7] fault: opa unavailable"
   retry_cmd docker_compose stop opa
-  run_k6_controller "suite7_fault_opa_unavailable" "SOURCE_UNAVAILABLE" "0"
+  run_k6_controller "suite7_fault_opa_unavailable" "${SUITE7_FAULT_EXPECT_TERMINAL_MODE}" "0"
   retry_cmd docker_compose start opa
   wait_for_http "gateway" "http://127.0.0.1:8080/healthz"
 
   echo "[suite7] fault: opa timeout"
   retry_cmd docker_compose --profile faults up -d --force-recreate opa_blackhole
   PECR_OPA_URL="http://opa_blackhole:8181" PECR_OPA_TIMEOUT_MS="50" recreate_gateway
-  run_k6_controller "suite7_fault_opa_timeout" "SOURCE_UNAVAILABLE" "0"
+  run_k6_controller "suite7_fault_opa_timeout" "${SUITE7_FAULT_EXPECT_TERMINAL_MODE}" "0"
   recreate_gateway
   retry_cmd docker_compose --profile faults stop opa_blackhole
 
   echo "[suite7] fault: postgres unavailable"
   retry_cmd docker_compose stop postgres
-  run_k6_controller "suite7_fault_postgres_unavailable" "SOURCE_UNAVAILABLE" "0"
+  run_k6_controller "suite7_fault_postgres_unavailable" "${SUITE7_FAULT_EXPECT_TERMINAL_MODE}" "0"
   retry_cmd docker_compose start postgres
   wait_for_postgres
   ensure_safeview_fixtures
@@ -283,7 +285,7 @@ else
   PECR_PG_SAFEVIEW_QUERY_TIMEOUT_MS="5" recreate_gateway
   run_k6_gateway_fetch_rows_checked \
     "suite7_fault_pg_statement_timeout" \
-    "SOURCE_UNAVAILABLE" \
+    "${SUITE7_FAULT_GATEWAY_EXPECT_TERMINAL_MODE}" \
     "safe_customer_view_public_slow" \
     "0" \
     "$GATEWAY_P99_BUDGET_MS"
