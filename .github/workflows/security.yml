@@ -55,7 +55,7 @@ jobs:
           path: sbom.cdx.json
           if-no-files-found: error
 
-      - name: Trivy filesystem scan (vuln budget: no HIGH/CRITICAL)
+      - name: "Trivy filesystem scan (vuln budget: no HIGH/CRITICAL)"
         uses: aquasecurity/trivy-action@0.28.0
         with:
           scan-type: fs

@@ -225,38 +225,39 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts
           baseline_summary_file="target/perf/suite7_baseline.summary.json"
+          # shellcheck disable=SC2006
 
           {
             echo "### Suite 7 Performance Signal (Baseline + RLM)"
             echo
             if [[ -f "${baseline_summary_file}" ]]; then
-              python3 - <<'PY'
-import json
-from pathlib import Path
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
 
-def print_summary(path_str: str, label: str) -> None:
-    path = Path(path_str)
-    if not path.exists():
-        print(f"- `{label}` summary missing: `{path_str}`")
-        return
-    data = json.loads(path.read_text(encoding="utf-8"))
-    metrics = data.get("metrics", {})
-    dur = metrics.get("http_req_duration", {})
-    p95 = dur.get("p(95)", "n/a")
-    p99 = dur.get("p(99)", "n/a")
-    print(f"- `{label}` p95: {p95}")
-    print(f"- `{label}` p99: {p99}")
+          def print_summary(path_str: str, label: str) -> None:
+              path = Path(path_str)
+              if not path.exists():
+                  print(f"- `{label}` summary missing: `{path_str}`")
+                  return
+              data = json.loads(path.read_text(encoding="utf-8"))
+              metrics = data.get("metrics", {})
+              dur = metrics.get("http_req_duration", {})
+              p95 = dur.get("p(95)", "n/a")
+              p99 = dur.get("p(99)", "n/a")
+              print(f"- `{label}` p95: {p95}")
+              print(f"- `{label}` p99: {p99}")
 
-print_summary("target/perf/suite7_baseline.summary.json", "baseline")
-print_summary("target/perf/suite7_rlm_baseline.summary.json", "rlm")
-PY
+          print_summary("target/perf/suite7_baseline.summary.json", "baseline")
+          print_summary("target/perf/suite7_rlm_baseline.summary.json", "rlm")
+          PY
             else
               echo "- Summary JSON: missing (`target/perf/suite7_baseline.summary.json`)"
               echo "::warning::Missing Suite 7 summary JSON (target/perf/suite7_baseline.summary.json)"
             fi
 
             if [[ -f artifacts/perf_regression.log ]] && grep -q "perf regression gate: FAIL" artifacts/perf_regression.log; then
-              echo "- Baseline regression gate: FAILED (see \`artifacts/perf_regression.log\`)"
+              echo "- Baseline regression gate: FAILED (see 'artifacts/perf_regression.log')"
               echo "::error title=Performance regression detected::Baseline regression gate failed. See artifacts/perf_regression.log."
             elif [[ -f artifacts/perf_regression.log ]]; then
               echo "- Baseline regression gate: passed"
@@ -266,7 +267,7 @@ PY
             fi
 
             if [[ -f artifacts/perf_regression_rlm.log ]] && grep -q "perf regression gate: FAIL" artifacts/perf_regression_rlm.log; then
-              echo "- RLM regression gate: FAILED (see \`artifacts/perf_regression_rlm.log\`)"
+              echo "- RLM regression gate: FAILED (see 'artifacts/perf_regression_rlm.log')"
               echo "::error title=RLM regression detected::RLM regression gate failed. See artifacts/perf_regression_rlm.log."
             elif [[ -f artifacts/perf_regression_rlm.log ]]; then
               echo "- RLM regression gate: passed"
@@ -275,23 +276,23 @@ PY
             fi
 
             if [[ -f artifacts/ops/canary_guard.json ]]; then
-              python3 - <<'PY'
-import json
-from pathlib import Path
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
 
-path = Path("artifacts/ops/canary_guard.json")
-data = json.loads(path.read_text(encoding="utf-8"))
-status = data.get("status", "unknown")
-step = data.get("recommended_fallback", {}).get("step", "none")
-print(f"- Canary guard status: {status} (recommended step: {step})")
-PY
+          path = Path("artifacts/ops/canary_guard.json")
+          data = json.loads(path.read_text(encoding="utf-8"))
+          status = data.get("status", "unknown")
+          step = data.get("recommended_fallback", {}).get("step", "none")
+          print(f"- Canary guard status: {status} (recommended step: {step})")
+          PY
             else
               echo "- Canary guard: artifact missing (`artifacts/ops/canary_guard.json`)"
             fi
 
-            echo "- Alarm artifacts: \`artifacts/perf/perf_alarm_baseline.json\`, \`artifacts/perf/perf_alarm_rlm.json\`"
-            echo "- Benchmark matrix: \`artifacts/perf/benchmark_matrix.md\`"
-            echo "- Canary fallback env patch: \`artifacts/ops/canary_fallback.env\`"
+            echo "- Alarm artifacts: 'artifacts/perf/perf_alarm_baseline.json', 'artifacts/perf/perf_alarm_rlm.json'"
+            echo "- Benchmark matrix: 'artifacts/perf/benchmark_matrix.md'"
+            echo "- Canary fallback env patch: 'artifacts/ops/canary_fallback.env'"
           } | tee artifacts/perf_signal_summary.md >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload perf artifacts

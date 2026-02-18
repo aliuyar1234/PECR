@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing release tag (example: v1.2.3)
+        description: "Existing release tag (example: v1.2.3)"
         required: true
         type: string
 
@@ -40,9 +40,11 @@ jobs:
           owner_lc="${GITHUB_REPOSITORY_OWNER,,}"
           version="${tag#v}"
 
-          echo "owner_lc=${owner_lc}" >> "${GITHUB_OUTPUT}"
-          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          {
+            echo "owner_lc=${owner_lc}"
+            echo "tag=${tag}"
+            echo "version=${version}"
+          } >> "${GITHUB_OUTPUT}"
 
   build_binaries:
     needs: resolve_meta

@@ -1,7 +1,10 @@
 # PECR - Policy-Enforced Context Runtime
 
 [![CI](https://github.com/aliuyar1234/PECR/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/aliuyar1234/PECR/actions/workflows/ci.yml)
+[![Security](https://github.com/aliuyar1234/PECR/actions/workflows/security.yml/badge.svg?branch=master)](https://github.com/aliuyar1234/PECR/actions/workflows/security.yml)
+[![CodeQL](https://github.com/aliuyar1234/PECR/actions/workflows/codeql.yml/badge.svg?branch=master)](https://github.com/aliuyar1234/PECR/actions/workflows/codeql.yml)
 [![Release](badges/release.svg)](https://github.com/aliuyar1234/PECR/releases)
+[![License](https://img.shields.io/github/license/aliuyar1234/PECR?label=License)](LICENSE)
 
 PECR is a governance runtime for AI context retrieval.
 It keeps orchestration non-privileged, enforces policy at every data access boundary, and returns deterministic outcomes with auditable evidence.
