@@ -19,30 +19,67 @@ PECR adds those missing controls by design:
 
 ## High-Level Architecture
 
+PECR is an AI runtime with two orchestration paths (baseline and RLM), wrapped by a policy/evidence governance plane.
+
 ```mermaid
 flowchart LR
-    Client[Client]
+    Client[Client / Agent UI]
 
-    subgraph NonPriv[Non-Privileged Zone]
-      Controller[PECR Controller\nOrchestration + Budget Scheduler]
+    subgraph AIPlane[AI Execution Plane (Non-Privileged)]
+      Controller[PECR Controller API]
+      Baseline[Baseline Planner Loop]
+      RLM[RLM Planner Bridge\n(vendored upstream rlm)]
+      Scheduler[Budget Scheduler + Batch Executor]
+      Replay[Replay Store + Evaluation APIs]
     end
 
-    subgraph Priv[Privileged Zone]
-      Gateway[PECR Gateway\nPolicy + Adapters + Evidence]
+    subgraph Governance[Policy + Evidence Plane (Privileged)]
+      Gateway[PECR Gateway]
       OPA[OPA Policy Engine]
-      Ledger[(PostgreSQL Ledger)]
-      Sources[(Systems of Record)]
+      Evidence[Redaction + Evidence Builder]
+      Finalize[Claim-Evidence Finalize Gate]
+      Ledger[(Append-Only Ledger)]
+    end
+
+    subgraph SoR[Systems of Record]
+      FS[Filesystem Corpus]
+      PG[PostgreSQL Safe Views]
+      EXT[External Sources / Adapters]
+    end
+
+    subgraph Ops[Quality + Operability]
+      Eval[Replay Regression + Scorecards]
+      Canary[Canary + Auto-Fallback]
+      Obs[Metrics + Traces + SLO Dashboards]
     end
 
     Client -->|POST /v1/run| Controller
-    Controller -->|typed operator calls| Gateway
+    Controller --> Baseline
+    Controller --> RLM
+    Baseline --> Scheduler
+    RLM -->|call_operator_batch plan| Scheduler
+
+    Scheduler -->|typed operator calls| Gateway
     Gateway -->|authz decisions| OPA
-    Gateway -->|read under policy/time| Sources
-    Gateway -->|append-only events| Ledger
-    Gateway -->|finalized result| Controller
+    Gateway --> Evidence
+    Evidence --> Finalize
+    Finalize -->|deterministic terminal mode| Controller
+
+    Gateway -->|policy-scoped reads| FS
+    Gateway -->|policy-scoped reads| PG
+    Gateway -->|policy-scoped reads| EXT
+    Gateway -->|append-only audit events| Ledger
+
+    Controller -->|persist run artifacts| Replay
+    Replay --> Eval
+    Eval --> Canary
+    Canary -->|runtime control knobs| Controller
+
+    Controller --> Obs
+    Gateway --> Obs
 ```
 
-Controller never reads systems of record directly.
+Controller remains non-privileged: it never reads systems of record directly and only uses typed, policy-enforced gateway operations.
 
 ## Request Lifecycle
 

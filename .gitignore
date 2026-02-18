@@ -2,3 +2,7 @@
 **/*.rs.bk
 .DS_Store
 docs/ROADMAP_ENHANCEMENT_PLAN.md
+DECISIONS.md
+*ROADMAP*.md
+*TODO*.md
+*BACKLOG*.md
