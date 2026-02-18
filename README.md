@@ -5,7 +5,6 @@
 [![CodeQL](https://img.shields.io/github/actions/workflow/status/aliuyar1234/PECR/codeql.yml?branch=master&label=CodeQL&logo=githubactions&style=flat-square)](https://github.com/aliuyar1234/PECR/actions/workflows/codeql.yml)
 [![Latest Release](https://img.shields.io/github/v/release/aliuyar1234/PECR?include_prereleases&sort=semver&style=flat-square)](https://github.com/aliuyar1234/PECR/releases)
 [![License](https://img.shields.io/github/license/aliuyar1234/PECR?style=flat-square)](LICENSE)
-Current stable tag: [`v1.0.3`](https://github.com/aliuyar1234/PECR/releases/tag/v1.0.3)
 
 PECR is a governance runtime for AI context retrieval.
 It keeps orchestration non-privileged, enforces policy at every data access boundary, and returns deterministic outcomes with auditable evidence.
