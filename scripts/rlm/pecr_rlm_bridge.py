@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import sys
 import uuid
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from pathlib import Path
 from typing import Any
 
 SUPPORTED_PROTOCOL_VERSION = 1
+REPL_BLOCK_PATTERN = re.compile(r"```repl\s*\n(.*?)\n```", re.DOTALL)
+FINAL_PATTERN = re.compile(r"^\s*FINAL\((.*)\)\s*$", re.MULTILINE | re.DOTALL)
 
 
 def eprint(*args: object) -> None:
@@ -54,6 +57,17 @@ def read_json_line() -> dict[str, Any]:
 def write_json_line(msg: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(msg, separators=(",", ":"), ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+
+def find_code_blocks(text: str) -> list[str]:
+    return [match.group(1).strip() for match in REPL_BLOCK_PATTERN.finditer(text)]
+
+
+def find_final_answer(text: str) -> str | None:
+    match = FINAL_PATTERN.search(text)
+    if match:
+        return match.group(1).strip()
+    return None
 
 
 def negotiate_protocol_version(start: dict[str, Any]) -> int:
@@ -142,8 +156,6 @@ class Bridge:
 
 
 def run_mock(bridge: Bridge, query: str, budget: Budget) -> dict[str, Any]:
-    from rlm.utils.parsing import find_code_blocks, find_final_answer
-
     search_refs: list[dict[str, Any]] = []
     operator_calls_used = 0
     stop_reason = "plan_complete"

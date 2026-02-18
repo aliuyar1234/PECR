@@ -1,10 +1,10 @@
 # PECR - Policy-Enforced Context Runtime
 
-[![CI](https://github.com/aliuyar1234/PECR/actions/workflows/ci.yml/badge.svg?branch=master)](https://github.com/aliuyar1234/PECR/actions/workflows/ci.yml)
-[![Security](https://github.com/aliuyar1234/PECR/actions/workflows/security.yml/badge.svg?branch=master)](https://github.com/aliuyar1234/PECR/actions/workflows/security.yml)
-[![CodeQL](https://github.com/aliuyar1234/PECR/actions/workflows/codeql.yml/badge.svg?branch=master)](https://github.com/aliuyar1234/PECR/actions/workflows/codeql.yml)
-[![Release](badges/release.svg)](https://github.com/aliuyar1234/PECR/releases)
-[![License](https://img.shields.io/github/license/aliuyar1234/PECR?label=License)](LICENSE)
+[![CI](https://img.shields.io/github/actions/workflow/status/aliuyar1234/PECR/ci.yml?branch=master&label=CI&logo=githubactions&style=flat-square)](https://github.com/aliuyar1234/PECR/actions/workflows/ci.yml)
+[![Security](https://img.shields.io/github/actions/workflow/status/aliuyar1234/PECR/security.yml?branch=master&label=Security&logo=githubactions&style=flat-square)](https://github.com/aliuyar1234/PECR/actions/workflows/security.yml)
+[![CodeQL](https://img.shields.io/github/actions/workflow/status/aliuyar1234/PECR/codeql.yml?branch=master&label=CodeQL&logo=githubactions&style=flat-square)](https://github.com/aliuyar1234/PECR/actions/workflows/codeql.yml)
+[![Latest Release](https://img.shields.io/github/v/release/aliuyar1234/PECR?include_prereleases&sort=semver&style=flat-square)](https://github.com/aliuyar1234/PECR/releases)
+[![License](https://img.shields.io/github/license/aliuyar1234/PECR?style=flat-square)](LICENSE)
 
 PECR is a governance runtime for AI context retrieval.
 It keeps orchestration non-privileged, enforces policy at every data access boundary, and returns deterministic outcomes with auditable evidence.
@@ -26,34 +26,34 @@ PECR is an AI runtime with two orchestration paths (baseline and RLM), wrapped b
 
 ```mermaid
 flowchart LR
-    Client[Client / Agent UI]
+    Client["Client / Agent UI"]
 
-    subgraph AIPlane[AI Execution Plane (Non-Privileged)]
-      Controller[PECR Controller API]
-      Baseline[Baseline Planner Loop]
-      RLM[RLM Planner Bridge\n(vendored upstream rlm)]
-      Scheduler[Budget Scheduler + Batch Executor]
-      Replay[Replay Store + Evaluation APIs]
+    subgraph AIPlane["AI Execution Plane (Non-Privileged)"]
+      Controller["PECR Controller API"]
+      Baseline["Baseline Planner Loop"]
+      RLM["RLM Planner Bridge<br/>(vendored upstream rlm)"]
+      Scheduler["Budget Scheduler + Batch Executor"]
+      Replay["Replay Store + Evaluation APIs"]
     end
 
-    subgraph Governance[Policy + Evidence Plane (Privileged)]
-      Gateway[PECR Gateway]
-      OPA[OPA Policy Engine]
-      Evidence[Redaction + Evidence Builder]
-      Finalize[Claim-Evidence Finalize Gate]
-      Ledger[(Append-Only Ledger)]
+    subgraph Governance["Policy + Evidence Plane (Privileged)"]
+      Gateway["PECR Gateway"]
+      OPA["OPA Policy Engine"]
+      Evidence["Redaction + Evidence Builder"]
+      Finalize["Claim-Evidence Finalize Gate"]
+      Ledger[("Append-Only Ledger")]
     end
 
-    subgraph SoR[Systems of Record]
-      FS[Filesystem Corpus]
-      PG[PostgreSQL Safe Views]
-      EXT[External Sources / Adapters]
+    subgraph SoR["Systems of Record"]
+      FS["Filesystem Corpus"]
+      PG["PostgreSQL Safe Views"]
+      EXT["External Sources / Adapters"]
     end
 
-    subgraph Ops[Quality + Operability]
-      Eval[Replay Regression + Scorecards]
-      Canary[Canary + Auto-Fallback]
-      Obs[Metrics + Traces + SLO Dashboards]
+    subgraph Ops["Quality + Operability"]
+      Eval["Replay Regression + Scorecards"]
+      Canary["Canary + Auto-Fallback"]
+      Obs["Metrics + Traces + SLO Dashboards"]
     end
 
     Client -->|POST /v1/run| Controller
@@ -273,8 +273,3 @@ bash scripts/ci.sh
   - `docs/standards/ARTIFACT_PROVENANCE_POLICY.md`
 - Guardrails:
   - `docs/enterprise/QUALITY_GUARDRAILS.md`
-
-## Current Limits
-
-- `PECR_MODEL_PROVIDER=external` is intentionally not implemented.
-- RLM mode is experimental and should be enabled intentionally.

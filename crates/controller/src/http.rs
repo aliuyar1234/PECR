@@ -764,10 +764,7 @@ where
 }
 
 fn map_replay_store_join_error(err: tokio::task::JoinError) -> std::io::Error {
-    std::io::Error::new(
-        std::io::ErrorKind::Other,
-        format!("replay store task failed: {}", err),
-    )
+    std::io::Error::other(format!("replay store task failed: {}", err))
 }
 
 fn map_replay_store_error(err: std::io::Error) -> ApiError {

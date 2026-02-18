@@ -490,7 +490,7 @@ pub(super) async fn run_context_loop(
         }
 
         let Some(timeout) = scheduler.remaining_wallclock() else {
-            stop_reason = BudgetStopReason::MaxWallclockMs.as_str();
+            stop_reason = BudgetStopReason::WallclockMs.as_str();
             budget_violation = true;
             break;
         };
@@ -559,7 +559,7 @@ pub(super) async fn run_context_loop(
                             break;
                         };
                         let Some(timeout) = scheduler.remaining_wallclock() else {
-                            stop_reason = BudgetStopReason::MaxWallclockMs.as_str();
+                            stop_reason = BudgetStopReason::WallclockMs.as_str();
                             budget_violation = true;
                             break 'plan_loop;
                         };
@@ -836,7 +836,7 @@ pub(super) async fn run_context_loop_rlm(
                 String::new()
             }
             Err(_) => {
-                stop_reason = Some(BudgetStopReason::MaxWallclockMs.as_str());
+                stop_reason = Some(BudgetStopReason::WallclockMs.as_str());
                 budget_violation = true;
                 String::new()
             }
@@ -892,13 +892,13 @@ pub(super) async fn run_context_loop_rlm(
             }
         }
     } else {
-        stop_reason = Some(BudgetStopReason::MaxWallclockMs.as_str());
+        stop_reason = Some(BudgetStopReason::WallclockMs.as_str());
         budget_violation = true;
     }
 
     while stop_reason.is_none() {
         let Some(timeout) = scheduler.remaining_wallclock() else {
-            stop_reason = Some(BudgetStopReason::MaxWallclockMs.as_str());
+            stop_reason = Some(BudgetStopReason::WallclockMs.as_str());
             budget_violation = true;
             break;
         };
@@ -918,7 +918,7 @@ pub(super) async fn run_context_loop_rlm(
                     break;
                 }
                 Err(_) => {
-                    stop_reason = Some(BudgetStopReason::MaxWallclockMs.as_str());
+                    stop_reason = Some(BudgetStopReason::WallclockMs.as_str());
                     budget_violation = true;
                     break;
                 }
@@ -1121,7 +1121,7 @@ pub(super) async fn run_context_loop_rlm(
                         }
 
                         let Some(timeout) = scheduler.remaining_wallclock() else {
-                            stop_reason = Some(BudgetStopReason::MaxWallclockMs.as_str());
+                            stop_reason = Some(BudgetStopReason::WallclockMs.as_str());
                             budget_violation = true;
                             break_outer = true;
                             break;
@@ -1257,7 +1257,7 @@ pub(super) async fn run_context_loop_rlm(
                             };
 
                             let Some(timeout) = scheduler.remaining_wallclock() else {
-                                stop_reason = Some(BudgetStopReason::MaxWallclockMs.as_str());
+                                stop_reason = Some(BudgetStopReason::WallclockMs.as_str());
                                 budget_violation = true;
                                 break_outer = true;
                                 break 'batch_loop;

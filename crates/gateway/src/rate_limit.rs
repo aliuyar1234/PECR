@@ -83,10 +83,10 @@ mod tests {
 
     #[test]
     fn limiter_allows_after_window_elapses() {
-        let limiter = RateLimiter::new(Duration::from_millis(5), 16);
+        let limiter = RateLimiter::new(Duration::from_millis(100), 16);
         assert!(limiter.allow("k", 1));
         assert!(!limiter.allow("k", 1));
-        thread::sleep(Duration::from_millis(10));
+        thread::sleep(Duration::from_millis(150));
         assert!(limiter.allow("k", 1));
     }
 }

@@ -5,19 +5,19 @@ const UNBOUNDED_WALLCLOCK_TIMEOUT: Duration = Duration::from_secs(31_536_000_000
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum BudgetStopReason {
-    MaxOperatorCalls,
-    MaxBytes,
-    MaxWallclockMs,
-    MaxRecursionDepth,
+    OperatorCalls,
+    Bytes,
+    WallclockMs,
+    RecursionDepth,
 }
 
 impl BudgetStopReason {
     pub(super) fn as_str(self) -> &'static str {
         match self {
-            Self::MaxOperatorCalls => "budget_max_operator_calls",
-            Self::MaxBytes => "budget_max_bytes",
-            Self::MaxWallclockMs => "budget_max_wallclock_ms",
-            Self::MaxRecursionDepth => "budget_max_recursion_depth",
+            Self::OperatorCalls => "budget_max_operator_calls",
+            Self::Bytes => "budget_max_bytes",
+            Self::WallclockMs => "budget_max_wallclock_ms",
+            Self::RecursionDepth => "budget_max_recursion_depth",
         }
     }
 }
@@ -75,14 +75,14 @@ impl<'a> BudgetScheduler<'a> {
 
     pub(super) fn check_depth(self, depth_used: u32) -> Result<(), BudgetStopReason> {
         if depth_used >= self.budget.max_recursion_depth {
-            return Err(BudgetStopReason::MaxRecursionDepth);
+            return Err(BudgetStopReason::RecursionDepth);
         }
         Ok(())
     }
 
     pub(super) fn check_operator_calls(self, used: u32) -> Result<(), BudgetStopReason> {
         if used >= self.budget.max_operator_calls {
-            return Err(BudgetStopReason::MaxOperatorCalls);
+            return Err(BudgetStopReason::OperatorCalls);
         }
         Ok(())
     }
@@ -93,14 +93,14 @@ impl<'a> BudgetScheduler<'a> {
         reserved: u32,
     ) -> Result<(), BudgetStopReason> {
         if used.saturating_add(reserved) >= self.budget.max_operator_calls {
-            return Err(BudgetStopReason::MaxOperatorCalls);
+            return Err(BudgetStopReason::OperatorCalls);
         }
         Ok(())
     }
 
     pub(super) fn check_bytes(self, used: u64) -> Result<(), BudgetStopReason> {
         if used > self.budget.max_bytes {
-            return Err(BudgetStopReason::MaxBytes);
+            return Err(BudgetStopReason::Bytes);
         }
         Ok(())
     }
@@ -144,22 +144,22 @@ mod tests {
         assert!(scheduler.check_operator_calls(4).is_ok());
         assert_eq!(
             scheduler.check_operator_calls(5),
-            Err(BudgetStopReason::MaxOperatorCalls)
+            Err(BudgetStopReason::OperatorCalls)
         );
         assert!(scheduler.check_operator_calls_with_reserved(3, 1).is_ok());
         assert_eq!(
             scheduler.check_operator_calls_with_reserved(4, 1),
-            Err(BudgetStopReason::MaxOperatorCalls)
+            Err(BudgetStopReason::OperatorCalls)
         );
 
         assert!(scheduler.check_depth(2).is_ok());
         assert_eq!(
             scheduler.check_depth(3),
-            Err(BudgetStopReason::MaxRecursionDepth)
+            Err(BudgetStopReason::RecursionDepth)
         );
 
         assert!(scheduler.check_bytes(1024).is_ok());
-        assert_eq!(scheduler.check_bytes(1025), Err(BudgetStopReason::MaxBytes));
+        assert_eq!(scheduler.check_bytes(1025), Err(BudgetStopReason::Bytes));
     }
 
     #[test]
