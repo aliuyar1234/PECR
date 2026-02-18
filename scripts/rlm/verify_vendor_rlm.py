@@ -10,6 +10,7 @@ from typing import Sequence
 
 ROOT = Path(__file__).resolve().parents[2]
 DECISIONS_FILE = ROOT / "DECISIONS.md"
+UPSTREAM_PIN_FILE = ROOT / "vendor" / "rlm" / "UPSTREAM_PIN"
 PIN_LINE_RE = re.compile(
     r"Vendored upstream `alexzhang13/rlm` at commit `([0-9a-f]{40})` into `vendor/rlm`\."
 )
@@ -36,14 +37,34 @@ def parse_pinned_commit(text: str) -> str:
     return match.group(1)
 
 
+def read_pinned_commit() -> tuple[str, str]:
+    if UPSTREAM_PIN_FILE.exists():
+        pinned_commit = UPSTREAM_PIN_FILE.read_text(encoding="utf-8").strip()
+        if not re.fullmatch(r"[0-9a-f]{40}", pinned_commit):
+            raise SystemExit(
+                f"invalid upstream pin in {UPSTREAM_PIN_FILE.relative_to(ROOT)} "
+                "(expected 40-char lowercase hex commit hash)"
+            )
+        return pinned_commit, str(UPSTREAM_PIN_FILE.relative_to(ROOT))
+
+    if DECISIONS_FILE.exists():
+        text = DECISIONS_FILE.read_text(encoding="utf-8")
+        return parse_pinned_commit(text), str(DECISIONS_FILE.relative_to(ROOT))
+
+    raise SystemExit(
+        "missing upstream pin: expected either "
+        f"{UPSTREAM_PIN_FILE.relative_to(ROOT)} (preferred) "
+        f"or {DECISIONS_FILE.relative_to(ROOT)}"
+    )
+
+
 def collect_missing_paths(paths: Sequence[Path]) -> list[Path]:
     return [path for path in paths if not path.exists()]
 
 
 def verify_structure() -> None:
-    text = DECISIONS_FILE.read_text(encoding="utf-8")
-    pinned_commit = parse_pinned_commit(text)
-    print(f"Pinned commit in DECISIONS.md: {pinned_commit}")
+    pinned_commit, source = read_pinned_commit()
+    print(f"Pinned commit ({source}): {pinned_commit}")
 
     missing_paths = collect_missing_paths(REQUIRED_PATHS)
     if missing_paths:
