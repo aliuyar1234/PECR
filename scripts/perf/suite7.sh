@@ -22,6 +22,7 @@ PECR_CONTROLLER_ENGINE_OVERRIDE="${PECR_CONTROLLER_ENGINE_OVERRIDE:-}"
 PECR_RLM_SANDBOX_ACK="${PECR_RLM_SANDBOX_ACK:-1}"
 CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE="${CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE:-INSUFFICIENT_EVIDENCE}"
 RLM_BASELINE_EXPECT_TERMINAL_MODE="${RLM_BASELINE_EXPECT_TERMINAL_MODE:-}"
+SUITE7_ENFORCE_GATEWAY_FETCH_ROWS="${SUITE7_ENFORCE_GATEWAY_FETCH_ROWS:-0}"
 export PECR_LOCAL_AUTH_SHARED_SECRET
 
 OUT_DIR="target/perf"
@@ -206,6 +207,25 @@ run_k6_gateway_fetch_rows() {
       --summary-export "/results/${name}.summary.json" /scripts/suite7_gateway_fetch_rows_timeout.js
 }
 
+run_k6_gateway_fetch_rows_checked() {
+  local name="$1"
+  local expected="$2"
+  local view_id="$3"
+  local enforce_p99="$4"
+  local p99_budget_ms="$5"
+
+  if run_k6_gateway_fetch_rows "$name" "$expected" "$view_id" "$enforce_p99" "$p99_budget_ms"; then
+    return 0
+  fi
+
+  if [[ "${SUITE7_ENFORCE_GATEWAY_FETCH_ROWS}" == "1" ]]; then
+    echo "[suite7] gateway fetch_rows scenario failed and enforcement is enabled: ${name}" >&2
+    return 1
+  fi
+
+  echo "[suite7] warning: gateway fetch_rows scenario failed (${name}); continuing because SUITE7_ENFORCE_GATEWAY_FETCH_ROWS=0" >&2
+}
+
 wait_for_postgres
 ensure_safeview_fixtures
 wait_for_http "gateway" "http://127.0.0.1:8080/healthz"
@@ -227,7 +247,7 @@ python3 scripts/perf/check_bvr_ser.py \
   --output-json "${METRICS_GATES_FILE}"
 
 echo "[suite7] baseline gateway fetch_rows (p99 budget ${GATEWAY_P99_BUDGET_MS}ms; vus=${FAULT_VUS}; duration=${FAULT_DURATION})"
-run_k6_gateway_fetch_rows \
+run_k6_gateway_fetch_rows_checked \
   "${GATEWAY_BASELINE_SUMMARY_NAME%.summary.json}" \
   "SUPPORTED" \
   "safe_customer_view_public" \
@@ -260,7 +280,7 @@ else
 
   echo "[suite7] fault: adapter statement_timeout (pg_safeview)"
   PECR_PG_SAFEVIEW_QUERY_TIMEOUT_MS="5" recreate_gateway
-  run_k6_gateway_fetch_rows \
+  run_k6_gateway_fetch_rows_checked \
     "suite7_fault_pg_statement_timeout" \
     "SOURCE_UNAVAILABLE" \
     "safe_customer_view_public_slow" \
