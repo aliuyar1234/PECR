@@ -38,11 +38,6 @@ function waitForHealthz() {
   throw new Error(`gateway not ready at ${baseUrl}/healthz after ${healthTimeoutMs}ms`);
 }
 
-export function setup() {
-  waitForHealthz();
-  return {};
-}
-
 function extractTerminalMode(res) {
   let payload;
   try {
@@ -75,10 +70,11 @@ function createSession(requestId) {
     `${baseUrl}/v1/sessions`,
     JSON.stringify({
       budget: {
-        max_operator_calls: 3,
-        max_bytes: 4096,
-        max_wallclock_ms: 1000,
-        max_recursion_depth: 2,
+        // Perf harness reuses this session across VUs and iterations.
+        max_operator_calls: 1000000,
+        max_bytes: 104857600,
+        max_wallclock_ms: 600000,
+        max_recursion_depth: 16,
         max_parallelism: 1,
       },
     }),
@@ -99,18 +95,12 @@ function createSession(requestId) {
   return { res, sessionId, sessionToken };
 }
 
-export default function () {
+export default function (data) {
   const requestId = `k6-${__VU}-${__ITER}-${Date.now()}`;
+  const sessionId = data && data.sessionId ? data.sessionId : "";
+  const sessionToken = data && data.sessionToken ? data.sessionToken : "";
 
-  const session = createSession(requestId);
-  check(session.res, {
-    "session create json": (r) =>
-      (r.headers["Content-Type"] || "").includes("application/json"),
-    "session_id present": () => session.sessionId.length > 0,
-    "session_token present": () => session.sessionToken.length > 0,
-  });
-
-  if (!session.sessionId || !session.sessionToken) {
+  if (!sessionId || !sessionToken) {
     wrongModeRate.add(true);
     return;
   }
@@ -119,7 +109,7 @@ export default function () {
     "Content-Type": "application/json",
     "x-pecr-principal-id": principalId,
     "x-pecr-request-id": requestId,
-    "x-pecr-session-token": session.sessionToken,
+    "x-pecr-session-token": sessionToken,
   };
   if (localAuthSecret) {
     headers["x-pecr-local-auth-secret"] = localAuthSecret;
@@ -128,7 +118,7 @@ export default function () {
   const operatorRes = http.post(
     `${baseUrl}/v1/operators/fetch_rows`,
     JSON.stringify({
-      session_id: session.sessionId,
+      session_id: sessionId,
       params: {
         view_id: viewId,
         fields: ["tenant_id", "customer_id", "status", "plan_tier", "updated_at"],
@@ -151,4 +141,26 @@ export default function () {
   });
 
   wrongModeRate.add(!hasTerminalMode || terminalMode !== expectedTerminalMode);
+}
+
+export function setup() {
+  waitForHealthz();
+  const requestId = `setup-${Date.now()}`;
+  const session = createSession(requestId);
+  const ok = check(session.res, {
+    "session create json": (r) =>
+      (r.headers["Content-Type"] || "").includes("application/json"),
+    "session create status 200": (r) => r.status === 200,
+    "session_id present": () => session.sessionId.length > 0,
+    "session_token present": () => session.sessionToken.length > 0,
+  });
+
+  if (!ok || !session.sessionId || !session.sessionToken) {
+    throw new Error("failed to create reusable session for gateway perf scenario");
+  }
+
+  return {
+    sessionId: session.sessionId,
+    sessionToken: session.sessionToken,
+  };
 }
