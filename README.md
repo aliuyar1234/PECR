@@ -3,7 +3,7 @@
 [![CI](https://img.shields.io/github/actions/workflow/status/aliuyar1234/PECR/ci.yml?branch=master&label=CI&logo=githubactions&style=flat-square)](https://github.com/aliuyar1234/PECR/actions/workflows/ci.yml)
 [![Security](https://img.shields.io/github/actions/workflow/status/aliuyar1234/PECR/security.yml?branch=master&label=Security&logo=githubactions&style=flat-square)](https://github.com/aliuyar1234/PECR/actions/workflows/security.yml)
 [![CodeQL](https://img.shields.io/github/actions/workflow/status/aliuyar1234/PECR/codeql.yml?branch=master&label=CodeQL&logo=githubactions&style=flat-square)](https://github.com/aliuyar1234/PECR/actions/workflows/codeql.yml)
-[![Latest Release](https://img.shields.io/github/v/release/aliuyar1234/PECR?include_prereleases&sort=semver&style=flat-square)](https://github.com/aliuyar1234/PECR/releases)
+[![Latest Release](https://img.shields.io/github/v/release/aliuyar1234/pecr?display_name=tag&label=release&style=flat-square)](https://github.com/aliuyar1234/PECR/releases/latest)
 [![License](https://img.shields.io/github/license/aliuyar1234/PECR?style=flat-square)](LICENSE)
 
 PECR is a governance runtime for AI context retrieval.
