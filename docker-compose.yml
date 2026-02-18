@@ -80,6 +80,7 @@ services:
       PECR_BUDGET_DEFAULTS: '{"max_operator_calls":10,"max_bytes":1048576,"max_wallclock_ms":10000,"max_recursion_depth":5,"max_parallelism":4}'
       PECR_AUTH_MODE: "${PECR_AUTH_MODE:-local}"
       PECR_METRICS_REQUIRE_AUTH: "${PECR_METRICS_REQUIRE_AUTH:-1}"
+      PECR_REPLAY_STORE_DIR: /tmp/replay
     depends_on:
       gateway:
         condition: service_started
