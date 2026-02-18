@@ -1,0 +1,39 @@
+{
+  "$id": "pecr.schemas.ReplayBundle.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "metadata",
+    "query",
+    "budget",
+    "session_id",
+    "policy_snapshot_id",
+    "loop_terminal_mode",
+    "response_text",
+    "claim_map",
+    "operator_calls_used",
+    "bytes_used",
+    "depth_used",
+    "evidence_ref_count",
+    "evidence_unit_ids"
+  ],
+  "properties": {
+    "metadata": { "$ref": "pecr.schemas.ReplayBundleMetadata.v1" },
+    "query": { "type": "string" },
+    "budget": { "$ref": "pecr.schemas.Budget.v1" },
+    "session_id": { "type": "string" },
+    "policy_snapshot_id": { "type": "string" },
+    "loop_terminal_mode": { "$ref": "pecr.schemas.TerminalMode.v1" },
+    "loop_response_text": { "type": "string" },
+    "response_text": { "type": "string" },
+    "claim_map": { "$ref": "pecr.schemas.ClaimMap.v1" },
+    "operator_calls_used": { "type": "integer", "minimum": 0 },
+    "bytes_used": { "type": "integer", "minimum": 0 },
+    "depth_used": { "type": "integer", "minimum": 0 },
+    "evidence_ref_count": { "type": "integer", "minimum": 0 },
+    "evidence_unit_ids": {
+      "type": "array",
+      "items": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+    }
+  }
+}

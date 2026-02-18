@@ -82,8 +82,11 @@ jobs:
         run: |
           set -euo pipefail
           chmod +x scripts/perf/suite7.sh
+          chmod +x scripts/perf/compare_k6_baseline.py
+          chmod +x scripts/perf/benchmark_matrix.py
+          chmod +x scripts/ops/canary_rollout_guard.py
 
-      - name: Suite 7 (p99 + fault injection + regression lock)
+      - name: Suite 7 baseline + RLM matrix + canary guard
         shell: bash
         env:
           BASELINE_VUS: "10"
@@ -105,30 +108,108 @@ jobs:
           PECR_PERF_REGRESSION_ABS_MS: "400"
           PECR_PERF_MIN_RATE_FACTOR: "0.85"
           PECR_PERF_RATE_ABS_DROP: "5"
+          PECR_CANARY_P95_BUDGET_MS: "1200"
+          PECR_CANARY_P99_BUDGET_MS: "1500"
+          PECR_CANARY_SOURCE_UNAVAILABLE_MAX_RATE: "0.05"
         run: |
           set -euo pipefail
-          mkdir -p artifacts
+          mkdir -p artifacts artifacts/perf artifacts/ops
+          overall_status=0
+
           set +e
           ./scripts/perf/suite7.sh 2>&1 | tee artifacts/suite7.log
           suite7_status=${PIPESTATUS[0]}
           set -e
 
-          mkdir -p artifacts/perf
-          cp -a target/perf/* artifacts/perf/ 2>/dev/null || true
-
+          cp -a target/perf/. artifacts/perf/ 2>/dev/null || true
           if [[ "${suite7_status}" -ne 0 ]]; then
-            exit "${suite7_status}"
+            overall_status="${suite7_status}"
+          fi
+
+          set +e
+          PECR_CONTROLLER_ENGINE_OVERRIDE="rlm" \
+          PECR_RLM_SANDBOX_ACK="1" \
+          SUITE7_SKIP_FAULTS="1" \
+          CONTROLLER_BASELINE_SUMMARY_NAME="suite7_rlm_baseline.summary.json" \
+          GATEWAY_BASELINE_SUMMARY_NAME="suite7_rlm_gateway_baseline.summary.json" \
+          METRICS_GATES_FILE="target/perf/suite7_rlm_metrics_gates.json" \
+          ./scripts/perf/suite7.sh 2>&1 | tee artifacts/suite7_rlm.log
+          suite7_rlm_status=${PIPESTATUS[0]}
+          set -e
+
+          cp -a target/perf/. artifacts/perf/ 2>/dev/null || true
+          if [[ "${suite7_rlm_status}" -ne 0 && "${overall_status}" -eq 0 ]]; then
+            overall_status="${suite7_rlm_status}"
           fi
 
           set +e
           python3 scripts/perf/compare_k6_baseline.py \
             --baseline perf/baselines/suite7_baseline.summary.json \
             --current target/perf/suite7_baseline.summary.json \
+            --alarm-label baseline \
+            --output-json artifacts/perf/perf_alarm_baseline.json \
+            --github-annotations \
             2>&1 | tee artifacts/perf_regression.log
-          perf_status=${PIPESTATUS[0]}
+          baseline_alarm_status=${PIPESTATUS[0]}
           set -e
 
-          exit "${perf_status}"
+          if [[ "${baseline_alarm_status}" -ne 0 && "${overall_status}" -eq 0 ]]; then
+            overall_status="${baseline_alarm_status}"
+          fi
+
+          set +e
+          python3 scripts/perf/compare_k6_baseline.py \
+            --baseline perf/baselines/suite7_baseline.summary.json \
+            --current target/perf/suite7_rlm_baseline.summary.json \
+            --alarm-label rlm \
+            --output-json artifacts/perf/perf_alarm_rlm.json \
+            --github-annotations \
+            2>&1 | tee artifacts/perf_regression_rlm.log
+          rlm_alarm_status=${PIPESTATUS[0]}
+          set -e
+
+          if [[ "${rlm_alarm_status}" -ne 0 && "${overall_status}" -eq 0 ]]; then
+            overall_status="${rlm_alarm_status}"
+          fi
+
+          set +e
+          python3 scripts/perf/benchmark_matrix.py \
+            --baseline perf/baselines/suite7_baseline.summary.json \
+            --candidate baseline=target/perf/suite7_baseline.summary.json \
+            --candidate rlm=target/perf/suite7_rlm_baseline.summary.json \
+            --output-json artifacts/perf/benchmark_matrix.json \
+            --output-md artifacts/perf/benchmark_matrix.md \
+            --append-step-summary "${GITHUB_STEP_SUMMARY}" \
+            --strict \
+            2>&1 | tee artifacts/perf_matrix.log
+          matrix_status=${PIPESTATUS[0]}
+          set -e
+
+          if [[ "${matrix_status}" -ne 0 && "${overall_status}" -eq 0 ]]; then
+            overall_status="${matrix_status}"
+          fi
+
+          set +e
+          python3 scripts/ops/canary_rollout_guard.py \
+            --summary target/perf/suite7_rlm_baseline.summary.json \
+            --metrics-gates target/perf/suite7_rlm_metrics_gates.json \
+            --engine rlm \
+            --adaptive-enabled true \
+            --batch-enabled true \
+            --output-json artifacts/ops/canary_guard.json \
+            --output-md artifacts/ops/canary_guard.md \
+            --output-env artifacts/ops/canary_fallback.env \
+            --fail-on-fallback \
+            --github-annotations \
+            2>&1 | tee artifacts/ops/canary_guard.log
+          canary_status=${PIPESTATUS[0]}
+          set -e
+
+          if [[ "${canary_status}" -ne 0 && "${overall_status}" -eq 0 ]]; then
+            overall_status="${canary_status}"
+          fi
+
+          exit "${overall_status}"
 
       - name: Perf stack cleanup
         if: always()
@@ -143,39 +224,74 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p artifacts
-          summary_file="target/perf/suite7_baseline.summary.json"
+          baseline_summary_file="target/perf/suite7_baseline.summary.json"
 
           {
-            echo "### Suite 7 Performance Signal"
+            echo "### Suite 7 Performance Signal (Baseline + RLM)"
             echo
-            if [[ -f "${summary_file}" ]]; then
+            if [[ -f "${baseline_summary_file}" ]]; then
               python3 - <<'PY'
 import json
 from pathlib import Path
 
-path = Path("target/perf/suite7_baseline.summary.json")
-data = json.loads(path.read_text(encoding="utf-8"))
-metrics = data.get("metrics", {})
-dur = metrics.get("http_req_duration", {})
-p95 = dur.get("p(95)", "n/a")
-p99 = dur.get("p(99)", "n/a")
-print(f"- `http_req_duration p95`: {p95}")
-print(f"- `http_req_duration p99`: {p99}")
+def print_summary(path_str: str, label: str) -> None:
+    path = Path(path_str)
+    if not path.exists():
+        print(f"- `{label}` summary missing: `{path_str}`")
+        return
+    data = json.loads(path.read_text(encoding="utf-8"))
+    metrics = data.get("metrics", {})
+    dur = metrics.get("http_req_duration", {})
+    p95 = dur.get("p(95)", "n/a")
+    p99 = dur.get("p(99)", "n/a")
+    print(f"- `{label}` p95: {p95}")
+    print(f"- `{label}` p99: {p99}")
+
+print_summary("target/perf/suite7_baseline.summary.json", "baseline")
+print_summary("target/perf/suite7_rlm_baseline.summary.json", "rlm")
 PY
             else
               echo "- Summary JSON: missing (`target/perf/suite7_baseline.summary.json`)"
               echo "::warning::Missing Suite 7 summary JSON (target/perf/suite7_baseline.summary.json)"
             fi
 
-            if [[ -f artifacts/perf_regression.log ]] && grep -q "FAIL:" artifacts/perf_regression.log; then
-              echo "- Regression gate: FAILED (see \`artifacts/perf_regression.log\`)"
-              echo "::error title=Performance regression detected::Suite 7 regression gate failed. See artifacts/perf_regression.log."
+            if [[ -f artifacts/perf_regression.log ]] && grep -q "perf regression gate: FAIL" artifacts/perf_regression.log; then
+              echo "- Baseline regression gate: FAILED (see \`artifacts/perf_regression.log\`)"
+              echo "::error title=Performance regression detected::Baseline regression gate failed. See artifacts/perf_regression.log."
             elif [[ -f artifacts/perf_regression.log ]]; then
-              echo "- Regression gate: passed"
-              echo "::notice title=Performance regression gate::Suite 7 regression gate passed."
+              echo "- Baseline regression gate: passed"
+              echo "::notice title=Performance regression gate::Baseline regression gate passed."
             else
-              echo "- Regression gate: no log produced"
+              echo "- Baseline regression gate: no log produced"
             fi
+
+            if [[ -f artifacts/perf_regression_rlm.log ]] && grep -q "perf regression gate: FAIL" artifacts/perf_regression_rlm.log; then
+              echo "- RLM regression gate: FAILED (see \`artifacts/perf_regression_rlm.log\`)"
+              echo "::error title=RLM regression detected::RLM regression gate failed. See artifacts/perf_regression_rlm.log."
+            elif [[ -f artifacts/perf_regression_rlm.log ]]; then
+              echo "- RLM regression gate: passed"
+            else
+              echo "- RLM regression gate: no log produced"
+            fi
+
+            if [[ -f artifacts/ops/canary_guard.json ]]; then
+              python3 - <<'PY'
+import json
+from pathlib import Path
+
+path = Path("artifacts/ops/canary_guard.json")
+data = json.loads(path.read_text(encoding="utf-8"))
+status = data.get("status", "unknown")
+step = data.get("recommended_fallback", {}).get("step", "none")
+print(f"- Canary guard status: {status} (recommended step: {step})")
+PY
+            else
+              echo "- Canary guard: artifact missing (`artifacts/ops/canary_guard.json`)"
+            fi
+
+            echo "- Alarm artifacts: \`artifacts/perf/perf_alarm_baseline.json\`, \`artifacts/perf/perf_alarm_rlm.json\`"
+            echo "- Benchmark matrix: \`artifacts/perf/benchmark_matrix.md\`"
+            echo "- Canary fallback env patch: \`artifacts/ops/canary_fallback.env\`"
           } | tee artifacts/perf_signal_summary.md >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Upload perf artifacts

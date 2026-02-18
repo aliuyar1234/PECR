@@ -1,0 +1,83 @@
+groups:
+  - name: pecr-runtime-slo
+    interval: 30s
+    rules:
+      - alert: PECRControllerHighP99Latency
+        expr: histogram_quantile(0.99, sum(rate(pecr_controller_http_request_duration_seconds_bucket[5m])) by (le, route)) > 1.5
+        for: 10m
+        labels:
+          severity: P2
+          owner: controller
+          domain: runtime
+        annotations:
+          summary: "Controller p99 latency above SLO budget"
+          description: "Controller route {{$labels.route}} p99 latency > 1.5s for 10m."
+
+      - alert: PECRGatewayHighP99Latency
+        expr: histogram_quantile(0.99, sum(rate(pecr_gateway_http_request_duration_seconds_bucket[5m])) by (le, route)) > 0.9
+        for: 10m
+        labels:
+          severity: P2
+          owner: gateway
+          domain: runtime
+        annotations:
+          summary: "Gateway p99 latency above SLO budget"
+          description: "Gateway route {{$labels.route}} p99 latency > 0.9s for 10m."
+
+      - alert: PECRControllerHigh5xxRate
+        expr: (sum(rate(pecr_controller_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(pecr_controller_http_requests_total[5m])), 0.0001)) > 0.02
+        for: 10m
+        labels:
+          severity: P1
+          owner: controller
+          domain: runtime
+        annotations:
+          summary: "Controller 5xx rate is elevated"
+          description: "Controller 5xx ratio > 2% for 10m."
+
+      - alert: PECRGatewayHigh5xxRate
+        expr: (sum(rate(pecr_gateway_http_requests_total{status=~"5.."}[5m])) / clamp_min(sum(rate(pecr_gateway_http_requests_total[5m])), 0.0001)) > 0.02
+        for: 10m
+        labels:
+          severity: P1
+          owner: gateway
+          domain: runtime
+        annotations:
+          summary: "Gateway 5xx rate is elevated"
+          description: "Gateway 5xx ratio > 2% for 10m."
+
+      - alert: PECRBudgetViolationSpike
+        expr: max(
+          (sum(rate(pecr_controller_budget_violations_total[5m])) / clamp_min(sum(rate(pecr_controller_http_requests_total{route="/v1/run",status="200"}[5m])), 0.0001)),
+          (sum(rate(pecr_gateway_budget_violations_total[5m])) / clamp_min(sum(rate(pecr_gateway_http_requests_total{route="/v1/finalize",status="200"}[5m])), 0.0001))
+          ) > 0.01
+        for: 10m
+        labels:
+          severity: P1
+          owner: controller
+          domain: scheduler
+        annotations:
+          summary: "Budget violation rate is above threshold"
+          description: "Controller or gateway budget violation rate > 1% for 10m."
+
+      - alert: PECRStalenessErrorRateHigh
+        expr: (sum(rate(pecr_gateway_staleness_errors_total[5m])) / clamp_min(sum(rate(pecr_gateway_http_requests_total{route="/v1/finalize",status="200"}[5m])), 0.0001)) > 0.01
+        for: 15m
+        labels:
+          severity: P2
+          owner: gateway
+          domain: policy
+        annotations:
+          summary: "Gateway staleness error rate above threshold"
+          description: "Gateway staleness error rate > 1% for 15m."
+
+      - alert: PECRSourceUnavailableModeSpike
+        expr: (sum(rate(pecr_controller_terminal_modes_total{route="/v1/run",terminal_mode="SOURCE_UNAVAILABLE"}[5m])) / clamp_min(sum(rate(pecr_controller_terminal_modes_total{route="/v1/run"}[5m])), 0.0001)) > 0.05
+        for: 10m
+        labels:
+          severity: P2
+          owner: controller
+          domain: runtime
+        annotations:
+          summary: "SOURCE_UNAVAILABLE terminal mode drift detected"
+          description: "SOURCE_UNAVAILABLE terminal mode ratio > 5% for 10m."

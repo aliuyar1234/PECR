@@ -1,0 +1,83 @@
+{
+  "title": "PECR / Budget and Scheduler",
+  "uid": "pecr-budget-scheduler",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": [
+    "pecr",
+    "slo",
+    "scheduler"
+  ],
+  "timezone": "browser",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Controller Inflight Ops",
+      "targets": [
+        {
+          "expr": "max(pecr_controller_inflight_ops)",
+          "legendFormat": "inflight ops"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Controller Queue Wait (p95/p99)",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(pecr_controller_operator_queue_wait_seconds_bucket[5m])) by (le))",
+          "legendFormat": "queue wait p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(pecr_controller_operator_queue_wait_seconds_bucket[5m])) by (le))",
+          "legendFormat": "queue wait p99"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Controller Budget Stop Reasons",
+      "targets": [
+        {
+          "expr": "sum(rate(pecr_controller_budget_stop_reasons_total[5m])) by (reason)",
+          "legendFormat": "{{reason}}"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Budget Violation Rate",
+      "targets": [
+        {
+          "expr": "sum(rate(pecr_controller_budget_violations_total[5m])) / clamp_min(sum(rate(pecr_controller_http_requests_total{route=\"/v1/run\",status=\"200\"}[5m])), 0.0001)",
+          "legendFormat": "controller BVR"
+        },
+        {
+          "expr": "sum(rate(pecr_gateway_budget_violations_total[5m])) / clamp_min(sum(rate(pecr_gateway_http_requests_total{route=\"/v1/finalize\",status=\"200\"}[5m])), 0.0001)",
+          "legendFormat": "gateway BVR"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Gateway Staleness Error Rate",
+      "targets": [
+        {
+          "expr": "sum(rate(pecr_gateway_staleness_errors_total[5m])) / clamp_min(sum(rate(pecr_gateway_http_requests_total{route=\"/v1/finalize\",status=\"200\"}[5m])), 0.0001)",
+          "legendFormat": "gateway SER"
+        }
+      ]
+    }
+  ]
+}

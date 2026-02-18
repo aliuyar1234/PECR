@@ -1,0 +1,5 @@
+{
+  "$id": "pecr.schemas.EngineMode.v1",
+  "type": "string",
+  "enum": ["baseline", "rlm"]
+}

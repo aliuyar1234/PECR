@@ -6,9 +6,11 @@ use pecr_contracts::{Budget, EvidenceUnit, EvidenceUnitRef, TerminalMode};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
-use super::budget::remaining_wallclock;
+use super::budget::{BudgetScheduler, BudgetStopReason};
 use super::{ApiError, AppState, apply_gateway_auth, json_error};
 
+#[cfg(feature = "rlm")]
+use std::collections::{HashMap, VecDeque};
 #[cfg(feature = "rlm")]
 use std::path::PathBuf;
 #[cfg(feature = "rlm")]
@@ -56,6 +58,21 @@ struct OperatorCallOutcome {
     bytes_len: usize,
 }
 
+struct InflightOpsGuard;
+
+impl InflightOpsGuard {
+    fn new() -> Self {
+        crate::metrics::inc_inflight_ops();
+        Self
+    }
+}
+
+impl Drop for InflightOpsGuard {
+    fn drop(&mut self) {
+        crate::metrics::dec_inflight_ops();
+    }
+}
+
 #[cfg(feature = "rlm")]
 #[derive(Debug, Deserialize)]
 struct BatchBridgeCall {
@@ -63,6 +80,18 @@ struct BatchBridgeCall {
     #[serde(default)]
     params: serde_json::Value,
 }
+
+#[cfg(feature = "rlm")]
+#[derive(Debug)]
+struct PendingBatchCall {
+    idx: usize,
+    params: serde_json::Value,
+}
+
+#[cfg(feature = "rlm")]
+const RLM_BRIDGE_PROTOCOL_MIN_VERSION: u32 = 1;
+#[cfg(feature = "rlm")]
+const RLM_BRIDGE_PROTOCOL_MAX_VERSION: u32 = 1;
 
 #[derive(Clone, Copy)]
 pub(super) struct GatewayCallContext<'a> {
@@ -81,10 +110,6 @@ fn allowed_operator(op_name: &str) -> bool {
         op_name,
         "search" | "fetch_span" | "fetch_rows" | "aggregate" | "list_versions" | "diff" | "redact"
     )
-}
-
-fn effective_parallelism(budget: &Budget) -> usize {
-    budget.max_parallelism.unwrap_or(1).max(1) as usize
 }
 
 #[cfg(feature = "rlm")]
@@ -106,6 +131,57 @@ fn record_operator_result(
     } else if let Ok(unit) = serde_json::from_value::<EvidenceUnit>(result.clone()) {
         evidence_units.push(unit);
     }
+}
+
+fn scheduler_parallelism(
+    state: &AppState,
+    scheduler: BudgetScheduler<'_>,
+    operator_calls_used: u32,
+    scheduled_calls: u32,
+) -> usize {
+    if state.config.adaptive_parallelism_enabled {
+        scheduler.adaptive_parallelism(operator_calls_used, scheduled_calls)
+    } else {
+        scheduler.effective_parallelism()
+    }
+}
+
+#[cfg(feature = "rlm")]
+fn next_fair_batch_call(
+    fairness_ring: &mut VecDeque<String>,
+    pending_by_operator: &mut HashMap<String, VecDeque<PendingBatchCall>>,
+    in_flight_by_operator: &mut HashMap<String, usize>,
+    max_in_flight_by_operator: &HashMap<String, usize>,
+) -> Option<(usize, String, serde_json::Value)> {
+    let slots = fairness_ring.len();
+    for _ in 0..slots {
+        let op_name = fairness_ring.pop_front()?;
+        fairness_ring.push_back(op_name.clone());
+
+        let max_in_flight = max_in_flight_by_operator
+            .get(op_name.as_str())
+            .copied()
+            .unwrap_or(usize::MAX);
+        let in_flight = in_flight_by_operator
+            .get(op_name.as_str())
+            .copied()
+            .unwrap_or(0);
+        if in_flight >= max_in_flight {
+            continue;
+        }
+
+        let Some(queue) = pending_by_operator.get_mut(op_name.as_str()) else {
+            continue;
+        };
+        let Some(next_call) = queue.pop_front() else {
+            continue;
+        };
+
+        in_flight_by_operator.insert(op_name.clone(), in_flight.saturating_add(1));
+        return Some((next_call.idx, op_name, next_call.params));
+    }
+
+    None
 }
 
 async fn call_operator(
@@ -235,6 +311,7 @@ async fn call_operator(
     };
     let started = Instant::now();
     async move {
+        let _inflight = InflightOpsGuard::new();
         let url = format!(
             "{}/v1/operators/{}",
             state.config.gateway_url.trim_end_matches('/'),
@@ -369,23 +446,51 @@ pub(super) async fn run_context_loop(
     let mut evidence_refs = Vec::<EvidenceUnitRef>::new();
     let mut evidence_units = Vec::<EvidenceUnit>::new();
     let mut search_refs = Vec::<EvidenceUnitRef>::new();
+    let scheduler = BudgetScheduler::new(budget, loop_start);
 
     'plan_loop: for step in &state.config.baseline_plan {
-        if depth_used >= budget.max_recursion_depth {
-            stop_reason = "budget_max_recursion_depth";
+        let step_name = match step {
+            BaselinePlanStep::Operator { op_name, .. } => op_name.as_str(),
+            BaselinePlanStep::SearchRefFetchSpan { .. } => "search_ref_fetch_span",
+        };
+        let planner_span = tracing::info_span!(
+            "planner.baseline_step",
+            trace_id = %ctx.trace_id,
+            request_id = %ctx.request_id,
+            session_id = %ctx.session_id,
+            step = %step_name,
+            depth_used,
+            operator_calls_used,
+            bytes_used,
+        );
+        tracing::debug!(parent: &planner_span, "planner.step_ready");
+
+        let scheduler_span = tracing::info_span!(
+            "scheduler.budget_gate",
+            trace_id = %ctx.trace_id,
+            request_id = %ctx.request_id,
+            session_id = %ctx.session_id,
+            depth_used,
+            operator_calls_used,
+            bytes_used,
+        );
+        if let Err(reason) = scheduler_span.in_scope(|| scheduler.check_depth(depth_used)) {
+            stop_reason = reason.as_str();
             budget_violation = true;
             break;
         }
 
         crate::metrics::inc_loop_iteration();
-        if operator_calls_used >= budget.max_operator_calls {
-            stop_reason = "budget_max_operator_calls";
+        if let Err(reason) =
+            scheduler_span.in_scope(|| scheduler.check_operator_calls(operator_calls_used))
+        {
+            stop_reason = reason.as_str();
             budget_violation = true;
             break;
         }
 
-        let Some(timeout) = remaining_wallclock(budget, loop_start) else {
-            stop_reason = "budget_max_wallclock_ms";
+        let Some(timeout) = scheduler.remaining_wallclock() else {
+            stop_reason = BudgetStopReason::MaxWallclockMs.as_str();
             budget_violation = true;
             break;
         };
@@ -432,14 +537,20 @@ pub(super) async fn run_context_loop(
                     .map(|r| r.object_id.clone());
                 let mut in_flight = FuturesUnordered::new();
                 let mut scheduled_calls: u32 = 0;
-                let parallelism = effective_parallelism(budget);
 
                 loop {
+                    let parallelism = scheduler_parallelism(
+                        state,
+                        scheduler,
+                        operator_calls_used,
+                        scheduled_calls,
+                    );
                     while in_flight.len() < parallelism {
-                        if operator_calls_used.saturating_add(scheduled_calls)
-                            >= budget.max_operator_calls
-                        {
-                            stop_reason = "budget_max_operator_calls";
+                        if let Err(reason) = scheduler.check_operator_calls_with_reserved(
+                            operator_calls_used,
+                            scheduled_calls,
+                        ) {
+                            stop_reason = reason.as_str();
                             budget_violation = true;
                             break 'plan_loop;
                         }
@@ -447,14 +558,16 @@ pub(super) async fn run_context_loop(
                         let Some(object_id) = refs_to_fetch.next() else {
                             break;
                         };
-                        let Some(timeout) = remaining_wallclock(budget, loop_start) else {
-                            stop_reason = "budget_max_wallclock_ms";
+                        let Some(timeout) = scheduler.remaining_wallclock() else {
+                            stop_reason = BudgetStopReason::MaxWallclockMs.as_str();
                             budget_violation = true;
                             break 'plan_loop;
                         };
 
                         scheduled_calls = scheduled_calls.saturating_add(1);
+                        let queued_at = Instant::now();
                         in_flight.push(async move {
+                            crate::metrics::observe_operator_queue_wait(queued_at.elapsed());
                             call_operator(
                                 state,
                                 ctx,
@@ -485,9 +598,9 @@ pub(super) async fn run_context_loop(
                         evidence_units.push(unit);
                     }
 
-                    if bytes_used > budget.max_bytes {
+                    if let Err(reason) = scheduler.check_bytes(bytes_used) {
                         terminal_mode = TerminalMode::InsufficientEvidence;
-                        stop_reason = "budget_max_bytes";
+                        stop_reason = reason.as_str();
                         budget_violation = true;
                         break 'plan_loop;
                     }
@@ -495,9 +608,9 @@ pub(super) async fn run_context_loop(
             }
         }
 
-        if bytes_used > budget.max_bytes {
+        if let Err(reason) = scheduler.check_bytes(bytes_used) {
             terminal_mode = TerminalMode::InsufficientEvidence;
-            stop_reason = "budget_max_bytes";
+            stop_reason = reason.as_str();
             budget_violation = true;
             break;
         }
@@ -509,6 +622,7 @@ pub(super) async fn run_context_loop(
     if budget_violation {
         crate::metrics::inc_budget_violation();
     }
+    crate::metrics::observe_budget_stop_reason(stop_reason);
 
     tracing::info!(
         request_id = %ctx.request_id,
@@ -565,6 +679,7 @@ pub(super) async fn run_context_loop_rlm(
     budget: &Budget,
 ) -> Result<ContextLoopResult, ApiError> {
     let loop_start = Instant::now();
+    let scheduler = BudgetScheduler::new(budget, loop_start);
 
     let mut terminal_mode = TerminalMode::InsufficientEvidence;
     let mut operator_calls_used: u32 = 0;
@@ -675,6 +790,10 @@ pub(super) async fn run_context_loop_rlm(
 
     let start_msg = serde_json::json!({
         "type": "start",
+        "protocol": {
+            "min_version": RLM_BRIDGE_PROTOCOL_MIN_VERSION,
+            "max_version": RLM_BRIDGE_PROTOCOL_MAX_VERSION,
+        },
         "query": query,
         "budget": budget,
     });
@@ -702,44 +821,144 @@ pub(super) async fn run_context_loop_rlm(
 
     let mut stdout_lines = tokio::io::BufReader::new(child_stdout).lines();
     let mut response_text: Option<String> = None;
+    let mut pending_msg: Option<serde_json::Value> = None;
 
-    loop {
-        let Some(timeout) = remaining_wallclock(budget, loop_start) else {
-            stop_reason = Some("budget_max_wallclock_ms");
+    if let Some(timeout) = scheduler.remaining_wallclock() {
+        let next_line = tokio::time::timeout(timeout, stdout_lines.next_line()).await;
+        let first_line = match next_line {
+            Ok(Ok(Some(line))) => line,
+            Ok(Ok(None)) => {
+                stop_reason = Some("bridge_eof");
+                String::new()
+            }
+            Ok(Err(_)) => {
+                stop_reason = Some("bridge_read_error");
+                String::new()
+            }
+            Err(_) => {
+                stop_reason = Some(BudgetStopReason::MaxWallclockMs.as_str());
+                budget_violation = true;
+                String::new()
+            }
+        };
+
+        if stop_reason.is_none() {
+            let first_msg =
+                serde_json::from_str::<serde_json::Value>(&first_line).map_err(|_| {
+                    json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "ERR_RLM_BRIDGE_PROTOCOL",
+                        "rlm bridge emitted invalid json".to_string(),
+                        TerminalMode::SourceUnavailable,
+                        false,
+                    )
+                })?;
+            let first_msg_type = first_msg
+                .get("type")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if first_msg_type == "start_ack" {
+                let version = first_msg
+                    .get("protocol_version")
+                    .and_then(|v| v.as_u64())
+                    .ok_or_else(|| {
+                        json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "ERR_RLM_BRIDGE_PROTOCOL",
+                            "rlm bridge start_ack missing protocol_version".to_string(),
+                            TerminalMode::SourceUnavailable,
+                            false,
+                        )
+                    })? as u32;
+                if !(RLM_BRIDGE_PROTOCOL_MIN_VERSION..=RLM_BRIDGE_PROTOCOL_MAX_VERSION)
+                    .contains(&version)
+                {
+                    return Err(json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "ERR_RLM_BRIDGE_PROTOCOL",
+                        format!(
+                            "unsupported rlm bridge protocol_version={} (supported {}-{})",
+                            version,
+                            RLM_BRIDGE_PROTOCOL_MIN_VERSION,
+                            RLM_BRIDGE_PROTOCOL_MAX_VERSION
+                        ),
+                        TerminalMode::SourceUnavailable,
+                        false,
+                    ));
+                }
+            } else {
+                // Backward compatibility: older bridges start directly with protocol messages.
+                pending_msg = Some(first_msg);
+            }
+        }
+    } else {
+        stop_reason = Some(BudgetStopReason::MaxWallclockMs.as_str());
+        budget_violation = true;
+    }
+
+    while stop_reason.is_none() {
+        let Some(timeout) = scheduler.remaining_wallclock() else {
+            stop_reason = Some(BudgetStopReason::MaxWallclockMs.as_str());
             budget_violation = true;
             break;
         };
 
-        let next_line = tokio::time::timeout(timeout, stdout_lines.next_line()).await;
-        let line = match next_line {
-            Ok(Ok(Some(line))) => line,
-            Ok(Ok(None)) => {
-                stop_reason = Some("bridge_eof");
-                budget_violation = false;
-                break;
-            }
-            Ok(Err(_)) => {
-                stop_reason = Some("bridge_read_error");
-                budget_violation = false;
-                break;
-            }
-            Err(_) => {
-                stop_reason = Some("budget_max_wallclock_ms");
-                budget_violation = true;
-                break;
-            }
+        let msg = if let Some(msg) = pending_msg.take() {
+            msg
+        } else {
+            let next_line = tokio::time::timeout(timeout, stdout_lines.next_line()).await;
+            let line = match next_line {
+                Ok(Ok(Some(line))) => line,
+                Ok(Ok(None)) => {
+                    stop_reason = Some("bridge_eof");
+                    break;
+                }
+                Ok(Err(_)) => {
+                    stop_reason = Some("bridge_read_error");
+                    break;
+                }
+                Err(_) => {
+                    stop_reason = Some(BudgetStopReason::MaxWallclockMs.as_str());
+                    budget_violation = true;
+                    break;
+                }
+            };
+            serde_json::from_str::<serde_json::Value>(&line).map_err(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ERR_RLM_BRIDGE_PROTOCOL",
+                    "rlm bridge emitted invalid json".to_string(),
+                    TerminalMode::SourceUnavailable,
+                    false,
+                )
+            })?
         };
-
-        let msg = serde_json::from_str::<serde_json::Value>(&line).map_err(|_| {
-            json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "ERR_RLM_BRIDGE_PROTOCOL",
-                "rlm bridge emitted invalid json".to_string(),
-                TerminalMode::SourceUnavailable,
-                false,
-            )
-        })?;
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or_default();
+        let bridge_depth = msg.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+        let planner_span = tracing::info_span!(
+            "planner.rlm_message",
+            trace_id = %ctx.trace_id,
+            request_id = %ctx.request_id,
+            session_id = %ctx.session_id,
+            msg_type = %msg_type,
+            bridge_depth,
+            depth_used,
+            operator_calls_used,
+            bytes_used,
+        );
+        tracing::debug!(parent: &planner_span, "planner.message_ready");
+        let scheduler_span = tracing::info_span!(
+            "scheduler.budget_gate",
+            trace_id = %ctx.trace_id,
+            request_id = %ctx.request_id,
+            session_id = %ctx.session_id,
+            phase = "rlm_loop",
+            msg_type = %msg_type,
+            bridge_depth,
+            depth_used,
+            operator_calls_used,
+            bytes_used,
+        );
 
         match msg_type {
             "call_operator" => {
@@ -760,15 +979,17 @@ pub(super) async fn run_context_loop_rlm(
                     stop_reason = Some("bridge_invalid_message");
                     break;
                 }
-                if depth >= budget.max_recursion_depth {
-                    stop_reason = Some("budget_max_recursion_depth");
+                if let Err(reason) = scheduler_span.in_scope(|| scheduler.check_depth(depth)) {
+                    stop_reason = Some(reason.as_str());
                     budget_violation = true;
                     break;
                 }
                 depth_used = depth_used.max(depth.saturating_add(1));
 
-                if operator_calls_used >= budget.max_operator_calls {
-                    stop_reason = Some("budget_max_operator_calls");
+                if let Err(reason) =
+                    scheduler_span.in_scope(|| scheduler.check_operator_calls(operator_calls_used))
+                {
+                    stop_reason = Some(reason.as_str());
                     budget_violation = true;
                     break;
                 }
@@ -848,8 +1069,8 @@ pub(super) async fn run_context_loop_rlm(
                     break;
                 }
 
-                if bytes_used > budget.max_bytes {
-                    stop_reason = Some("budget_max_bytes");
+                if let Err(reason) = scheduler_span.in_scope(|| scheduler.check_bytes(bytes_used)) {
+                    stop_reason = Some(reason.as_str());
                     budget_violation = true;
                     break;
                 }
@@ -871,109 +1092,251 @@ pub(super) async fn run_context_loop_rlm(
                     stop_reason = Some("bridge_invalid_message");
                     break;
                 }
-                if depth >= budget.max_recursion_depth {
-                    stop_reason = Some("budget_max_recursion_depth");
+                if let Err(reason) = scheduler_span.in_scope(|| scheduler.check_depth(depth)) {
+                    stop_reason = Some(reason.as_str());
                     budget_violation = true;
                     break;
                 }
                 depth_used = depth_used.max(depth.saturating_add(1));
 
-                let parallelism = effective_parallelism(budget);
-                let mut next_call_idx = 0usize;
-                let mut in_flight = FuturesUnordered::new();
-                let mut scheduled_calls: u32 = 0;
                 let mut batch_results = vec![serde_json::Value::Null; calls.len()];
                 let mut break_outer = false;
 
-                'batch_loop: loop {
-                    while in_flight.len() < parallelism {
-                        if operator_calls_used.saturating_add(scheduled_calls)
-                            >= budget.max_operator_calls
+                if !state.config.batch_mode_enabled {
+                    for (idx, call) in calls.iter().enumerate() {
+                        if let Err(reason) = scheduler_span
+                            .in_scope(|| scheduler.check_operator_calls(operator_calls_used))
                         {
-                            stop_reason = Some("budget_max_operator_calls");
+                            stop_reason = Some(reason.as_str());
                             budget_violation = true;
                             break_outer = true;
-                            break 'batch_loop;
-                        }
-
-                        let Some(call) = calls.get(next_call_idx) else {
                             break;
-                        };
+                        }
 
                         let op_name = call.op_name.trim();
                         if op_name.is_empty() || !allowed_operator(op_name) {
                             stop_reason = Some("bridge_operator_not_allowlisted");
                             break_outer = true;
-                            break 'batch_loop;
+                            break;
                         }
 
-                        let Some(timeout) = remaining_wallclock(budget, loop_start) else {
-                            stop_reason = Some("budget_max_wallclock_ms");
+                        let Some(timeout) = scheduler.remaining_wallclock() else {
+                            stop_reason = Some(BudgetStopReason::MaxWallclockMs.as_str());
                             budget_violation = true;
                             break_outer = true;
-                            break 'batch_loop;
+                            break;
                         };
 
-                        let idx = next_call_idx;
-                        next_call_idx += 1;
-                        scheduled_calls = scheduled_calls.saturating_add(1);
-                        let params = call.params.clone();
-                        let op_name_owned = op_name.to_string();
-                        in_flight.push(async move {
-                            (
+                        let outcome =
+                            call_operator(state, ctx, op_name, call.params.clone(), timeout)
+                                .await?;
+                        operator_calls_used = operator_calls_used.saturating_add(1);
+                        bytes_used = bytes_used.saturating_add(outcome.bytes_len as u64);
+
+                        if let Some(body) = outcome.body {
+                            let terminal_mode_for_resp = body.terminal_mode;
+                            let result = body.result;
+                            record_operator_result(
+                                op_name,
+                                &result,
+                                &mut evidence_refs,
+                                &mut evidence_units,
+                            );
+                            batch_results[idx] = serde_json::json!({
+                                "ok": true,
+                                "op_name": op_name,
+                                "terminal_mode": terminal_mode_for_resp.as_str(),
+                                "result": result,
+                                "bytes_len": outcome.bytes_len,
+                            });
+                        } else {
+                            terminal_mode = outcome.terminal_mode_hint;
+                            stop_reason = Some("operator_error");
+                            batch_results[idx] = serde_json::json!({
+                                "ok": false,
+                                "op_name": op_name,
+                                "terminal_mode": outcome.terminal_mode_hint.as_str(),
+                                "result": serde_json::Value::Null,
+                                "bytes_len": outcome.bytes_len,
+                            });
+                            break_outer = true;
+                            break;
+                        }
+
+                        if let Err(reason) =
+                            scheduler_span.in_scope(|| scheduler.check_bytes(bytes_used))
+                        {
+                            stop_reason = Some(reason.as_str());
+                            budget_violation = true;
+                            break_outer = true;
+                            break;
+                        }
+                    }
+                } else {
+                    let mut pending_by_operator: HashMap<String, VecDeque<PendingBatchCall>> =
+                        HashMap::new();
+                    let mut max_in_flight_by_operator: HashMap<String, usize> = HashMap::new();
+                    let mut in_flight_by_operator: HashMap<String, usize> = HashMap::new();
+                    let mut fairness_ring = VecDeque::<String>::new();
+
+                    for (idx, call) in calls.iter().enumerate() {
+                        let op_name = call.op_name.trim();
+                        if op_name.is_empty() || !allowed_operator(op_name) {
+                            stop_reason = Some("bridge_operator_not_allowlisted");
+                            break_outer = true;
+                            break;
+                        }
+
+                        if !pending_by_operator.contains_key(op_name) {
+                            let policy = state.config.operator_concurrency_policies.get(op_name);
+                            let fairness_weight =
+                                policy.and_then(|p| p.fairness_weight).unwrap_or(1) as usize;
+                            let max_in_flight =
+                                policy.and_then(|p| p.max_in_flight).unwrap_or(usize::MAX);
+                            let op_name_owned = op_name.to_string();
+                            pending_by_operator.insert(op_name_owned.clone(), VecDeque::new());
+                            max_in_flight_by_operator.insert(op_name_owned.clone(), max_in_flight);
+                            in_flight_by_operator.insert(op_name_owned.clone(), 0);
+                            for _ in 0..fairness_weight {
+                                fairness_ring.push_back(op_name_owned.clone());
+                            }
+                        }
+
+                        if let Some(queue) = pending_by_operator.get_mut(op_name) {
+                            queue.push_back(PendingBatchCall {
                                 idx,
-                                op_name_owned.clone(),
-                                call_operator(state, ctx, op_name_owned.as_str(), params, timeout)
-                                    .await,
-                            )
-                        });
+                                params: call.params.clone(),
+                            });
+                        }
                     }
 
-                    let Some((idx, op_name, outcome)) = in_flight.next().await else {
+                    if break_outer {
                         break;
-                    };
-                    scheduled_calls = scheduled_calls.saturating_sub(1);
+                    }
+                    if fairness_ring.is_empty() {
+                        stop_reason = Some("bridge_invalid_message");
+                        break;
+                    }
 
-                    let outcome = outcome?;
-                    operator_calls_used = operator_calls_used.saturating_add(1);
-                    bytes_used = bytes_used.saturating_add(outcome.bytes_len as u64);
+                    let mut in_flight = FuturesUnordered::new();
+                    let mut scheduled_calls: u32 = 0;
 
-                    if let Some(body) = outcome.body {
-                        let terminal_mode_for_resp = body.terminal_mode;
-                        let result = body.result;
-                        record_operator_result(
-                            op_name.as_str(),
-                            &result,
-                            &mut evidence_refs,
-                            &mut evidence_units,
+                    'batch_loop: loop {
+                        let parallelism = scheduler_parallelism(
+                            state,
+                            scheduler,
+                            operator_calls_used,
+                            scheduled_calls,
                         );
+                        while in_flight.len() < parallelism {
+                            if let Err(reason) = scheduler_span.in_scope(|| {
+                                scheduler.check_operator_calls_with_reserved(
+                                    operator_calls_used,
+                                    scheduled_calls,
+                                )
+                            }) {
+                                stop_reason = Some(reason.as_str());
+                                budget_violation = true;
+                                break_outer = true;
+                                break 'batch_loop;
+                            }
 
-                        batch_results[idx] = serde_json::json!({
-                            "ok": true,
-                            "op_name": op_name,
-                            "terminal_mode": terminal_mode_for_resp.as_str(),
-                            "result": result,
-                            "bytes_len": outcome.bytes_len,
-                        });
-                    } else {
-                        terminal_mode = outcome.terminal_mode_hint;
-                        stop_reason = Some("operator_error");
-                        batch_results[idx] = serde_json::json!({
-                            "ok": false,
-                            "op_name": op_name,
-                            "terminal_mode": outcome.terminal_mode_hint.as_str(),
-                            "result": serde_json::Value::Null,
-                            "bytes_len": outcome.bytes_len,
-                        });
-                        break_outer = true;
-                        break;
-                    }
+                            let has_pending_calls =
+                                pending_by_operator.values().any(|queue| !queue.is_empty());
+                            if !has_pending_calls {
+                                break;
+                            }
 
-                    if bytes_used > budget.max_bytes {
-                        stop_reason = Some("budget_max_bytes");
-                        budget_violation = true;
-                        break_outer = true;
-                        break;
+                            let Some((idx, op_name, params)) = next_fair_batch_call(
+                                &mut fairness_ring,
+                                &mut pending_by_operator,
+                                &mut in_flight_by_operator,
+                                &max_in_flight_by_operator,
+                            ) else {
+                                break;
+                            };
+
+                            let Some(timeout) = scheduler.remaining_wallclock() else {
+                                stop_reason = Some(BudgetStopReason::MaxWallclockMs.as_str());
+                                budget_violation = true;
+                                break_outer = true;
+                                break 'batch_loop;
+                            };
+
+                            scheduled_calls = scheduled_calls.saturating_add(1);
+                            let queued_at = Instant::now();
+                            in_flight.push(async move {
+                                crate::metrics::observe_operator_queue_wait(queued_at.elapsed());
+                                (
+                                    idx,
+                                    op_name.clone(),
+                                    call_operator(state, ctx, op_name.as_str(), params, timeout)
+                                        .await,
+                                )
+                            });
+                        }
+
+                        if in_flight.is_empty() {
+                            let has_pending_calls =
+                                pending_by_operator.values().any(|queue| !queue.is_empty());
+                            if !has_pending_calls {
+                                break;
+                            }
+                            stop_reason = Some("bridge_invalid_message");
+                            break_outer = true;
+                            break;
+                        }
+
+                        let Some((idx, op_name, outcome)) = in_flight.next().await else {
+                            break;
+                        };
+                        scheduled_calls = scheduled_calls.saturating_sub(1);
+                        if let Some(in_flight) = in_flight_by_operator.get_mut(op_name.as_str()) {
+                            *in_flight = in_flight.saturating_sub(1);
+                        }
+
+                        let outcome = outcome?;
+                        operator_calls_used = operator_calls_used.saturating_add(1);
+                        bytes_used = bytes_used.saturating_add(outcome.bytes_len as u64);
+
+                        if let Some(body) = outcome.body {
+                            let terminal_mode_for_resp = body.terminal_mode;
+                            let result = body.result;
+                            record_operator_result(
+                                op_name.as_str(),
+                                &result,
+                                &mut evidence_refs,
+                                &mut evidence_units,
+                            );
+                            batch_results[idx] = serde_json::json!({
+                                "ok": true,
+                                "op_name": op_name,
+                                "terminal_mode": terminal_mode_for_resp.as_str(),
+                                "result": result,
+                                "bytes_len": outcome.bytes_len,
+                            });
+                        } else {
+                            terminal_mode = outcome.terminal_mode_hint;
+                            stop_reason = Some("operator_error");
+                            batch_results[idx] = serde_json::json!({
+                                "ok": false,
+                                "op_name": op_name,
+                                "terminal_mode": outcome.terminal_mode_hint.as_str(),
+                                "result": serde_json::Value::Null,
+                                "bytes_len": outcome.bytes_len,
+                            });
+                            break_outer = true;
+                            break;
+                        }
+
+                        if let Err(reason) =
+                            scheduler_span.in_scope(|| scheduler.check_bytes(bytes_used))
+                        {
+                            stop_reason = Some(reason.as_str());
+                            budget_violation = true;
+                            break_outer = true;
+                            break;
+                        }
                     }
                 }
 
@@ -1028,6 +1391,7 @@ pub(super) async fn run_context_loop_rlm(
     }
 
     let stop_reason = stop_reason.unwrap_or("unknown");
+    crate::metrics::observe_budget_stop_reason(stop_reason);
     let stop_is_bridge_failure = matches!(
         stop_reason,
         "bridge_eof"

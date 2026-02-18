@@ -268,31 +268,69 @@ class VerbosePrinter:
         prompt_preview: str,
         response_preview: str,
         execution_time: float | None = None,
+        metadata: dict | None = None,
     ) -> None:
-        """Print a sub-call to another model."""
+        """Print a sub-call to another model.
+
+        Args:
+            model: The model name used for the sub-call.
+            prompt_preview: Preview of the prompt sent.
+            response_preview: Preview of the response received.
+            execution_time: Time taken for the sub-call.
+            metadata: If present, this was a recursive RLM call (rlm_query).
+                      Contains "iterations" and "run_metadata" keys.
+        """
         if not self.enabled:
             return
 
+        is_rlm_call = metadata is not None
+
         # Header
         header = Text()
-        header.append("  ↳ ", style=STYLE_SECONDARY)
-        header.append("Sub-call: ", style=STYLE_SECONDARY)
+        if is_rlm_call:
+            header.append("  ↳ ", style=STYLE_SECONDARY)
+            header.append("RLM Sub-call: ", style=STYLE_SECONDARY)
+        else:
+            header.append("  ↳ ", style=STYLE_MUTED)
+            header.append("LLM Sub-call: ", style=STYLE_MUTED)
         header.append(_to_str(model), style=STYLE_ACCENT)
         if execution_time:
             header.append(f"  ({execution_time:.2f}s)", style=STYLE_MUTED)
 
         # Content
         content = Text()
-        content.append("Prompt: ", style=STYLE_MUTED)
-        content.append(_to_str(prompt_preview), style=STYLE_TEXT)
-        content.append("\nResponse: ", style=STYLE_MUTED)
-        content.append(_to_str(response_preview), style=STYLE_TEXT)
 
+        # Show child RLM summary when metadata is available
+        if is_rlm_call:
+            iterations = metadata.get("iterations", [])
+            iteration_count = len(iterations)
+            content.append(f"Iterations: {iteration_count}", style=STYLE_WARNING)
+            run_meta = metadata.get("run_metadata", {})
+            depth = run_meta.get("depth")
+            if depth is not None:
+                content.append(f"  |  Depth: {depth}", style=STYLE_MUTED)
+            content.append("\n")
+
+        # Truncate previews for readability
+        max_preview = 200
+        prompt_str = _to_str(prompt_preview)
+        response_str = _to_str(response_preview)
+        if len(prompt_str) > max_preview:
+            prompt_str = prompt_str[:max_preview] + "…"
+        if len(response_str) > max_preview:
+            response_str = response_str[:max_preview] + "…"
+
+        content.append("Prompt: ", style=STYLE_MUTED)
+        content.append(prompt_str, style=STYLE_TEXT)
+        content.append("\nResponse: ", style=STYLE_MUTED)
+        content.append(response_str, style=STYLE_TEXT)
+
+        border = COLORS["secondary"] if is_rlm_call else COLORS["muted"]
         panel = Panel(
             content,
             title=header,
             title_align="left",
-            border_style=COLORS["secondary"],
+            border_style=border,
             padding=(0, 1),
         )
         self.console.print(panel)
@@ -322,7 +360,111 @@ class VerbosePrinter:
                     prompt_preview=_to_str(call.prompt) if call.prompt else "",
                     response_preview=_to_str(call.response) if call.response else "",
                     execution_time=call.execution_time,
+                    metadata=call.metadata,
                 )
+
+    def print_budget_exceeded(self, spent: float, budget: float) -> None:
+        """Print a budget exceeded warning."""
+        if not self.enabled:
+            return
+
+        # Title
+        title = Text()
+        title.append("⚠ ", style=STYLE_ERROR)
+        title.append("Budget Exceeded", style=Style(color=COLORS["error"], bold=True))
+
+        # Content
+        content = Text()
+        content.append(f"Spent: ${spent:.6f}\n", style=STYLE_ERROR)
+        content.append(f"Budget: ${budget:.6f}", style=STYLE_MUTED)
+
+        panel = Panel(
+            content,
+            title=title,
+            title_align="left",
+            border_style=COLORS["error"],
+            padding=(0, 2),
+        )
+
+        self.console.print()
+        self.console.print(panel)
+        self.console.print()
+
+    def print_limit_exceeded(self, limit_type: str, details: str) -> None:
+        """Print a limit exceeded warning (timeout, tokens, errors, cancellation)."""
+        if not self.enabled:
+            return
+
+        # Map limit type to display name
+        limit_names = {
+            "timeout": "Timeout Exceeded",
+            "tokens": "Token Limit Exceeded",
+            "errors": "Error Threshold Exceeded",
+            "cancelled": "Execution Cancelled",
+        }
+        display_name = limit_names.get(limit_type, f"{limit_type.title()} Limit Exceeded")
+
+        # Title
+        title = Text()
+        title.append("⚠ ", style=STYLE_ERROR)
+        title.append(display_name, style=Style(color=COLORS["error"], bold=True))
+
+        # Content
+        content = Text(details, style=STYLE_ERROR)
+
+        panel = Panel(
+            content,
+            title=title,
+            title_align="left",
+            border_style=COLORS["error"],
+            padding=(0, 2),
+        )
+
+        self.console.print()
+        self.console.print(panel)
+
+    def print_compaction_status(
+        self,
+        current_tokens: int,
+        threshold_tokens: int,
+        max_tokens: int,
+    ) -> None:
+        """Print how close root context is to compaction threshold (before next turn)."""
+        if not self.enabled:
+            return
+        pct = (current_tokens / threshold_tokens * 100) if threshold_tokens else 0
+        line = Text()
+        line.append("Context: ", style=STYLE_MUTED)
+        line.append(f"{current_tokens:,}", style=STYLE_TEXT)
+        line.append(" / ", style=STYLE_MUTED)
+        line.append(f"{threshold_tokens:,}", style=STYLE_SECONDARY)
+        line.append(" tokens ", style=STYLE_MUTED)
+        line.append(f"({pct:.0f}% of compaction threshold)", style=STYLE_MUTED)
+        if current_tokens >= threshold_tokens:
+            line.append(" — compacting", style=STYLE_WARNING)
+        self.console.print(line)
+
+    def print_compaction(self) -> None:
+        """Print that context compaction (summarization) is running."""
+        if not self.enabled:
+            return
+
+        title = Text()
+        title.append("◐ ", style=STYLE_ACCENT)
+        title.append("Compaction", style=STYLE_SECONDARY)
+        title.append(" — summarizing context, continuing from summary", style=STYLE_MUTED)
+
+        self.console.print()
+        self.console.print(
+            Panel(
+                Text("Root context reached threshold. Summarizing and continuing."),
+                title=title,
+                title_align="left",
+                border_style=COLORS["muted"],
+                padding=(0, 1),
+            )
+        )
+        self.console.print()
 
     def print_final_answer(self, answer: Any) -> None:
         """Print the final answer."""
@@ -381,9 +523,12 @@ class VerbosePrinter:
                 m.get("total_output_tokens", 0)
                 for m in usage_summary.get("model_usage_summaries", {}).values()
             )
+            total_cost = usage_summary.get("total_cost")
             if total_input or total_output:
                 summary_table.add_row("Input Tokens", f"{total_input:,}")
                 summary_table.add_row("Output Tokens", f"{total_output:,}")
+            if total_cost is not None:
+                summary_table.add_row("Total Cost", f"${total_cost:.6f}")
 
         # Wrap in rule
         self.console.print()

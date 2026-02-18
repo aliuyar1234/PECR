@@ -1,4 +1,4 @@
 /target/
 **/*.rs.bk
 .DS_Store
-
+docs/ROADMAP_ENHANCEMENT_PLAN.md

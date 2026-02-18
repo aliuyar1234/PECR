@@ -1,0 +1,15 @@
+{
+  "name": "list_versions.basic",
+  "op_name": "list_versions",
+  "params": {
+    "object_id": "public/public_1.txt"
+  },
+  "allowed_terminal_modes": [
+    "SUPPORTED",
+    "INSUFFICIENT_PERMISSION",
+    "SOURCE_UNAVAILABLE"
+  ],
+  "required_result_paths": [
+    "versions"
+  ]
+}

@@ -18,15 +18,37 @@ RETRY_SLEEP_SECS="${RETRY_SLEEP_SECS:-2}"
 PECR_LOCAL_AUTH_SHARED_SECRET="${PECR_LOCAL_AUTH_SHARED_SECRET:-suite7-local-auth-secret}"
 METRICS_PRINCIPAL_ID="${METRICS_PRINCIPAL_ID:-dev}"
 METRICS_AUTH_HEADER="${METRICS_AUTH_HEADER:-}"
+PECR_CONTROLLER_ENGINE_OVERRIDE="${PECR_CONTROLLER_ENGINE_OVERRIDE:-}"
+PECR_RLM_SANDBOX_ACK="${PECR_RLM_SANDBOX_ACK:-1}"
 export PECR_LOCAL_AUTH_SHARED_SECRET
 
 OUT_DIR="target/perf"
+CONTROLLER_BASELINE_SUMMARY_NAME="${CONTROLLER_BASELINE_SUMMARY_NAME:-suite7_baseline.summary.json}"
+GATEWAY_BASELINE_SUMMARY_NAME="${GATEWAY_BASELINE_SUMMARY_NAME:-suite7_gateway_baseline.summary.json}"
+METRICS_GATES_FILE="${METRICS_GATES_FILE:-${OUT_DIR}/suite7_metrics_gates.json}"
+SUITE7_SKIP_FAULTS="${SUITE7_SKIP_FAULTS:-0}"
+COMPOSE_OVERRIDE_FILE=""
 
 mkdir -p "$OUT_DIR"
 chmod 777 "$OUT_DIR"
 
+if [[ -n "${PECR_CONTROLLER_ENGINE_OVERRIDE}" ]]; then
+  COMPOSE_OVERRIDE_FILE="$(mktemp)"
+  cat >"${COMPOSE_OVERRIDE_FILE}" <<EOF
+services:
+  controller:
+    environment:
+      PECR_CONTROLLER_ENGINE: "${PECR_CONTROLLER_ENGINE_OVERRIDE}"
+      PECR_RLM_SANDBOX_ACK: "${PECR_RLM_SANDBOX_ACK}"
+EOF
+fi
+
 docker_compose() {
-  docker compose "$@"
+  if [[ -n "${COMPOSE_OVERRIDE_FILE}" ]]; then
+    docker compose -f docker-compose.yml -f "${COMPOSE_OVERRIDE_FILE}" "$@"
+  else
+    docker compose "$@"
+  fi
 }
 
 retry_cmd() {
@@ -55,6 +77,10 @@ suite7_cleanup() {
 
   if [[ "${PECR_PERF_KEEP_STACK:-0}" != "1" ]]; then
     docker_compose down -v --remove-orphans >/dev/null 2>&1 || true
+  fi
+
+  if [[ -n "${COMPOSE_OVERRIDE_FILE}" && -f "${COMPOSE_OVERRIDE_FILE}" ]]; then
+    rm -f "${COMPOSE_OVERRIDE_FILE}"
   fi
 }
 
@@ -149,7 +175,7 @@ run_k6_controller_baseline() {
     -e VUS="$BASELINE_VUS" \
     -e DURATION="$BASELINE_DURATION" \
     k6 run --summary-trend-stats "min,avg,med,max,p(90),p(95),p(99)" \
-      --summary-export "/results/suite7_baseline.summary.json" /scripts/suite7_controller_run.js
+      --summary-export "/results/${CONTROLLER_BASELINE_SUMMARY_NAME}" /scripts/suite7_controller_run.js
 }
 
 run_k6_gateway_fetch_rows() {
@@ -190,45 +216,49 @@ python3 scripts/perf/check_bvr_ser.py \
   --controller-after "${OUT_DIR}/metrics_controller.after.prom" \
   --bvr-threshold "${BVR_THRESHOLD}" \
   --ser-threshold "${SER_THRESHOLD}" \
-  --output-json "${OUT_DIR}/suite7_metrics_gates.json"
+  --output-json "${METRICS_GATES_FILE}"
 
 echo "[suite7] baseline gateway fetch_rows (p99 budget ${GATEWAY_P99_BUDGET_MS}ms; vus=${FAULT_VUS}; duration=${FAULT_DURATION})"
 run_k6_gateway_fetch_rows \
-  "suite7_gateway_baseline" \
+  "${GATEWAY_BASELINE_SUMMARY_NAME%.summary.json}" \
   "SUPPORTED" \
   "safe_customer_view_public" \
   "1" \
   "$GATEWAY_P99_BUDGET_MS"
 
-echo "[suite7] fault: opa unavailable"
-retry_cmd docker_compose stop opa
-run_k6_controller "suite7_fault_opa_unavailable" "SOURCE_UNAVAILABLE" "0"
-retry_cmd docker_compose start opa
-wait_for_http "gateway" "http://127.0.0.1:8080/healthz"
+if [[ "${SUITE7_SKIP_FAULTS}" == "1" ]]; then
+  echo "[suite7] faults skipped (SUITE7_SKIP_FAULTS=1)"
+else
+  echo "[suite7] fault: opa unavailable"
+  retry_cmd docker_compose stop opa
+  run_k6_controller "suite7_fault_opa_unavailable" "SOURCE_UNAVAILABLE" "0"
+  retry_cmd docker_compose start opa
+  wait_for_http "gateway" "http://127.0.0.1:8080/healthz"
 
-echo "[suite7] fault: opa timeout"
-retry_cmd docker_compose --profile faults up -d --force-recreate opa_blackhole
-PECR_OPA_URL="http://opa_blackhole:8181" PECR_OPA_TIMEOUT_MS="50" recreate_gateway
-run_k6_controller "suite7_fault_opa_timeout" "SOURCE_UNAVAILABLE" "0"
-recreate_gateway
-retry_cmd docker_compose --profile faults stop opa_blackhole
+  echo "[suite7] fault: opa timeout"
+  retry_cmd docker_compose --profile faults up -d --force-recreate opa_blackhole
+  PECR_OPA_URL="http://opa_blackhole:8181" PECR_OPA_TIMEOUT_MS="50" recreate_gateway
+  run_k6_controller "suite7_fault_opa_timeout" "SOURCE_UNAVAILABLE" "0"
+  recreate_gateway
+  retry_cmd docker_compose --profile faults stop opa_blackhole
 
-echo "[suite7] fault: postgres unavailable"
-retry_cmd docker_compose stop postgres
-run_k6_controller "suite7_fault_postgres_unavailable" "SOURCE_UNAVAILABLE" "0"
-retry_cmd docker_compose start postgres
-wait_for_postgres
-ensure_safeview_fixtures
-recreate_gateway
+  echo "[suite7] fault: postgres unavailable"
+  retry_cmd docker_compose stop postgres
+  run_k6_controller "suite7_fault_postgres_unavailable" "SOURCE_UNAVAILABLE" "0"
+  retry_cmd docker_compose start postgres
+  wait_for_postgres
+  ensure_safeview_fixtures
+  recreate_gateway
 
-echo "[suite7] fault: adapter statement_timeout (pg_safeview)"
-PECR_PG_SAFEVIEW_QUERY_TIMEOUT_MS="5" recreate_gateway
-run_k6_gateway_fetch_rows \
-  "suite7_fault_pg_statement_timeout" \
-  "SOURCE_UNAVAILABLE" \
-  "safe_customer_view_public_slow" \
-  "0" \
-  "$GATEWAY_P99_BUDGET_MS"
-recreate_gateway
+  echo "[suite7] fault: adapter statement_timeout (pg_safeview)"
+  PECR_PG_SAFEVIEW_QUERY_TIMEOUT_MS="5" recreate_gateway
+  run_k6_gateway_fetch_rows \
+    "suite7_fault_pg_statement_timeout" \
+    "SOURCE_UNAVAILABLE" \
+    "safe_customer_view_public_slow" \
+    "0" \
+    "$GATEWAY_P99_BUDGET_MS"
+  recreate_gateway
+fi
 
 echo "[suite7] done; summaries in ${OUT_DIR}"

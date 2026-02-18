@@ -1,19 +1,24 @@
-use axum::extract::State;
+use axum::extract::{Path, Query, State};
 use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pecr_auth::{OidcAuthenticator, Principal};
 use pecr_contracts::canonical;
-use pecr_contracts::{Budget, ClaimMap, TerminalMode};
+use pecr_contracts::{
+    Budget, ClaimMap, EngineMode, ReplayBundle, ReplayBundleMetadata, ReplayEvaluationResult,
+    ReplayEvaluationSubmission, RunQualityScorecard, TerminalMode,
+};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
+use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
 use ulid::Ulid;
 
 use crate::config::{AuthMode, ControllerConfig, ControllerEngine, StartupError};
 use crate::rate_limit::RateLimiter;
+use crate::replay::{PersistedRun, ReplayStore, hash_principal_id};
 
 mod budget;
 mod finalize;
@@ -33,6 +38,7 @@ pub struct AppState {
     http: reqwest::Client,
     oidc: Option<OidcAuthenticator>,
     rate_limiter: RateLimiter,
+    replay_store: ReplayStore,
 }
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
@@ -60,11 +66,20 @@ pub async fn router(config: ControllerConfig) -> Result<Router, StartupError> {
         Duration::from_secs(config.rate_limit_window_secs.max(1)),
         16_384,
     );
+    let replay_store = ReplayStore::new(
+        PathBuf::from(config.replay_store_dir.clone()),
+        config.replay_retention_days,
+    )
+    .map_err(|err| StartupError {
+        code: "ERR_REPLAY_STORE_INIT",
+        message: format!("failed to initialize replay store: {}", err),
+    })?;
     let state = AppState {
         config,
         http: reqwest::Client::new(),
         oidc,
         rate_limiter,
+        replay_store,
     };
 
     Ok(Router::new()
@@ -72,6 +87,11 @@ pub async fn router(config: ControllerConfig) -> Result<Router, StartupError> {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/v1/run", post(run))
+        .route("/v1/replays", get(list_replays))
+        .route("/v1/replays/{run_id}", get(get_replay))
+        .route("/v1/evaluations", post(submit_evaluation))
+        .route("/v1/evaluations/scorecards", get(get_scorecards))
+        .route("/v1/evaluations/{evaluation_id}", get(get_evaluation))
         .with_state(state))
 }
 
@@ -225,6 +245,19 @@ async fn run(
             ControllerEngine::Baseline => run_context_loop(&state, ctx, &query, &budget).await?,
             ControllerEngine::Rlm => run_context_loop_rlm(&state, ctx, &query, &budget).await?,
         };
+        let loop_terminal_mode = loop_result.terminal_mode;
+        let loop_response_text = loop_result.response_text.clone();
+        let operator_calls_used = loop_result.operator_calls_used;
+        let bytes_used = loop_result.bytes_used;
+        let depth_used = loop_result.depth_used;
+        let evidence_ref_count = loop_result.evidence_refs.len() as u32;
+        let mut evidence_unit_ids = loop_result
+            .evidence_units
+            .iter()
+            .map(|unit| unit.evidence_unit_id.clone())
+            .collect::<Vec<_>>();
+        evidence_unit_ids.sort();
+        evidence_unit_ids.dedup();
 
         let finalize_span = tracing::info_span!(
             "finalize.compile",
@@ -241,8 +274,8 @@ async fn run(
 
             let response_text = loop_result
                 .response_text
-                .unwrap_or_else(|| response_text_for_terminal_mode(loop_result.terminal_mode));
-            let claim_map = build_claim_map(&response_text, loop_result.terminal_mode);
+                .unwrap_or_else(|| response_text_for_terminal_mode(loop_terminal_mode));
+            let claim_map = build_claim_map(&response_text, loop_terminal_mode);
 
             let finalized = finalize_session(&state, ctx, response_text, claim_map).await?;
 
@@ -255,12 +288,48 @@ async fn run(
         .instrument(finalize_span)
         .await?;
 
-        Ok(Json(RunResponse {
+        let run_response = RunResponse {
             terminal_mode: finalized.terminal_mode,
+            trace_id: finalized.trace_id.clone(),
+            claim_map: finalized.claim_map.clone(),
+            response_text: finalized.response_text.clone(),
+        };
+
+        let persisted_run = PersistedRun {
             trace_id: finalized.trace_id,
-            claim_map: finalized.claim_map,
-            response_text: finalized.response_text,
-        }))
+            request_id: request_id.clone(),
+            principal_id: principal_id.clone(),
+            engine_mode: state.config.controller_engine,
+            query: query.clone(),
+            budget: budget.clone(),
+            session_id: session.session.session_id.clone(),
+            policy_snapshot_id: session.session.policy_snapshot_id.clone(),
+            loop_terminal_mode,
+            loop_response_text,
+            terminal_mode: run_response.terminal_mode,
+            response_text: run_response.response_text.clone(),
+            claim_map: run_response.claim_map.clone(),
+            operator_calls_used,
+            bytes_used,
+            depth_used,
+            evidence_ref_count,
+            evidence_unit_ids,
+        };
+        if let Err(err) = run_replay_store_io(&state, move |replay_store| {
+            replay_store.persist_run(persisted_run)
+        })
+        .await
+        {
+            tracing::warn!(
+                request_id = %request_id,
+                trace_id = %run_response.trace_id,
+                principal_id = %principal_id,
+                error = %err,
+                "controller.replay_persist_failed"
+            );
+        }
+
+        Ok(Json(run_response))
     }
     .instrument(span)
     .await;
@@ -285,6 +354,159 @@ async fn run(
     }
 
     handler_result
+}
+
+#[derive(Debug, Deserialize)]
+struct ReplayListQuery {
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    engine_mode: Option<EngineMode>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplayListResponse {
+    replays: Vec<ReplayBundleMetadata>,
+}
+
+#[derive(Debug, Serialize)]
+struct ReplayScorecardsResponse {
+    scorecards: Vec<RunQualityScorecard>,
+}
+
+async fn list_replays(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ReplayListQuery>,
+) -> Result<Json<ReplayListResponse>, ApiError> {
+    let principal = extract_principal(&state, &headers).await?;
+    let principal_id_hash = hash_principal_id(&principal.principal_id);
+    let limit = query
+        .limit
+        .unwrap_or(state.config.replay_list_limit)
+        .max(1)
+        .min(state.config.replay_list_limit);
+    let engine_mode = query.engine_mode;
+    let replays = run_replay_store_io(&state, move |replay_store| {
+        replay_store.list_replay_metadata(&principal_id_hash, limit, engine_mode)
+    })
+    .await
+    .map_err(map_replay_store_error)?;
+
+    Ok(Json(ReplayListResponse { replays }))
+}
+
+async fn get_replay(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(run_id): Path<String>,
+) -> Result<Json<ReplayBundle>, ApiError> {
+    let principal = extract_principal(&state, &headers).await?;
+    let principal_id_hash = hash_principal_id(&principal.principal_id);
+    let Some(bundle) = run_replay_store_io(&state, move |replay_store| {
+        replay_store.load_replay(&principal_id_hash, run_id.as_str())
+    })
+    .await
+    .map_err(map_replay_store_error)?
+    else {
+        return Err(json_error(
+            StatusCode::NOT_FOUND,
+            "ERR_REPLAY_NOT_FOUND",
+            "replay run was not found".to_string(),
+            TerminalMode::InsufficientPermission,
+            false,
+        ));
+    };
+
+    Ok(Json(bundle))
+}
+
+async fn submit_evaluation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(req): Json<ReplayEvaluationSubmission>,
+) -> Result<Json<ReplayEvaluationResult>, ApiError> {
+    if let Some(min_quality_score) = req.min_quality_score
+        && !(0.0..=100.0).contains(&min_quality_score)
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "ERR_INVALID_PARAMS",
+            "min_quality_score must be in [0, 100]".to_string(),
+            TerminalMode::InsufficientEvidence,
+            false,
+        ));
+    }
+
+    if let Some(max_source_unavailable_rate) = req.max_source_unavailable_rate
+        && !(0.0..=1.0).contains(&max_source_unavailable_rate)
+    {
+        return Err(json_error(
+            StatusCode::BAD_REQUEST,
+            "ERR_INVALID_PARAMS",
+            "max_source_unavailable_rate must be in [0, 1]".to_string(),
+            TerminalMode::InsufficientEvidence,
+            false,
+        ));
+    }
+
+    let principal = extract_principal(&state, &headers).await?;
+    let principal_id_hash = hash_principal_id(&principal.principal_id);
+    let max_runs = state.config.replay_list_limit;
+    let result = run_replay_store_io(&state, move |replay_store| {
+        replay_store.submit_evaluation(&principal_id_hash, req, max_runs)
+    })
+    .await
+    .map_err(map_replay_store_error)?;
+
+    Ok(Json(result))
+}
+
+async fn get_evaluation(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(evaluation_id): Path<String>,
+) -> Result<Json<ReplayEvaluationResult>, ApiError> {
+    let principal = extract_principal(&state, &headers).await?;
+    let principal_id_hash = hash_principal_id(&principal.principal_id);
+    let Some(result) = run_replay_store_io(&state, move |replay_store| {
+        replay_store.load_evaluation(&principal_id_hash, evaluation_id.as_str())
+    })
+    .await
+    .map_err(map_replay_store_error)?
+    else {
+        return Err(json_error(
+            StatusCode::NOT_FOUND,
+            "ERR_EVALUATION_NOT_FOUND",
+            "evaluation result was not found".to_string(),
+            TerminalMode::InsufficientPermission,
+            false,
+        ));
+    };
+
+    Ok(Json(result))
+}
+
+async fn get_scorecards(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ReplayListQuery>,
+) -> Result<Json<ReplayScorecardsResponse>, ApiError> {
+    let principal = extract_principal(&state, &headers).await?;
+    let principal_id_hash = hash_principal_id(&principal.principal_id);
+    let limit = query
+        .limit
+        .unwrap_or(state.config.replay_list_limit)
+        .max(1)
+        .min(state.config.replay_list_limit);
+    let engine_mode = query.engine_mode;
+    let scorecards = run_replay_store_io(&state, move |replay_store| {
+        replay_store.scorecards_for_principal(&principal_id_hash, limit, engine_mode)
+    })
+    .await
+    .map_err(map_replay_store_error)?;
+
+    Ok(Json(ReplayScorecardsResponse { scorecards }))
 }
 
 #[derive(Debug, Serialize)]
@@ -530,6 +752,43 @@ async fn gateway_non_success_response(response: reqwest::Response) -> ApiError {
     }
 }
 
+async fn run_replay_store_io<T, F>(state: &AppState, operation: F) -> std::io::Result<T>
+where
+    T: Send + 'static,
+    F: FnOnce(ReplayStore) -> std::io::Result<T> + Send + 'static,
+{
+    let replay_store = state.replay_store.clone();
+    tokio::task::spawn_blocking(move || operation(replay_store))
+        .await
+        .map_err(map_replay_store_join_error)?
+}
+
+fn map_replay_store_join_error(err: tokio::task::JoinError) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::Other,
+        format!("replay store task failed: {}", err),
+    )
+}
+
+fn map_replay_store_error(err: std::io::Error) -> ApiError {
+    match err.kind() {
+        std::io::ErrorKind::InvalidInput => json_error(
+            StatusCode::BAD_REQUEST,
+            "ERR_INVALID_PARAMS",
+            err.to_string(),
+            TerminalMode::InsufficientEvidence,
+            false,
+        ),
+        _ => json_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "ERR_REPLAY_STORE",
+            format!("replay store operation failed: {}", err),
+            TerminalMode::SourceUnavailable,
+            true,
+        ),
+    }
+}
+
 fn extract_authorization_header(headers: &HeaderMap) -> Option<String> {
     headers
         .get(header::AUTHORIZATION)
@@ -742,11 +1001,158 @@ mod tests {
     use axum::extract::State;
     use axum::routing::post;
     use axum::{Json, Router};
+    #[cfg(feature = "rlm")]
+    use std::collections::HashMap;
+    #[cfg(feature = "rlm")]
+    use std::fs;
     use std::net::SocketAddr;
+    #[cfg(feature = "rlm")]
+    use std::path::PathBuf;
     use std::sync::Arc;
+    #[cfg(feature = "rlm")]
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    #[cfg(feature = "rlm")]
+    use std::time::{SystemTime, UNIX_EPOCH};
     use tokio::net::TcpListener;
     use tokio::sync::oneshot;
+
+    #[cfg(feature = "rlm")]
+    static RLM_SCRIPT_ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    #[cfg(feature = "rlm")]
+    #[derive(Clone, Default)]
+    struct BatchGatewayMetrics {
+        start_order: Arc<Mutex<Vec<String>>>,
+        in_flight_by_operator: Arc<Mutex<HashMap<String, usize>>>,
+        max_in_flight_by_operator: Arc<Mutex<HashMap<String, usize>>>,
+    }
+
+    #[cfg(feature = "rlm")]
+    impl BatchGatewayMetrics {
+        fn record_start(&self, op_name: &str) {
+            self.start_order
+                .lock()
+                .expect("start order lock should not be poisoned")
+                .push(op_name.to_string());
+
+            let mut in_flight = self
+                .in_flight_by_operator
+                .lock()
+                .expect("in flight lock should not be poisoned");
+            let current = in_flight.entry(op_name.to_string()).or_insert(0);
+            *current += 1;
+
+            let mut max = self
+                .max_in_flight_by_operator
+                .lock()
+                .expect("max in flight lock should not be poisoned");
+            let max_seen = max.entry(op_name.to_string()).or_insert(0);
+            if *max_seen < *current {
+                *max_seen = *current;
+            }
+        }
+
+        fn record_end(&self, op_name: &str) {
+            if let Some(current) = self
+                .in_flight_by_operator
+                .lock()
+                .expect("in flight lock should not be poisoned")
+                .get_mut(op_name)
+            {
+                *current = current.saturating_sub(1);
+            }
+        }
+
+        fn start_order_snapshot(&self) -> Vec<String> {
+            self.start_order
+                .lock()
+                .expect("start order lock should not be poisoned")
+                .clone()
+        }
+
+        fn max_in_flight_for(&self, op_name: &str) -> usize {
+            *self
+                .max_in_flight_by_operator
+                .lock()
+                .expect("max in flight lock should not be poisoned")
+                .get(op_name)
+                .unwrap_or(&0)
+        }
+    }
+
+    #[cfg(feature = "rlm")]
+    #[derive(Clone)]
+    struct BatchGatewayState {
+        metrics: BatchGatewayMetrics,
+        delay_ms: u64,
+    }
+
+    #[cfg(feature = "rlm")]
+    async fn spawn_batch_gateway(
+        state: BatchGatewayState,
+    ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        async fn search(
+            State(state): State<BatchGatewayState>,
+            Json(_): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            state.metrics.record_start("search");
+            tokio::time::sleep(Duration::from_millis(state.delay_ms)).await;
+            state.metrics.record_end("search");
+            Json(serde_json::json!({
+                "terminal_mode": "SUPPORTED",
+                "result": { "refs": [] }
+            }))
+        }
+
+        async fn fetch_span(
+            State(state): State<BatchGatewayState>,
+            Json(_): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            state.metrics.record_start("fetch_span");
+            tokio::time::sleep(Duration::from_millis(state.delay_ms)).await;
+            state.metrics.record_end("fetch_span");
+            Json(serde_json::json!({
+                "terminal_mode": "SUPPORTED",
+                "result": {
+                    "source_system": "fs_corpus",
+                    "object_id": "public/public_1.txt",
+                    "version_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "span_or_row_spec": { "type": "text_span", "start_byte": 0, "end_byte": 0, "line_start": 1, "line_end": 1 },
+                    "content_type": "text/plain",
+                    "content": "unit-test",
+                    "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "retrieved_at": "1970-01-01T00:00:00Z",
+                    "as_of_time": "1970-01-01T00:00:00Z",
+                    "policy_snapshot_id": "policy",
+                    "policy_snapshot_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "transform_chain": [],
+                    "evidence_unit_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                }
+            }))
+        }
+
+        let app = Router::new()
+            .route("/v1/operators/search", post(search))
+            .route("/v1/operators/fetch_span", post(fetch_span))
+            .with_state(state);
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should succeed");
+        let addr = listener.local_addr().expect("local_addr should succeed");
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        (addr, shutdown_tx, handle)
+    }
 
     async fn spawn_mock_gateway(
         counter: Arc<AtomicUsize>,
@@ -943,6 +1349,8 @@ mod tests {
         budget: Budget,
         baseline_plan: Vec<crate::config::BaselinePlanStep>,
     ) -> AppState {
+        let replay_store_dir =
+            std::env::temp_dir().join(format!("pecr-controller-http-tests-{}", Ulid::new()));
         AppState {
             config: ControllerConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("bind addr must parse"),
@@ -951,17 +1359,144 @@ mod tests {
                 model_provider: crate::config::ModelProvider::Mock,
                 budget_defaults: budget,
                 baseline_plan,
+                adaptive_parallelism_enabled: true,
+                batch_mode_enabled: true,
+                operator_concurrency_policies: std::collections::HashMap::new(),
                 auth_mode: crate::config::AuthMode::Local,
                 local_auth_shared_secret: None,
                 oidc: None,
                 metrics_require_auth: false,
                 rate_limit_window_secs: 60,
                 rate_limit_run_per_window: 1_000,
+                replay_store_dir: replay_store_dir.display().to_string(),
+                replay_retention_days: 30,
+                replay_list_limit: 200,
             },
             http: reqwest::Client::new(),
             oidc: None,
             rate_limiter: RateLimiter::new(Duration::from_secs(60), 1024),
+            replay_store: ReplayStore::new(replay_store_dir, 30)
+                .expect("replay store should initialize"),
         }
+    }
+
+    #[cfg(feature = "rlm")]
+    fn write_temp_bridge_script(contents: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be monotonic enough for tests")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!("pecr-rlm-bridge-test-{}.py", nanos));
+        fs::write(&path, contents).expect("temp bridge script must be writable");
+        path
+    }
+
+    #[tokio::test]
+    async fn replay_and_evaluation_handlers_return_principal_scoped_data() {
+        let gateway_addr: SocketAddr = "127.0.0.1:1".parse().expect("socket address should parse");
+        let budget = Budget {
+            max_operator_calls: 10,
+            max_bytes: 2048,
+            max_wallclock_ms: 1_000,
+            max_recursion_depth: 4,
+            max_parallelism: Some(1),
+        };
+        let state = controller_state(
+            gateway_addr,
+            budget.clone(),
+            crate::config::default_baseline_plan(),
+        );
+
+        let claim_map = build_claim_map(
+            "UNKNOWN: insufficient evidence to answer",
+            TerminalMode::InsufficientEvidence,
+        );
+        let replay_meta = state
+            .replay_store
+            .persist_run(PersistedRun {
+                trace_id: Ulid::new().to_string(),
+                request_id: "req-test-replay-api".to_string(),
+                principal_id: "dev".to_string(),
+                engine_mode: ControllerEngine::Baseline,
+                query: "q".to_string(),
+                budget,
+                session_id: "session".to_string(),
+                policy_snapshot_id: "policy".to_string(),
+                loop_terminal_mode: TerminalMode::InsufficientEvidence,
+                loop_response_text: Some("UNKNOWN: insufficient evidence".to_string()),
+                terminal_mode: TerminalMode::InsufficientEvidence,
+                response_text: "UNKNOWN: insufficient evidence".to_string(),
+                claim_map,
+                operator_calls_used: 2,
+                bytes_used: 100,
+                depth_used: 2,
+                evidence_ref_count: 0,
+                evidence_unit_ids: Vec::new(),
+            })
+            .expect("persist run should succeed");
+
+        let mut headers = HeaderMap::new();
+        headers.insert("x-pecr-principal-id", HeaderValue::from_static("dev"));
+
+        let list = list_replays(
+            State(state.clone()),
+            headers.clone(),
+            Query(ReplayListQuery {
+                limit: Some(10),
+                engine_mode: None,
+            }),
+        )
+        .await
+        .expect("list_replays should succeed");
+        assert_eq!(list.0.replays.len(), 1);
+
+        let replay = get_replay(
+            State(state.clone()),
+            headers.clone(),
+            Path(replay_meta.run_id.clone()),
+        )
+        .await
+        .expect("get_replay should succeed");
+        assert_eq!(replay.0.metadata.run_id, replay_meta.run_id);
+
+        let evaluation = submit_evaluation(
+            State(state.clone()),
+            headers.clone(),
+            Json(ReplayEvaluationSubmission {
+                evaluation_name: "smoke-eval".to_string(),
+                replay_ids: vec![replay.0.metadata.run_id.clone()],
+                engine_mode: None,
+                min_quality_score: Some(0.0),
+                max_source_unavailable_rate: Some(1.0),
+            }),
+        )
+        .await
+        .expect("submit_evaluation should succeed");
+        assert_eq!(evaluation.0.replay_ids.len(), 1);
+
+        let fetched_evaluation = get_evaluation(
+            State(state.clone()),
+            headers.clone(),
+            Path(evaluation.0.evaluation_id.clone()),
+        )
+        .await
+        .expect("get_evaluation should succeed");
+        assert_eq!(
+            fetched_evaluation.0.evaluation_id,
+            evaluation.0.evaluation_id
+        );
+
+        let scorecards = get_scorecards(
+            State(state),
+            headers,
+            Query(ReplayListQuery {
+                limit: Some(10),
+                engine_mode: None,
+            }),
+        )
+        .await
+        .expect("get_scorecards should succeed");
+        assert_eq!(scorecards.0.scorecards.len(), 1);
     }
 
     #[tokio::test]
@@ -1165,6 +1700,9 @@ mod tests {
     #[cfg(feature = "rlm")]
     #[tokio::test]
     async fn rlm_loop_executes_batch_calls_with_parallelism_budget() {
+        let _env_lock = RLM_SCRIPT_ENV_LOCK
+            .lock()
+            .expect("rlm script env lock should not be poisoned");
         let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("..")
             .join("..")
@@ -1225,6 +1763,434 @@ mod tests {
         assert_eq!(result.operator_calls_used, 5);
         assert_eq!(max_in_flight.load(Ordering::SeqCst), 2);
         assert_eq!(result.evidence_refs.len(), 2);
+    }
+
+    #[cfg(feature = "rlm")]
+    #[tokio::test]
+    async fn rlm_loop_batch_mode_flag_off_falls_back_to_sequential() {
+        let _env_lock = RLM_SCRIPT_ENV_LOCK
+            .lock()
+            .expect("rlm script env lock should not be poisoned");
+        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("scripts")
+            .join("rlm")
+            .join("pecr_rlm_bridge.py");
+        assert!(script_path.exists(), "rlm bridge script must exist");
+
+        let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+        // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let (gateway_addr, shutdown, task) =
+            spawn_parallel_fetch_gateway(in_flight, max_in_flight.clone()).await;
+
+        let budget = Budget {
+            max_operator_calls: 100,
+            max_bytes: 1024 * 1024,
+            max_wallclock_ms: 10_000,
+            max_recursion_depth: 10,
+            max_parallelism: Some(4),
+        };
+        let mut state = controller_state(
+            gateway_addr,
+            budget.clone(),
+            crate::config::default_baseline_plan(),
+        );
+        state.config.batch_mode_enabled = false;
+        let ctx = GatewayCallContext {
+            principal_id: "dev",
+            authz_header: None,
+            local_auth_shared_secret: None,
+            request_id: "req_test_rlm_batch_off",
+            trace_id: "trace_test_rlm_batch_off",
+            session_token: "token",
+            session_id: "session",
+        };
+        let result = run_context_loop_rlm(&state, ctx, "query", &budget).await;
+
+        shutdown.send(()).ok();
+        let _ = task.await;
+        if let Some(previous) = previous_script_path {
+            // Safety: restoring the test-local env var mutation.
+            unsafe {
+                std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+            }
+        } else {
+            // Safety: restoring the test-local env var mutation.
+            unsafe {
+                std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+            }
+        }
+
+        let result = result.expect("rlm context loop should succeed");
+        assert_eq!(result.operator_calls_used, 5);
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 1);
+    }
+
+    #[cfg(feature = "rlm")]
+    #[tokio::test]
+    async fn rlm_loop_batch_scheduler_applies_weighted_fairness() {
+        let _env_lock = RLM_SCRIPT_ENV_LOCK
+            .lock()
+            .expect("rlm script env lock should not be poisoned");
+        let script_path = write_temp_bridge_script(
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+line = sys.stdin.readline()
+json.loads(line)
+sys.stdout.write(json.dumps({"type": "start_ack", "protocol_version": 1}) + "\n")
+sys.stdout.flush()
+
+batch_id = "batch_fairness"
+calls = [
+    {"op_name": "search", "params": {"query": "q1"}},
+    {"op_name": "search", "params": {"query": "q2"}},
+    {"op_name": "search", "params": {"query": "q3"}},
+    {"op_name": "fetch_span", "params": {"object_id": "o1"}},
+    {"op_name": "fetch_span", "params": {"object_id": "o2"}},
+]
+sys.stdout.write(json.dumps({"type": "call_operator_batch", "id": batch_id, "depth": 0, "calls": calls}) + "\n")
+sys.stdout.flush()
+
+resp = json.loads(sys.stdin.readline())
+if resp.get("type") != "operator_batch_result" or resp.get("id") != batch_id:
+    raise SystemExit("unexpected batch response")
+
+sys.stdout.write(json.dumps({"type": "done", "final_answer": "UNKNOWN: fairness"}) + "\n")
+sys.stdout.flush()
+"#,
+        );
+
+        let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+        // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+        }
+
+        let metrics = BatchGatewayMetrics::default();
+        let (gateway_addr, shutdown, task) = spawn_batch_gateway(BatchGatewayState {
+            metrics: metrics.clone(),
+            delay_ms: 5,
+        })
+        .await;
+
+        let budget = Budget {
+            max_operator_calls: 100,
+            max_bytes: 1024 * 1024,
+            max_wallclock_ms: 10_000,
+            max_recursion_depth: 10,
+            max_parallelism: Some(1),
+        };
+        let mut state = controller_state(
+            gateway_addr,
+            budget.clone(),
+            crate::config::default_baseline_plan(),
+        );
+        state.config.operator_concurrency_policies.insert(
+            "fetch_span".to_string(),
+            crate::config::OperatorConcurrencyPolicy {
+                max_in_flight: None,
+                fairness_weight: Some(2),
+            },
+        );
+        let ctx = GatewayCallContext {
+            principal_id: "dev",
+            authz_header: None,
+            local_auth_shared_secret: None,
+            request_id: "req_test_rlm_fairness",
+            trace_id: "trace_test_rlm_fairness",
+            session_token: "token",
+            session_id: "session",
+        };
+        let result = run_context_loop_rlm(&state, ctx, "query", &budget).await;
+
+        shutdown.send(()).ok();
+        let _ = task.await;
+        if let Some(previous) = previous_script_path {
+            // Safety: restoring the test-local env var mutation.
+            unsafe {
+                std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+            }
+        } else {
+            // Safety: restoring the test-local env var mutation.
+            unsafe {
+                std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+            }
+        }
+        let _ = fs::remove_file(&script_path);
+
+        let result = result.expect("rlm context loop should succeed");
+        assert_eq!(result.operator_calls_used, 5);
+        assert_eq!(
+            metrics.start_order_snapshot(),
+            vec![
+                "search".to_string(),
+                "fetch_span".to_string(),
+                "fetch_span".to_string(),
+                "search".to_string(),
+                "search".to_string(),
+            ]
+        );
+    }
+
+    #[cfg(feature = "rlm")]
+    #[tokio::test]
+    async fn rlm_loop_batch_scheduler_enforces_per_operator_in_flight_caps() {
+        let _env_lock = RLM_SCRIPT_ENV_LOCK
+            .lock()
+            .expect("rlm script env lock should not be poisoned");
+        let script_path = write_temp_bridge_script(
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+line = sys.stdin.readline()
+json.loads(line)
+sys.stdout.write(json.dumps({"type": "start_ack", "protocol_version": 1}) + "\n")
+sys.stdout.flush()
+
+batch_id = "batch_caps"
+calls = [
+    {"op_name": "search", "params": {"query": "q1"}},
+    {"op_name": "search", "params": {"query": "q2"}},
+    {"op_name": "search", "params": {"query": "q3"}},
+    {"op_name": "fetch_span", "params": {"object_id": "o1"}},
+    {"op_name": "fetch_span", "params": {"object_id": "o2"}},
+    {"op_name": "fetch_span", "params": {"object_id": "o3"}},
+]
+sys.stdout.write(json.dumps({"type": "call_operator_batch", "id": batch_id, "depth": 0, "calls": calls}) + "\n")
+sys.stdout.flush()
+
+resp = json.loads(sys.stdin.readline())
+if resp.get("type") != "operator_batch_result" or resp.get("id") != batch_id:
+    raise SystemExit("unexpected batch response")
+
+sys.stdout.write(json.dumps({"type": "done", "final_answer": "UNKNOWN: caps"}) + "\n")
+sys.stdout.flush()
+"#,
+        );
+
+        let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+        // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+        }
+
+        let metrics = BatchGatewayMetrics::default();
+        let (gateway_addr, shutdown, task) = spawn_batch_gateway(BatchGatewayState {
+            metrics: metrics.clone(),
+            delay_ms: 60,
+        })
+        .await;
+
+        let budget = Budget {
+            max_operator_calls: 100,
+            max_bytes: 1024 * 1024,
+            max_wallclock_ms: 10_000,
+            max_recursion_depth: 10,
+            max_parallelism: Some(4),
+        };
+        let mut state = controller_state(
+            gateway_addr,
+            budget.clone(),
+            crate::config::default_baseline_plan(),
+        );
+        state.config.operator_concurrency_policies.insert(
+            "search".to_string(),
+            crate::config::OperatorConcurrencyPolicy {
+                max_in_flight: Some(1),
+                fairness_weight: None,
+            },
+        );
+        state.config.operator_concurrency_policies.insert(
+            "fetch_span".to_string(),
+            crate::config::OperatorConcurrencyPolicy {
+                max_in_flight: Some(1),
+                fairness_weight: None,
+            },
+        );
+        let ctx = GatewayCallContext {
+            principal_id: "dev",
+            authz_header: None,
+            local_auth_shared_secret: None,
+            request_id: "req_test_rlm_caps",
+            trace_id: "trace_test_rlm_caps",
+            session_token: "token",
+            session_id: "session",
+        };
+        let result = run_context_loop_rlm(&state, ctx, "query", &budget).await;
+
+        shutdown.send(()).ok();
+        let _ = task.await;
+        if let Some(previous) = previous_script_path {
+            // Safety: restoring the test-local env var mutation.
+            unsafe {
+                std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+            }
+        } else {
+            // Safety: restoring the test-local env var mutation.
+            unsafe {
+                std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+            }
+        }
+        let _ = fs::remove_file(&script_path);
+
+        let result = result.expect("rlm context loop should succeed");
+        assert_eq!(result.operator_calls_used, 6);
+        assert_eq!(metrics.max_in_flight_for("search"), 1);
+        assert_eq!(metrics.max_in_flight_for("fetch_span"), 1);
+    }
+
+    #[cfg(feature = "rlm")]
+    #[tokio::test]
+    async fn rlm_loop_supports_legacy_bridge_without_start_ack() {
+        let _env_lock = RLM_SCRIPT_ENV_LOCK
+            .lock()
+            .expect("rlm script env lock should not be poisoned");
+        let script_path = write_temp_bridge_script(
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+line = sys.stdin.readline()
+json.loads(line)
+sys.stdout.write(json.dumps({"type": "done", "final_answer": "UNKNOWN: legacy bridge"}) + "\n")
+sys.stdout.flush()
+"#,
+        );
+
+        let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+        // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (gateway_addr, shutdown, task) = spawn_mock_gateway(counter.clone()).await;
+
+        let budget = Budget {
+            max_operator_calls: 10,
+            max_bytes: 1024 * 1024,
+            max_wallclock_ms: 10_000,
+            max_recursion_depth: 10,
+            max_parallelism: Some(2),
+        };
+        let state = controller_state(
+            gateway_addr,
+            budget.clone(),
+            crate::config::default_baseline_plan(),
+        );
+        let ctx = GatewayCallContext {
+            principal_id: "dev",
+            authz_header: None,
+            local_auth_shared_secret: None,
+            request_id: "req_test_rlm_legacy",
+            trace_id: "trace_test_rlm_legacy",
+            session_token: "token",
+            session_id: "session",
+        };
+        let result = run_context_loop_rlm(&state, ctx, "query", &budget).await;
+
+        shutdown.send(()).ok();
+        let _ = task.await;
+        if let Some(previous) = previous_script_path {
+            // Safety: restoring the test-local env var mutation.
+            unsafe {
+                std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+            }
+        } else {
+            // Safety: restoring the test-local env var mutation.
+            unsafe {
+                std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+            }
+        }
+        let _ = fs::remove_file(&script_path);
+
+        let result = result.expect("legacy bridge without start_ack should still work");
+        assert_eq!(
+            result.response_text.as_deref(),
+            Some("UNKNOWN: legacy bridge")
+        );
+        assert_eq!(result.operator_calls_used, 0);
+        assert_eq!(counter.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(feature = "rlm")]
+    #[tokio::test]
+    async fn rlm_loop_rejects_unsupported_bridge_protocol_version() {
+        let _env_lock = RLM_SCRIPT_ENV_LOCK
+            .lock()
+            .expect("rlm script env lock should not be poisoned");
+        let script_path = write_temp_bridge_script(
+            r#"#!/usr/bin/env python3
+import json
+import sys
+
+line = sys.stdin.readline()
+json.loads(line)
+sys.stdout.write(json.dumps({"type": "start_ack", "protocol_version": 99}) + "\n")
+sys.stdout.flush()
+"#,
+        );
+
+        let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+        // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+        }
+
+        let counter = Arc::new(AtomicUsize::new(0));
+        let (gateway_addr, shutdown, task) = spawn_mock_gateway(counter).await;
+
+        let budget = Budget {
+            max_operator_calls: 10,
+            max_bytes: 1024 * 1024,
+            max_wallclock_ms: 10_000,
+            max_recursion_depth: 10,
+            max_parallelism: Some(2),
+        };
+        let state = controller_state(
+            gateway_addr,
+            budget.clone(),
+            crate::config::default_baseline_plan(),
+        );
+        let ctx = GatewayCallContext {
+            principal_id: "dev",
+            authz_header: None,
+            local_auth_shared_secret: None,
+            request_id: "req_test_rlm_bad_protocol",
+            trace_id: "trace_test_rlm_bad_protocol",
+            session_token: "token",
+            session_id: "session",
+        };
+        let result = run_context_loop_rlm(&state, ctx, "query", &budget).await;
+
+        shutdown.send(()).ok();
+        let _ = task.await;
+        if let Some(previous) = previous_script_path {
+            // Safety: restoring the test-local env var mutation.
+            unsafe {
+                std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+            }
+        } else {
+            // Safety: restoring the test-local env var mutation.
+            unsafe {
+                std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+            }
+        }
+        let _ = fs::remove_file(&script_path);
+
+        let err = result.expect_err("unsupported bridge protocol must fail");
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.1.0.code, "ERR_RLM_BRIDGE_PROTOCOL");
     }
 
     #[test]

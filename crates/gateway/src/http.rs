@@ -63,6 +63,7 @@ pub struct AppState {
     operator_cache: OperatorCache,
     rate_limiter: RateLimiter,
     pg_pool: PgPool,
+    fs_search_index: Arc<RwLock<FsSearchIndexCache>>,
     fs_versions: Arc<RwLock<FsVersionCache>>,
     pg_versions: Arc<RwLock<FsVersionCache>>,
 }
@@ -136,6 +137,10 @@ pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
         config.fs_version_cache_max_versions_per_object,
     )));
 
+    let fs_search_index = Arc::new(RwLock::new(FsSearchIndexCache::new(Duration::from_millis(
+        config.cache_ttl_ms,
+    ))));
+
     let pg_versions = Arc::new(RwLock::new(FsVersionCache::new(
         config.fs_version_cache_max_bytes,
         config.fs_version_cache_max_versions_per_object,
@@ -149,6 +154,7 @@ pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
         operator_cache,
         rate_limiter,
         pg_pool,
+        fs_search_index,
         fs_versions,
         pg_versions,
     };
@@ -158,6 +164,7 @@ pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
         .route("/readyz", get(readyz))
         .route("/metrics", get(metrics))
         .route("/v1/sessions", post(create_session))
+        .route("/v1/policies/simulate", post(simulate_policy))
         .route("/v1/operators/{op_name}", post(call_operator))
         .route("/v1/finalize", post(finalize))
         .with_state(state))
@@ -239,6 +246,29 @@ struct CreateSessionResponse {
     trace_id: String,
     policy_snapshot_id: String,
     budget: Budget,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PolicySimulateRequest {
+    action: String,
+    params: serde_json::Map<String, serde_json::Value>,
+    #[serde(default)]
+    policy_snapshot_hash: Option<String>,
+    #[serde(default)]
+    policy_bundle_hash: Option<String>,
+    #[serde(default)]
+    as_of_time: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicySimulateResponse {
+    allow: bool,
+    cacheable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    redaction: Option<serde_json::Value>,
 }
 
 async fn create_session(
@@ -501,6 +531,144 @@ async fn create_session(
     result
 }
 
+async fn simulate_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    req: Result<Json<PolicySimulateRequest>, JsonRejection>,
+) -> Result<Json<PolicySimulateResponse>, ApiError> {
+    let started = Instant::now();
+    let result = async move {
+        let principal = extract_principal(&state, &headers).await?;
+        let principal_id = principal.principal_id.clone();
+        let request_id = extract_request_id(&headers);
+
+        let Json(req) = req.map_err(|_| {
+            json_error(
+                StatusCode::BAD_REQUEST,
+                "ERR_INVALID_PARAMS",
+                "invalid JSON body".to_string(),
+                TerminalMode::InsufficientEvidence,
+                false,
+            )
+        })?;
+
+        let action = req.action.trim();
+        if action.is_empty() {
+            return Err(json_error(
+                StatusCode::BAD_REQUEST,
+                "ERR_INVALID_PARAMS",
+                "action must be a non-empty string".to_string(),
+                TerminalMode::InsufficientEvidence,
+                false,
+            ));
+        }
+
+        let policy_snapshot_hash = parse_optional_sha256_hash(
+            req.policy_snapshot_hash.as_deref(),
+            "policy_snapshot_hash",
+        )?;
+        let policy_bundle_hash =
+            parse_optional_sha256_hash(req.policy_bundle_hash.as_deref(), "policy_bundle_hash")?
+                .or_else(|| Some(state.config.policy_bundle_hash.clone()));
+        let as_of_time = match req
+            .as_of_time
+            .as_deref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            Some(raw) => Some(sanitize_as_of_time(raw).ok_or_else(|| {
+                json_error(
+                    StatusCode::BAD_REQUEST,
+                    "ERR_INVALID_PARAMS",
+                    "as_of_time must be RFC3339 UTC (YYYY-MM-DDTHH:MM:SSZ)".to_string(),
+                    TerminalMode::InsufficientEvidence,
+                    false,
+                )
+            })?),
+            None => Some(state.config.as_of_time_default.clone()),
+        };
+
+        let params_value = serde_json::Value::Object(req.params.clone());
+        let params_hash = canonical::hash_canonical_json(&params_value);
+
+        let mut opa_input = serde_json::Map::new();
+        opa_input.insert(
+            "action".to_string(),
+            serde_json::Value::String(action.to_string()),
+        );
+        opa_input.insert(
+            "principal_id".to_string(),
+            serde_json::Value::String(principal_id.clone()),
+        );
+        opa_input.insert(
+            "request_id".to_string(),
+            serde_json::Value::String(request_id),
+        );
+        opa_input.insert("params".to_string(), params_value);
+
+        if let Some(hash) = policy_snapshot_hash.as_ref() {
+            opa_input.insert(
+                "policy_snapshot_hash".to_string(),
+                serde_json::Value::String(hash.clone()),
+            );
+        }
+        if let Some(hash) = policy_bundle_hash.as_ref() {
+            opa_input.insert(
+                "policy_bundle_hash".to_string(),
+                serde_json::Value::String(hash.clone()),
+            );
+        }
+        if let Some(value) = as_of_time.as_ref() {
+            opa_input.insert(
+                "as_of_time".to_string(),
+                serde_json::Value::String(value.clone()),
+            );
+        }
+
+        for (key, value) in req.params {
+            if key == "params" || opa_input.contains_key(key.as_str()) {
+                continue;
+            }
+            opa_input.insert(key, value);
+        }
+
+        let cache_key = OpaCacheKey::policy_simulation(
+            principal_id.as_str(),
+            action,
+            params_hash.as_str(),
+            policy_snapshot_hash.as_deref(),
+            policy_bundle_hash.as_deref(),
+            as_of_time.as_deref(),
+        );
+        let decision = state
+            .opa
+            .decide(serde_json::Value::Object(opa_input), Some(cache_key))
+            .await
+            .map_err(|err| opa_error_response(&err))?;
+
+        Ok(Json(PolicySimulateResponse {
+            allow: decision.allow,
+            cacheable: decision.cacheable,
+            reason: decision.reason,
+            redaction: decision.redaction,
+        }))
+    }
+    .await;
+
+    let status = match &result {
+        Ok(_) => StatusCode::OK,
+        Err((status, _)) => *status,
+    };
+    crate::metrics::observe_http_request(
+        "/v1/policies/simulate",
+        "POST",
+        status.as_u16(),
+        started.elapsed(),
+    );
+
+    result
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct OperatorCallRequest {
@@ -512,6 +680,8 @@ struct OperatorCallRequest {
 struct OperatorCallResponse {
     terminal_mode: TerminalMode,
     result: serde_json::Value,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    policy_decision: Option<serde_json::Value>,
 }
 
 async fn call_operator(
@@ -1030,6 +1200,21 @@ async fn call_operator(
             ));
         }
 
+        let policy_decision_payload = serde_json::json!({
+            "allow": decision.allow,
+            "cacheable": decision.cacheable,
+            "reason": decision.reason,
+            "redaction": decision.redaction,
+        });
+
+        let build_response = |terminal_mode: TerminalMode, result: serde_json::Value| {
+            OperatorCallResponse {
+                terminal_mode,
+                result,
+                policy_decision: Some(policy_decision_payload.clone()),
+            }
+        };
+
         let field_redaction = parse_field_redaction(decision.redaction.as_ref())?;
 
         let operator_span = match op_name.as_str() {
@@ -1201,24 +1386,14 @@ async fn call_operator(
                     let as_of_time = session.as_of_time.clone();
                     let policy_snapshot_hash = session.policy_snapshot_hash.clone();
                     let params = req.params.clone();
-                    let refs = tokio::task::spawn_blocking(move || {
-                        search_from_fs(
-                            fs_corpus_path.as_str(),
-                            as_of_time.as_str(),
-                            policy_snapshot_hash.as_str(),
-                            &params,
-                        )
-                    })
-                    .await
-                    .map_err(|_| {
-                        json_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "ERR_INTERNAL",
-                            "search execution task failed".to_string(),
-                            TerminalMode::SourceUnavailable,
-                            false,
-                        )
-                    })??;
+                    let refs = search_from_fs(
+                        &state.fs_search_index,
+                        fs_corpus_path.as_str(),
+                        as_of_time.as_str(),
+                        policy_snapshot_hash.as_str(),
+                        &params,
+                    )
+                    .await?;
                     let result = serde_json::json!({ "refs": refs });
                     state
                         .operator_cache
@@ -1246,10 +1421,7 @@ async fn call_operator(
                 (
                     StatusCode::OK,
                     None,
-                    OperatorCallResponse {
-                        terminal_mode,
-                        result,
-                    },
+                    build_response(terminal_mode, result),
                     Vec::new(),
                 )
             }
@@ -1284,10 +1456,7 @@ async fn call_operator(
                 (
                     StatusCode::OK,
                     None,
-                    OperatorCallResponse {
-                        terminal_mode: TerminalMode::Supported,
-                        result: serde_json::json!({ "versions": versions }),
-                    },
+                    build_response(TerminalMode::Supported, serde_json::json!({ "versions": versions })),
                     Vec::new(),
                 )
             }
@@ -1327,10 +1496,7 @@ async fn call_operator(
                 (
                     StatusCode::OK,
                     None,
-                    OperatorCallResponse {
-                        terminal_mode: TerminalMode::Supported,
-                        result,
-                    },
+                    build_response(TerminalMode::Supported, result),
                     evidence,
                 )
             }
@@ -1370,10 +1536,7 @@ async fn call_operator(
                 (
                     StatusCode::OK,
                     None,
-                    OperatorCallResponse {
-                        terminal_mode: TerminalMode::Supported,
-                        result,
-                    },
+                    build_response(TerminalMode::Supported, result),
                     vec![evidence],
                 )
             }
@@ -1428,10 +1591,7 @@ async fn call_operator(
                 (
                     StatusCode::OK,
                     None,
-                    OperatorCallResponse {
-                        terminal_mode: TerminalMode::Supported,
-                        result,
-                    },
+                    build_response(TerminalMode::Supported, result),
                     evidence,
                 )
             }
@@ -1483,10 +1643,7 @@ async fn call_operator(
                 (
                     StatusCode::OK,
                     None,
-                    OperatorCallResponse {
-                        terminal_mode: TerminalMode::Supported,
-                        result,
-                    },
+                    build_response(TerminalMode::Supported, result),
                     vec![evidence],
                 )
             }
@@ -1642,20 +1799,17 @@ async fn call_operator(
                 (
                     StatusCode::OK,
                     None,
-                    OperatorCallResponse {
-                        terminal_mode: TerminalMode::Supported,
-                        result,
-                    },
+                    build_response(TerminalMode::Supported, result),
                     evidence_emitted,
                 )
             }
             _ => (
                 StatusCode::NOT_IMPLEMENTED,
                 Some("ERR_INTERNAL"),
-                OperatorCallResponse {
-                    terminal_mode: TerminalMode::SourceUnavailable,
-                    result: serde_json::json!({"message":"operator execution not implemented yet"}),
-                },
+                build_response(
+                    TerminalMode::SourceUnavailable,
+                    serde_json::json!({"message":"operator execution not implemented yet"}),
+                ),
                 Vec::new(),
             ),
         };
@@ -1864,6 +2018,73 @@ struct VersionInfo {
     version_id: String,
     as_of_time: String,
     metadata_hash: String,
+}
+
+#[derive(Debug, Clone)]
+struct FsSearchIndexEntry {
+    path: std::path::PathBuf,
+    object_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct FsSearchIndexSnapshot {
+    root: std::path::PathBuf,
+    files: Arc<Vec<FsSearchIndexEntry>>,
+    indexed_at: Instant,
+}
+
+#[derive(Debug)]
+struct FsSearchIndexCache {
+    ttl: Duration,
+    snapshot: Option<FsSearchIndexSnapshot>,
+}
+
+impl FsSearchIndexCache {
+    fn new(ttl: Duration) -> Self {
+        Self {
+            ttl,
+            snapshot: None,
+        }
+    }
+
+    fn get_if_fresh(&self, root: &std::path::Path) -> Option<Arc<Vec<FsSearchIndexEntry>>> {
+        let snapshot = self.snapshot.as_ref()?;
+        if snapshot.root != root {
+            return None;
+        }
+        if self.ttl.is_zero() {
+            return None;
+        }
+        if snapshot.indexed_at.elapsed() >= self.ttl {
+            return None;
+        }
+
+        Some(snapshot.files.clone())
+    }
+
+    fn set_snapshot(
+        &mut self,
+        root: std::path::PathBuf,
+        files: Vec<FsSearchIndexEntry>,
+    ) -> Arc<Vec<FsSearchIndexEntry>> {
+        let files = Arc::new(files);
+        self.snapshot = Some(FsSearchIndexSnapshot {
+            root,
+            files: files.clone(),
+            indexed_at: Instant::now(),
+        });
+        files
+    }
+
+    fn invalidate(&mut self, root: &std::path::Path) {
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|snapshot| snapshot.root == root)
+        {
+            self.snapshot = None;
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -2448,7 +2669,8 @@ async fn fetch_span_from_fs(
     })
 }
 
-fn search_from_fs(
+async fn search_from_fs(
+    fs_search_index: &Arc<RwLock<FsSearchIndexCache>>,
     fs_corpus_path: &str,
     as_of_time_default: &str,
     policy_snapshot_hash: &str,
@@ -2476,7 +2698,7 @@ fn search_from_fs(
         .min(50) as usize;
 
     let base = std::path::Path::new(fs_corpus_path);
-    let base_canon = base.canonicalize().map_err(|_| {
+    let base_canon = tokio::fs::canonicalize(base).await.map_err(|_| {
         json_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "ERR_INTERNAL",
@@ -2486,105 +2708,206 @@ fn search_from_fs(
         )
     })?;
 
-    fn collect_files(
-        dir: &std::path::Path,
-        out: &mut Vec<std::path::PathBuf>,
-    ) -> std::io::Result<()> {
-        for entry in std::fs::read_dir(dir)? {
-            let entry = entry?;
-            let path = entry.path();
-            let meta = entry.metadata()?;
-            if meta.is_dir() {
-                collect_files(&path, out)?;
-            } else if meta.is_file() {
-                out.push(path);
-            }
-        }
-        Ok(())
-    }
-
-    let mut files = Vec::new();
-    collect_files(&base_canon, &mut files).map_err(|_| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ERR_INTERNAL",
-            "failed to enumerate filesystem corpus".to_string(),
-            TerminalMode::SourceUnavailable,
-            false,
-        )
-    })?;
-
-    files.sort_by(|a, b| a.to_string_lossy().cmp(&b.to_string_lossy()));
-
-    let mut refs = Vec::new();
-
-    for path in files {
-        if limit != 0 && refs.len() >= limit {
-            break;
-        }
-
-        let rel = match path.strip_prefix(&base_canon) {
-            Ok(rel) => rel,
-            Err(_) => continue,
+    let mut retried_after_invalidation = false;
+    loop {
+        let files = if retried_after_invalidation {
+            rebuild_fs_search_index(fs_search_index, &base_canon).await?
+        } else {
+            get_or_rebuild_fs_search_index(fs_search_index, &base_canon).await?
         };
 
-        let object_id = rel
-            .to_string_lossy()
-            .replace(std::path::MAIN_SEPARATOR, "/");
+        let mut refs = Vec::new();
+        let mut retry_needed = false;
 
-        let bytes = std::fs::read(&path).map_err(|_| {
+        for entry in files.iter() {
+            if limit != 0 && refs.len() >= limit {
+                break;
+            }
+
+            let bytes = match tokio::fs::read(&entry.path).await {
+                Ok(bytes) => bytes,
+                Err(_) if !retried_after_invalidation => {
+                    fs_search_index.write().await.invalidate(&base_canon);
+                    retried_after_invalidation = true;
+                    retry_needed = true;
+                    break;
+                }
+                Err(_) => {
+                    return Err(json_error(
+                        StatusCode::NOT_FOUND,
+                        "ERR_SOURCE_UNAVAILABLE",
+                        "object not found".to_string(),
+                        TerminalMode::SourceUnavailable,
+                        false,
+                    ));
+                }
+            };
+
+            let text = match std::str::from_utf8(&bytes) {
+                Ok(text) => text,
+                Err(_) => continue,
+            };
+
+            if !text.contains(query) {
+                continue;
+            }
+
+            let version_id = sha256_hex(&bytes);
+            let canonical_content = canonical::canonicalize_text_plain(text);
+            let content_hash = canonical::sha256_hex(canonical_content.as_bytes());
+
+            let newline_count = bytes.iter().filter(|b| **b == b'\n').count() as u64;
+            let span_or_row_spec = serde_json::json!({
+                "type": "text_span",
+                "start_byte": 0,
+                "end_byte": bytes.len() as u64,
+                "line_start": 1,
+                "line_end": 1 + newline_count,
+            });
+
+            let identity = serde_json::json!({
+                "source_system": "fs_corpus",
+                "object_id": entry.object_id.clone(),
+                "version_id": version_id.clone(),
+                "span_or_row_spec": span_or_row_spec,
+                "content_hash": content_hash,
+                "as_of_time": as_of_time_default,
+                "policy_snapshot_hash": policy_snapshot_hash,
+                "transform_chain": [],
+            });
+            let evidence_unit_id = canonical::hash_canonical_json(&identity);
+
+            refs.push(EvidenceUnitRef {
+                evidence_unit_id,
+                source_system: "fs_corpus".to_string(),
+                object_id: entry.object_id.clone(),
+                version_id,
+            });
+        }
+
+        if retry_needed {
+            continue;
+        }
+
+        return Ok(refs);
+    }
+}
+
+async fn get_or_rebuild_fs_search_index(
+    fs_search_index: &Arc<RwLock<FsSearchIndexCache>>,
+    base_canon: &std::path::Path,
+) -> Result<Arc<Vec<FsSearchIndexEntry>>, ApiError> {
+    if let Some(files) = fs_search_index.read().await.get_if_fresh(base_canon) {
+        return Ok(files);
+    }
+
+    rebuild_fs_search_index(fs_search_index, base_canon).await
+}
+
+async fn rebuild_fs_search_index(
+    fs_search_index: &Arc<RwLock<FsSearchIndexCache>>,
+    base_canon: &std::path::Path,
+) -> Result<Arc<Vec<FsSearchIndexEntry>>, ApiError> {
+    let files = build_fs_search_index(base_canon).await?;
+    let mut cache = fs_search_index.write().await;
+    Ok(cache.set_snapshot(base_canon.to_path_buf(), files))
+}
+
+async fn build_fs_search_index(
+    base_canon: &std::path::Path,
+) -> Result<Vec<FsSearchIndexEntry>, ApiError> {
+    let mut pending_dirs = vec![base_canon.to_path_buf()];
+    let mut visited_dirs = std::collections::HashSet::new();
+    visited_dirs.insert(base_canon.to_path_buf());
+    let mut files = Vec::new();
+
+    while let Some(dir) = pending_dirs.pop() {
+        let mut entries = tokio::fs::read_dir(&dir).await.map_err(|_| {
             json_error(
-                StatusCode::NOT_FOUND,
-                "ERR_SOURCE_UNAVAILABLE",
-                "object not found".to_string(),
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ERR_INTERNAL",
+                "failed to enumerate filesystem corpus".to_string(),
                 TerminalMode::SourceUnavailable,
                 false,
             )
         })?;
 
-        let text = match std::str::from_utf8(&bytes) {
-            Ok(text) => text,
-            Err(_) => continue,
-        };
+        while let Some(entry) = entries.next_entry().await.map_err(|_| {
+            json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "ERR_INTERNAL",
+                "failed to enumerate filesystem corpus".to_string(),
+                TerminalMode::SourceUnavailable,
+                false,
+            )
+        })? {
+            let path = entry.path();
+            let meta = tokio::fs::metadata(&path).await.map_err(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ERR_INTERNAL",
+                    "failed to enumerate filesystem corpus".to_string(),
+                    TerminalMode::SourceUnavailable,
+                    false,
+                )
+            })?;
 
-        if !text.contains(query) {
-            continue;
+            if meta.is_dir() {
+                let dir_canon = tokio::fs::canonicalize(&path).await.map_err(|_| {
+                    json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "ERR_INTERNAL",
+                        "failed to enumerate filesystem corpus".to_string(),
+                        TerminalMode::SourceUnavailable,
+                        false,
+                    )
+                })?;
+
+                if !dir_canon.starts_with(base_canon) {
+                    continue;
+                }
+
+                if visited_dirs.insert(dir_canon.clone()) {
+                    pending_dirs.push(dir_canon);
+                }
+                continue;
+            }
+
+            if !meta.is_file() {
+                continue;
+            }
+
+            let file_canon = tokio::fs::canonicalize(&path).await.map_err(|_| {
+                json_error(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "ERR_INTERNAL",
+                    "failed to enumerate filesystem corpus".to_string(),
+                    TerminalMode::SourceUnavailable,
+                    false,
+                )
+            })?;
+            if !file_canon.starts_with(base_canon) {
+                continue;
+            }
+
+            let rel = match path.strip_prefix(base_canon) {
+                Ok(rel) => rel,
+                Err(_) => continue,
+            };
+            if !is_safe_rel_path(rel) {
+                continue;
+            }
+
+            let object_id = rel
+                .to_string_lossy()
+                .replace(std::path::MAIN_SEPARATOR, "/");
+
+            files.push(FsSearchIndexEntry { path, object_id });
         }
-
-        let version_id = sha256_hex(&bytes);
-        let canonical_content = canonical::canonicalize_text_plain(text);
-        let content_hash = canonical::sha256_hex(canonical_content.as_bytes());
-
-        let newline_count = bytes.iter().filter(|b| **b == b'\n').count() as u64;
-        let span_or_row_spec = serde_json::json!({
-            "type": "text_span",
-            "start_byte": 0,
-            "end_byte": bytes.len() as u64,
-            "line_start": 1,
-            "line_end": 1 + newline_count,
-        });
-
-        let identity = serde_json::json!({
-            "source_system": "fs_corpus",
-            "object_id": object_id.clone(),
-            "version_id": version_id.clone(),
-            "span_or_row_spec": span_or_row_spec,
-            "content_hash": content_hash,
-            "as_of_time": as_of_time_default,
-            "policy_snapshot_hash": policy_snapshot_hash,
-            "transform_chain": [],
-        });
-        let evidence_unit_id = canonical::hash_canonical_json(&identity);
-
-        refs.push(EvidenceUnitRef {
-            evidence_unit_id,
-            source_system: "fs_corpus".to_string(),
-            object_id,
-            version_id,
-        });
     }
 
-    Ok(refs)
+    files.sort_by(|a, b| a.path.to_string_lossy().cmp(&b.path.to_string_lossy()));
+    Ok(files)
 }
 
 fn is_safe_rel_path(path: &std::path::Path) -> bool {
@@ -4114,6 +4437,30 @@ fn sanitize_request_id(raw: &str) -> Option<String> {
     }
 
     (!out.is_empty()).then_some(out)
+}
+
+fn parse_optional_sha256_hash(
+    raw: Option<&str>,
+    field_name: &str,
+) -> Result<Option<String>, ApiError> {
+    let Some(value) = raw
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+
+    if canonical::is_sha256_hex(value) {
+        return Ok(Some(value.to_string()));
+    }
+
+    Err(json_error(
+        StatusCode::BAD_REQUEST,
+        "ERR_INVALID_PARAMS",
+        format!("{} must be sha256 hex", field_name),
+        TerminalMode::InsufficientEvidence,
+        false,
+    ))
 }
 
 fn sanitize_as_of_time(raw: &str) -> Option<String> {

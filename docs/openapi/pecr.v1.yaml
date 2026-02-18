@@ -121,6 +121,52 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /v1/policies/simulate:
+    post:
+      summary: Simulate a policy decision
+      operationId: simulatePolicy
+      security:
+        - PecrLocalPrincipal: []
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XPecrRequestId"
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PolicySimulationRequest"
+      responses:
+        "200":
+          description: Policy simulation decision payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PolicySimulationResponse"
+        "400":
+          description: Invalid request payload or fields
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid principal credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Source unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "504":
+          description: Policy engine timeout
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/operators/{op_name}:
     post:
       summary: Execute allowlisted operator
@@ -166,6 +212,8 @@ paths:
                     $ref: "#/components/schemas/TerminalMode"
                   result:
                     type: object
+                  policy_decision:
+                    $ref: "#/components/schemas/PolicyDecision"
         "400":
           description: Invalid request
           content:
@@ -379,6 +427,211 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /v1/replays:
+    get:
+      summary: List persisted replay metadata for the authenticated principal
+      operationId: listReplays
+      security:
+        - PecrLocalPrincipal: []
+        - BearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+          description: Maximum replay records to return.
+        - name: engine_mode
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/EngineMode"
+      responses:
+        "200":
+          description: Replay metadata records
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [replays]
+                properties:
+                  replays:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/ReplayBundleMetadata"
+        "401":
+          description: Missing or invalid principal credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Replay store unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/replays/{run_id}:
+    get:
+      summary: Get full replay bundle for a run
+      operationId: getReplay
+      security:
+        - PecrLocalPrincipal: []
+        - BearerAuth: []
+      parameters:
+        - name: run_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Replay bundle payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReplayBundle"
+        "401":
+          description: Missing or invalid principal credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Replay bundle not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Replay store unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/evaluations:
+    post:
+      summary: Submit replay evaluation and return computed result
+      operationId: submitEvaluation
+      security:
+        - PecrLocalPrincipal: []
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReplayEvaluationSubmission"
+      responses:
+        "200":
+          description: Evaluation computed and persisted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReplayEvaluationResult"
+        "400":
+          description: Invalid evaluation parameters
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "401":
+          description: Missing or invalid principal credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Replay store unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/evaluations/scorecards:
+    get:
+      summary: Compute run quality scorecards grouped by engine mode
+      operationId: getRunQualityScorecards
+      security:
+        - PecrLocalPrincipal: []
+        - BearerAuth: []
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+        - name: engine_mode
+          in: query
+          required: false
+          schema:
+            $ref: "#/components/schemas/EngineMode"
+      responses:
+        "200":
+          description: Scorecards over persisted replay bundles
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: false
+                required: [scorecards]
+                properties:
+                  scorecards:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/RunQualityScorecard"
+        "401":
+          description: Missing or invalid principal credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Replay store unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+  /v1/evaluations/{evaluation_id}:
+    get:
+      summary: Fetch persisted evaluation result
+      operationId: getEvaluation
+      security:
+        - PecrLocalPrincipal: []
+        - BearerAuth: []
+      parameters:
+        - name: evaluation_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Evaluation result payload
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReplayEvaluationResult"
+        "401":
+          description: Missing or invalid principal credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "404":
+          description: Evaluation result not found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "500":
+          description: Replay store unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
 components:
   securitySchemes:
     PecrLocalPrincipal:
@@ -468,6 +721,11 @@ components:
         - INSUFFICIENT_EVIDENCE
         - INSUFFICIENT_PERMISSION
         - SOURCE_UNAVAILABLE
+    EngineMode:
+      type: string
+      enum:
+        - baseline
+        - rlm
     Claim:
       type: object
       additionalProperties: false
@@ -522,6 +780,284 @@ components:
           maximum: 1
         notes:
           type: string
+    ReplayBundleMetadata:
+      type: object
+      additionalProperties: false
+      required:
+        - schema_version
+        - run_id
+        - trace_id
+        - request_id
+        - principal_id_hash
+        - engine_mode
+        - recorded_at_unix_ms
+        - terminal_mode
+        - quality_score
+        - bundle_hash
+      properties:
+        schema_version:
+          type: integer
+          minimum: 1
+        run_id:
+          type: string
+          minLength: 1
+        trace_id:
+          type: string
+          minLength: 1
+        request_id:
+          type: string
+          minLength: 1
+        principal_id_hash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        engine_mode:
+          $ref: "#/components/schemas/EngineMode"
+        recorded_at_unix_ms:
+          type: integer
+          minimum: 0
+        terminal_mode:
+          $ref: "#/components/schemas/TerminalMode"
+        quality_score:
+          type: number
+          minimum: 0
+          maximum: 100
+        bundle_hash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+    ReplayBundle:
+      type: object
+      additionalProperties: false
+      required:
+        - metadata
+        - query
+        - budget
+        - session_id
+        - policy_snapshot_id
+        - loop_terminal_mode
+        - response_text
+        - claim_map
+        - operator_calls_used
+        - bytes_used
+        - depth_used
+        - evidence_ref_count
+        - evidence_unit_ids
+      properties:
+        metadata:
+          $ref: "#/components/schemas/ReplayBundleMetadata"
+        query:
+          type: string
+        budget:
+          $ref: "#/components/schemas/Budget"
+        session_id:
+          type: string
+        policy_snapshot_id:
+          type: string
+        loop_terminal_mode:
+          $ref: "#/components/schemas/TerminalMode"
+        loop_response_text:
+          type: string
+        response_text:
+          type: string
+        claim_map:
+          $ref: "#/components/schemas/ClaimMap"
+        operator_calls_used:
+          type: integer
+          minimum: 0
+        bytes_used:
+          type: integer
+          minimum: 0
+        depth_used:
+          type: integer
+          minimum: 0
+        evidence_ref_count:
+          type: integer
+          minimum: 0
+        evidence_unit_ids:
+          type: array
+          items:
+            type: string
+            pattern: "^[a-f0-9]{64}$"
+    ReplayEvaluationSubmission:
+      type: object
+      additionalProperties: false
+      required:
+        - evaluation_name
+      properties:
+        evaluation_name:
+          type: string
+          minLength: 1
+        replay_ids:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        engine_mode:
+          $ref: "#/components/schemas/EngineMode"
+        min_quality_score:
+          type: number
+          minimum: 0
+          maximum: 100
+        max_source_unavailable_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+    ReplayRunScore:
+      type: object
+      additionalProperties: false
+      required:
+        - run_id
+        - trace_id
+        - engine_mode
+        - terminal_mode
+        - quality_score
+        - coverage_observed
+      properties:
+        run_id:
+          type: string
+          minLength: 1
+        trace_id:
+          type: string
+          minLength: 1
+        engine_mode:
+          $ref: "#/components/schemas/EngineMode"
+        terminal_mode:
+          $ref: "#/components/schemas/TerminalMode"
+        quality_score:
+          type: number
+          minimum: 0
+          maximum: 100
+        coverage_observed:
+          type: number
+          minimum: 0
+          maximum: 1
+    RunQualityScorecard:
+      type: object
+      additionalProperties: false
+      required:
+        - engine_mode
+        - run_count
+        - average_quality_score
+        - minimum_quality_score
+        - maximum_quality_score
+        - supported_rate
+        - source_unavailable_rate
+        - average_coverage_observed
+      properties:
+        engine_mode:
+          $ref: "#/components/schemas/EngineMode"
+        run_count:
+          type: integer
+          minimum: 0
+        average_quality_score:
+          type: number
+          minimum: 0
+          maximum: 100
+        minimum_quality_score:
+          type: number
+          minimum: 0
+          maximum: 100
+        maximum_quality_score:
+          type: number
+          minimum: 0
+          maximum: 100
+        supported_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+        source_unavailable_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+        average_coverage_observed:
+          type: number
+          minimum: 0
+          maximum: 1
+    ReplayEvaluationResult:
+      type: object
+      additionalProperties: false
+      required:
+        - evaluation_id
+        - evaluation_name
+        - principal_id_hash
+        - created_at_unix_ms
+        - replay_ids
+        - run_results
+        - scorecards
+        - overall_pass
+      properties:
+        evaluation_id:
+          type: string
+          minLength: 1
+        evaluation_name:
+          type: string
+          minLength: 1
+        principal_id_hash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        created_at_unix_ms:
+          type: integer
+          minimum: 0
+        replay_ids:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        missing_replay_ids:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        run_results:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReplayRunScore"
+        scorecards:
+          type: array
+          items:
+            $ref: "#/components/schemas/RunQualityScorecard"
+        overall_pass:
+          type: boolean
+    PolicySimulationRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - action
+        - params
+      properties:
+        action:
+          type: string
+          minLength: 1
+        params:
+          type: object
+        policy_snapshot_hash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+          description: Optional override for policy snapshot hash; when omitted the gateway forwards no snapshot hash.
+        policy_bundle_hash:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+          description: Optional override for policy bundle hash; when omitted the gateway default bundle hash is used.
+        as_of_time:
+          type: string
+          pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+          description: Optional RFC3339 UTC timestamp; when omitted the gateway default as_of_time is used.
+    PolicyDecision:
+      type: object
+      additionalProperties: false
+      required:
+        - allow
+        - cacheable
+      properties:
+        allow:
+          type: boolean
+        cacheable:
+          type: boolean
+        reason:
+          type: string
+        redaction:
+          type: object
+    PolicySimulationResponse:
+      $ref: "#/components/schemas/PolicyDecision"
     ErrorResponse:
       type: object
       additionalProperties: false

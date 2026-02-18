@@ -14,12 +14,18 @@ pub struct ControllerConfig {
     pub model_provider: ModelProvider,
     pub budget_defaults: Budget,
     pub baseline_plan: Vec<BaselinePlanStep>,
+    pub adaptive_parallelism_enabled: bool,
+    pub batch_mode_enabled: bool,
+    pub operator_concurrency_policies: HashMap<String, OperatorConcurrencyPolicy>,
     pub auth_mode: AuthMode,
     pub local_auth_shared_secret: Option<String>,
     pub oidc: Option<OidcConfig>,
     pub metrics_require_auth: bool,
     pub rate_limit_window_secs: u64,
     pub rate_limit_run_per_window: u32,
+    pub replay_store_dir: String,
+    pub replay_retention_days: u64,
+    pub replay_list_limit: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +40,14 @@ pub enum BaselinePlanStep {
         #[serde(default = "default_max_refs")]
         max_refs: usize,
     },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct OperatorConcurrencyPolicy {
+    #[serde(default)]
+    pub max_in_flight: Option<usize>,
+    #[serde(default)]
+    pub fairness_weight: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -67,6 +81,27 @@ impl std::fmt::Display for StartupError {
 }
 
 impl std::error::Error for StartupError {}
+
+const ADAPTIVE_PARALLELISM_ENV_KEYS: &[&str] = &[
+    "PECR_CONTROLLER_ADAPTIVE_PARALLELISM_ENABLED",
+    "PECR_CONTROLLER_ADAPTIVE_PARALLELISM",
+    "PECR_ADAPTIVE_PARALLELISM_ENABLED",
+    "PECR_ADAPTIVE_PARALLELISM",
+];
+
+const BATCH_MODE_ENV_KEYS: &[&str] = &[
+    "PECR_CONTROLLER_BATCH_MODE_ENABLED",
+    "PECR_CONTROLLER_BATCH_MODE",
+    "PECR_BATCH_MODE_ENABLED",
+    "PECR_BATCH_MODE",
+];
+
+const OPERATOR_CONCURRENCY_POLICY_ENV_KEYS: &[&str] = &[
+    "PECR_CONTROLLER_OPERATOR_CONCURRENCY_POLICIES",
+    "PECR_CONTROLLER_OPERATOR_CONCURRENCY_POLICY",
+    "PECR_OPERATOR_CONCURRENCY_POLICIES",
+    "PECR_OPERATOR_CONCURRENCY_POLICY",
+];
 
 impl ControllerConfig {
     pub fn load() -> Result<Self, StartupError> {
@@ -161,6 +196,12 @@ impl ControllerConfig {
             message: format!("PECR_BUDGET_DEFAULTS invalid: {}", reason),
         })?;
         let baseline_plan = parse_baseline_plan(kv.get("PECR_BASELINE_PLAN"))?;
+        let adaptive_parallelism_enabled =
+            parse_bool_from_env_keys(kv, ADAPTIVE_PARALLELISM_ENV_KEYS, true);
+        let batch_mode_enabled = parse_bool_from_env_keys(kv, BATCH_MODE_ENV_KEYS, true);
+        let operator_concurrency_policies = parse_operator_concurrency_policies(
+            first_nonempty_env_value(kv, OPERATOR_CONCURRENCY_POLICY_ENV_KEYS),
+        )?;
 
         let oidc = if auth_mode == AuthMode::Oidc {
             Some(parse_oidc_config(kv)?)
@@ -180,6 +221,28 @@ impl ControllerConfig {
             60,
             "PECR_RATE_LIMIT_RUN_PER_WINDOW",
         )?;
+        let replay_store_dir = kv
+            .get("PECR_REPLAY_STORE_DIR")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .unwrap_or("target/replay")
+            .to_string();
+        let replay_retention_days = parse_u64(
+            kv.get("PECR_REPLAY_RETENTION_DAYS"),
+            30,
+            "PECR_REPLAY_RETENTION_DAYS",
+        )?;
+        let replay_list_limit = parse_usize(
+            kv.get("PECR_REPLAY_LIST_LIMIT"),
+            200,
+            "PECR_REPLAY_LIST_LIMIT",
+        )?;
+        if replay_list_limit == 0 {
+            return Err(StartupError {
+                code: "ERR_INVALID_CONFIG",
+                message: "PECR_REPLAY_LIST_LIMIT must be > 0".to_string(),
+            });
+        }
 
         Ok(Self {
             bind_addr,
@@ -188,12 +251,18 @@ impl ControllerConfig {
             model_provider,
             budget_defaults,
             baseline_plan,
+            adaptive_parallelism_enabled,
+            batch_mode_enabled,
+            operator_concurrency_policies,
             auth_mode,
             local_auth_shared_secret,
             oidc,
             metrics_require_auth,
             rate_limit_window_secs,
             rate_limit_run_per_window,
+            replay_store_dir,
+            replay_retention_days,
+            replay_list_limit,
         })
     }
 }
@@ -303,6 +372,21 @@ fn parse_u32(value: Option<&String>, default: u32, key: &'static str) -> Result<
     }
 }
 
+fn parse_usize(
+    value: Option<&String>,
+    default: usize,
+    key: &'static str,
+) -> Result<usize, StartupError> {
+    match value {
+        None => Ok(default),
+        Some(v) if v.trim().is_empty() => Ok(default),
+        Some(v) => v.parse::<usize>().map_err(|_| StartupError {
+            code: "ERR_INVALID_CONFIG",
+            message: format!("{} must be an integer", key),
+        }),
+    }
+}
+
 fn default_plan_params() -> serde_json::Value {
     serde_json::json!({})
 }
@@ -376,6 +460,79 @@ fn parse_baseline_plan(value: Option<&String>) -> Result<Vec<BaselinePlanStep>, 
     }
 
     Ok(plan)
+}
+
+fn parse_operator_concurrency_policies(
+    value: Option<&String>,
+) -> Result<HashMap<String, OperatorConcurrencyPolicy>, StartupError> {
+    let Some(raw) = value.map(|v| v.trim()).filter(|v| !v.is_empty()) else {
+        return Ok(HashMap::new());
+    };
+
+    let raw_policies = serde_json::from_str::<HashMap<String, OperatorConcurrencyPolicy>>(raw)
+        .map_err(|_| StartupError {
+            code: "ERR_INVALID_CONFIG",
+            message: "PECR_OPERATOR_CONCURRENCY_POLICIES must be a valid JSON map".to_string(),
+        })?;
+
+    let mut policies = HashMap::with_capacity(raw_policies.len());
+    for (raw_op_name, policy) in raw_policies {
+        let op_name = raw_op_name.trim();
+        if op_name.is_empty() {
+            return Err(StartupError {
+                code: "ERR_INVALID_CONFIG",
+                message: "PECR_OPERATOR_CONCURRENCY_POLICIES requires non-empty operator names"
+                    .to_string(),
+            });
+        }
+        if policy.max_in_flight == Some(0) {
+            return Err(StartupError {
+                code: "ERR_INVALID_CONFIG",
+                message: format!(
+                    "PECR_OPERATOR_CONCURRENCY_POLICIES[{}].max_in_flight must be > 0 when set",
+                    op_name
+                ),
+            });
+        }
+        if policy.fairness_weight == Some(0) {
+            return Err(StartupError {
+                code: "ERR_INVALID_CONFIG",
+                message: format!(
+                    "PECR_OPERATOR_CONCURRENCY_POLICIES[{}].fairness_weight must be > 0 when set",
+                    op_name
+                ),
+            });
+        }
+        if policies
+            .insert(op_name.to_string(), policy)
+            .as_ref()
+            .is_some()
+        {
+            return Err(StartupError {
+                code: "ERR_INVALID_CONFIG",
+                message: format!(
+                    "PECR_OPERATOR_CONCURRENCY_POLICIES has duplicate operator after trimming: {}",
+                    op_name
+                ),
+            });
+        }
+    }
+
+    Ok(policies)
+}
+
+fn parse_bool_from_env_keys(kv: &HashMap<String, String>, keys: &[&str], default: bool) -> bool {
+    keys.iter()
+        .find_map(|key| parse_bool(kv.get(*key)))
+        .unwrap_or(default)
+}
+
+fn first_nonempty_env_value<'a>(
+    kv: &'a HashMap<String, String>,
+    keys: &[&str],
+) -> Option<&'a String> {
+    keys.iter()
+        .find_map(|key| kv.get(*key).filter(|value| !value.trim().is_empty()))
 }
 
 fn parse_model_provider(value: Option<&String>) -> Result<ModelProvider, StartupError> {
@@ -637,6 +794,120 @@ mod tests {
         );
 
         let err = ControllerConfig::from_kv(&env).unwrap_err();
+        assert_eq!(err.code, "ERR_INVALID_CONFIG");
+    }
+
+    #[test]
+    fn runtime_flags_default_to_enabled_for_compatibility() {
+        let env = minimal_ok_env();
+        let cfg = ControllerConfig::from_kv(&env).expect("config should load");
+
+        assert!(cfg.adaptive_parallelism_enabled);
+        assert!(cfg.batch_mode_enabled);
+        assert!(cfg.operator_concurrency_policies.is_empty());
+        assert_eq!(cfg.replay_store_dir, "target/replay");
+        assert_eq!(cfg.replay_retention_days, 30);
+        assert_eq!(cfg.replay_list_limit, 200);
+    }
+
+    #[test]
+    fn runtime_flags_and_operator_policy_parse_from_env() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_CONTROLLER_ADAPTIVE_PARALLELISM_ENABLED".to_string(),
+            "0".to_string(),
+        );
+        env.insert(
+            "PECR_CONTROLLER_BATCH_MODE_ENABLED".to_string(),
+            "false".to_string(),
+        );
+        env.insert(
+            "PECR_OPERATOR_CONCURRENCY_POLICIES".to_string(),
+            r#"{
+                " search ": {"max_in_flight": 2, "fairness_weight": 3},
+                "fetch_span": {"max_in_flight": 1}
+            }"#
+            .to_string(),
+        );
+
+        let cfg = ControllerConfig::from_kv(&env).expect("config should load");
+        assert!(!cfg.adaptive_parallelism_enabled);
+        assert!(!cfg.batch_mode_enabled);
+
+        let search_policy = cfg
+            .operator_concurrency_policies
+            .get("search")
+            .expect("search policy should exist");
+        assert_eq!(search_policy.max_in_flight, Some(2));
+        assert_eq!(search_policy.fairness_weight, Some(3));
+
+        let fetch_span_policy = cfg
+            .operator_concurrency_policies
+            .get("fetch_span")
+            .expect("fetch_span policy should exist");
+        assert_eq!(fetch_span_policy.max_in_flight, Some(1));
+        assert_eq!(fetch_span_policy.fairness_weight, None);
+    }
+
+    #[test]
+    fn operator_policy_rejects_empty_operator_name() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_OPERATOR_CONCURRENCY_POLICIES".to_string(),
+            r#"{" ": {"max_in_flight": 1}}"#.to_string(),
+        );
+
+        let err = ControllerConfig::from_kv(&env).expect_err("config must reject empty operator");
+        assert_eq!(err.code, "ERR_INVALID_CONFIG");
+    }
+
+    #[test]
+    fn operator_policy_rejects_zero_max_in_flight() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_OPERATOR_CONCURRENCY_POLICIES".to_string(),
+            r#"{"search": {"max_in_flight": 0}}"#.to_string(),
+        );
+
+        let err = ControllerConfig::from_kv(&env).expect_err("config must reject zero cap");
+        assert_eq!(err.code, "ERR_INVALID_CONFIG");
+    }
+
+    #[test]
+    fn operator_policy_rejects_zero_fairness_weight() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_OPERATOR_CONCURRENCY_POLICIES".to_string(),
+            r#"{"search": {"fairness_weight": 0}}"#.to_string(),
+        );
+
+        let err =
+            ControllerConfig::from_kv(&env).expect_err("config must reject zero fairness weight");
+        assert_eq!(err.code, "ERR_INVALID_CONFIG");
+    }
+
+    #[test]
+    fn replay_config_overrides_parse_from_env() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_REPLAY_STORE_DIR".to_string(),
+            "target/custom-replay".to_string(),
+        );
+        env.insert("PECR_REPLAY_RETENTION_DAYS".to_string(), "7".to_string());
+        env.insert("PECR_REPLAY_LIST_LIMIT".to_string(), "25".to_string());
+
+        let cfg = ControllerConfig::from_kv(&env).expect("config should load");
+        assert_eq!(cfg.replay_store_dir, "target/custom-replay");
+        assert_eq!(cfg.replay_retention_days, 7);
+        assert_eq!(cfg.replay_list_limit, 25);
+    }
+
+    #[test]
+    fn replay_list_limit_requires_positive_value() {
+        let mut env = minimal_ok_env();
+        env.insert("PECR_REPLAY_LIST_LIMIT".to_string(), "0".to_string());
+
+        let err = ControllerConfig::from_kv(&env).expect_err("config must reject zero list limit");
         assert_eq!(err.code, "ERR_INVALID_CONFIG");
     }
 

@@ -10,8 +10,11 @@ use tokio::sync::RwLock;
 pub struct OpaCacheKey {
     pub policy_snapshot_hash: String,
     pub action: String,
+    pub principal_id: Option<String>,
     pub op_name: Option<String>,
     pub params_hash: Option<String>,
+    pub policy_bundle_hash: Option<String>,
+    pub as_of_time: Option<String>,
 }
 
 impl OpaCacheKey {
@@ -19,8 +22,11 @@ impl OpaCacheKey {
         Self {
             policy_snapshot_hash: policy_snapshot_hash.to_string(),
             action: "create_session".to_string(),
+            principal_id: None,
             op_name: None,
             params_hash: None,
+            policy_bundle_hash: None,
+            as_of_time: None,
         }
     }
 
@@ -28,8 +34,11 @@ impl OpaCacheKey {
         Self {
             policy_snapshot_hash: policy_snapshot_hash.to_string(),
             action: "finalize".to_string(),
+            principal_id: None,
             op_name: None,
             params_hash: None,
+            policy_bundle_hash: None,
+            as_of_time: None,
         }
     }
 
@@ -37,8 +46,30 @@ impl OpaCacheKey {
         Self {
             policy_snapshot_hash: policy_snapshot_hash.to_string(),
             action: "operator_call".to_string(),
+            principal_id: None,
             op_name: Some(op_name.to_string()),
             params_hash: Some(params_hash.to_string()),
+            policy_bundle_hash: None,
+            as_of_time: None,
+        }
+    }
+
+    pub fn policy_simulation(
+        principal_id: &str,
+        action: &str,
+        params_hash: &str,
+        policy_snapshot_hash: Option<&str>,
+        policy_bundle_hash: Option<&str>,
+        as_of_time: Option<&str>,
+    ) -> Self {
+        Self {
+            policy_snapshot_hash: policy_snapshot_hash.unwrap_or_default().to_string(),
+            action: action.to_string(),
+            principal_id: Some(principal_id.to_string()),
+            op_name: None,
+            params_hash: Some(params_hash.to_string()),
+            policy_bundle_hash: policy_bundle_hash.map(|value| value.to_string()),
+            as_of_time: as_of_time.map(|value| value.to_string()),
         }
     }
 }
@@ -309,5 +340,57 @@ fn is_retryable(err: &OpaError) -> bool {
         OpaError::Timeout | OpaError::Http(_) | OpaError::InvalidResponse => true,
         OpaError::BadStatus(status) => status.is_server_error(),
         OpaError::CircuitOpen => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::OpaCacheKey;
+
+    #[test]
+    fn policy_simulation_key_contains_context() {
+        let key = OpaCacheKey::policy_simulation(
+            "principal-a",
+            "operator_call",
+            "params-hash-a",
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"),
+            Some("2025-01-01T00:00:00Z"),
+        );
+
+        assert_eq!(
+            key.policy_snapshot_hash.as_str(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(key.action.as_str(), "operator_call");
+        assert_eq!(key.principal_id.as_deref(), Some("principal-a"));
+        assert_eq!(key.params_hash.as_deref(), Some("params-hash-a"));
+        assert_eq!(
+            key.policy_bundle_hash.as_deref(),
+            Some("bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
+        );
+        assert_eq!(key.as_of_time.as_deref(), Some("2025-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn policy_simulation_key_distinguishes_principal() {
+        let first = OpaCacheKey::policy_simulation(
+            "principal-a",
+            "operator_call",
+            "params-hash-a",
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            None,
+            None,
+        );
+        let second = OpaCacheKey::policy_simulation(
+            "principal-b",
+            "operator_call",
+            "params-hash-a",
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"),
+            None,
+            None,
+        );
+
+        assert_ne!(first, second);
     }
 }

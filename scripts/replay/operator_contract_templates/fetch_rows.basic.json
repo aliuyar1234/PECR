@@ -1,0 +1,20 @@
+{
+  "name": "fetch_rows.basic",
+  "op_name": "fetch_rows",
+  "params": {
+    "view_id": "safe_customer_view_public",
+    "filter_spec": {
+      "customer_id": "cust_public_1"
+    },
+    "fields": [
+      "status",
+      "plan_tier"
+    ]
+  },
+  "allowed_terminal_modes": [
+    "SUPPORTED",
+    "INSUFFICIENT_PERMISSION",
+    "SOURCE_UNAVAILABLE"
+  ],
+  "required_result_paths": []
+}

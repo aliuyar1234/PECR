@@ -1,0 +1,21 @@
+{
+  "$id": "pecr.schemas.ReplayRunScore.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "run_id",
+    "trace_id",
+    "engine_mode",
+    "terminal_mode",
+    "quality_score",
+    "coverage_observed"
+  ],
+  "properties": {
+    "run_id": { "type": "string", "minLength": 1 },
+    "trace_id": { "type": "string", "minLength": 1 },
+    "engine_mode": { "$ref": "pecr.schemas.EngineMode.v1" },
+    "terminal_mode": { "$ref": "pecr.schemas.TerminalMode.v1" },
+    "quality_score": { "type": "number", "minimum": 0, "maximum": 100 },
+    "coverage_observed": { "type": "number", "minimum": 0, "maximum": 1 }
+  }
+}

@@ -1,0 +1,17 @@
+{
+  "name": "search.basic",
+  "op_name": "search",
+  "params": {
+    "query": "smoke",
+    "limit": 2
+  },
+  "allowed_terminal_modes": [
+    "SUPPORTED",
+    "INSUFFICIENT_EVIDENCE",
+    "INSUFFICIENT_PERMISSION",
+    "SOURCE_UNAVAILABLE"
+  ],
+  "required_result_paths": [
+    "refs"
+  ]
+}

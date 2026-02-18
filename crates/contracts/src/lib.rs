@@ -22,6 +22,22 @@ impl TerminalMode {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EngineMode {
+    Baseline,
+    Rlm,
+}
+
+impl EngineMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EngineMode::Baseline => "baseline",
+            EngineMode::Rlm => "rlm",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum EvidenceContentType {
     #[serde(rename = "text/plain")]
@@ -129,6 +145,94 @@ pub struct TraceEvent {
     pub payload_hash: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub payload: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayBundleMetadata {
+    pub schema_version: u32,
+    pub run_id: String,
+    pub trace_id: String,
+    pub request_id: String,
+    pub principal_id_hash: String,
+    pub engine_mode: EngineMode,
+    pub recorded_at_unix_ms: u64,
+    pub terminal_mode: TerminalMode,
+    pub quality_score: f64,
+    pub bundle_hash: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayBundle {
+    pub metadata: ReplayBundleMetadata,
+    pub query: String,
+    pub budget: Budget,
+    pub session_id: String,
+    pub policy_snapshot_id: String,
+    pub loop_terminal_mode: TerminalMode,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub loop_response_text: Option<String>,
+    pub response_text: String,
+    pub claim_map: ClaimMap,
+    pub operator_calls_used: u32,
+    pub bytes_used: u64,
+    pub depth_used: u32,
+    pub evidence_ref_count: u32,
+    pub evidence_unit_ids: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayEvaluationSubmission {
+    pub evaluation_name: String,
+    #[serde(default)]
+    pub replay_ids: Vec<String>,
+    #[serde(default)]
+    pub engine_mode: Option<EngineMode>,
+    #[serde(default)]
+    pub min_quality_score: Option<f64>,
+    #[serde(default)]
+    pub max_source_unavailable_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayRunScore {
+    pub run_id: String,
+    pub trace_id: String,
+    pub engine_mode: EngineMode,
+    pub terminal_mode: TerminalMode,
+    pub quality_score: f64,
+    pub coverage_observed: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RunQualityScorecard {
+    pub engine_mode: EngineMode,
+    pub run_count: u64,
+    pub average_quality_score: f64,
+    pub minimum_quality_score: f64,
+    pub maximum_quality_score: f64,
+    pub supported_rate: f64,
+    pub source_unavailable_rate: f64,
+    pub average_coverage_observed: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayEvaluationResult {
+    pub evaluation_id: String,
+    pub evaluation_name: String,
+    pub principal_id_hash: String,
+    pub created_at_unix_ms: u64,
+    pub replay_ids: Vec<String>,
+    #[serde(default)]
+    pub missing_replay_ids: Vec<String>,
+    pub run_results: Vec<ReplayRunScore>,
+    pub scorecards: Vec<RunQualityScorecard>,
+    pub overall_pass: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -286,5 +390,71 @@ mod tests {
             "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
 
         assert_ne!(base.compute_hash(), changed.compute_hash());
+    }
+
+    #[test]
+    fn engine_mode_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&EngineMode::Baseline).expect("serialize engine mode"),
+            "\"baseline\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EngineMode::Rlm).expect("serialize engine mode"),
+            "\"rlm\""
+        );
+    }
+
+    #[test]
+    fn replay_bundle_round_trip_preserves_metadata() {
+        let bundle = ReplayBundle {
+            metadata: ReplayBundleMetadata {
+                schema_version: 1,
+                run_id: "run_01".to_string(),
+                trace_id: "01HRAY56GFKGG7M9VG6FXFXAFM".to_string(),
+                request_id: "req_01".to_string(),
+                principal_id_hash:
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+                engine_mode: EngineMode::Baseline,
+                recorded_at_unix_ms: 1_700_000_000_000,
+                terminal_mode: TerminalMode::InsufficientEvidence,
+                quality_score: 61.5,
+                bundle_hash: "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            },
+            query: "status".to_string(),
+            budget: Budget {
+                max_operator_calls: 10,
+                max_bytes: 2048,
+                max_wallclock_ms: 1000,
+                max_recursion_depth: 3,
+                max_parallelism: Some(1),
+            },
+            session_id: "session_01".to_string(),
+            policy_snapshot_id: "policy_01".to_string(),
+            loop_terminal_mode: TerminalMode::InsufficientEvidence,
+            loop_response_text: Some("UNKNOWN: no evidence".to_string()),
+            response_text: "UNKNOWN: no evidence".to_string(),
+            claim_map: ClaimMap {
+                claim_map_id: "claim_map_01".to_string(),
+                terminal_mode: TerminalMode::InsufficientEvidence,
+                claims: Vec::new(),
+                coverage_threshold: 0.95,
+                coverage_observed: 1.0,
+                notes: None,
+            },
+            operator_calls_used: 2,
+            bytes_used: 128,
+            depth_used: 2,
+            evidence_ref_count: 0,
+            evidence_unit_ids: Vec::new(),
+        };
+
+        let encoded = serde_json::to_vec(&bundle).expect("encode replay bundle");
+        let decoded =
+            serde_json::from_slice::<ReplayBundle>(&encoded).expect("decode replay bundle");
+
+        assert_eq!(decoded.metadata.run_id, "run_01");
+        assert_eq!(decoded.metadata.engine_mode, EngineMode::Baseline);
+        assert_eq!(decoded.response_text, "UNKNOWN: no evidence");
     }
 }

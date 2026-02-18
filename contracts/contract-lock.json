@@ -3,13 +3,20 @@
     "crates/contracts/schemas/Budget.v1.schema.json": "e1594bf977d2a6d537c0364f2d8ff3f1125bf14cdac5e19a855a958441387bb2",
     "crates/contracts/schemas/Claim.v1.schema.json": "20eb25cdb2208119c88bfc9b4736379a78c4ab066de336198d69f958fe462741",
     "crates/contracts/schemas/ClaimMap.v1.schema.json": "04341798ae3f4a334ad92cc056ea8eb39e0d8abadaa8e8bb4a043f69e4bbbc1e",
+    "crates/contracts/schemas/EngineMode.v1.schema.json": "54de6a7e794d4aef236e9b912c388f6246b21900d71692badb7c9b70b26c6758",
     "crates/contracts/schemas/ErrorResponse.v1.schema.json": "e38041b0c0ce0fd571db14d7d99d8bb0fcc44fc8f635485e3eb8cd6dbcb493b3",
     "crates/contracts/schemas/EvidenceUnit.v1.schema.json": "d313aaefc76c0552cb05a731ec7603b957f1a7743d96e5eba934944064ad8c11",
     "crates/contracts/schemas/EvidenceUnitRef.v1.schema.json": "17238d2cca62f884d2eb41eaf02c3ad00ee6e85593b8d2d1a3873d6e87a82f94",
     "crates/contracts/schemas/PolicySnapshot.v1.schema.json": "294fd333c8e50bff947ce877a94335c9ef89c88ee2a5526ca38b1e964423763d",
+    "crates/contracts/schemas/ReplayBundle.v1.schema.json": "8b9bcd6770e622a3bb40cea8e2afd49f2d8df604ac8428fc7aaf12c9f861589b",
+    "crates/contracts/schemas/ReplayBundleMetadata.v1.schema.json": "3bc7d96fd218d6c70470790bd3bbe9a5002a8914562fe8ba7253c0ce59827b88",
+    "crates/contracts/schemas/ReplayEvaluationResult.v1.schema.json": "b4b9a878822812d0ea171c5594140cd041870f72d8ce3f068b12a7e34713b12f",
+    "crates/contracts/schemas/ReplayEvaluationSubmission.v1.schema.json": "d795d44b094ad6fca5a2029e95884cb807552ee4c19cd151a4dc7f95074b9190",
+    "crates/contracts/schemas/ReplayRunScore.v1.schema.json": "bf5aa63f9ca0e4a109ad0917c3950bd3c83ddb2a454a61488c6bb03f3cc9e4ca",
+    "crates/contracts/schemas/RunQualityScorecard.v1.schema.json": "7b1853d4bc106f52f2aab6acb1fda1df3ac0a03fb15f98b87dddf897e3314f9c",
     "crates/contracts/schemas/TerminalMode.v1.schema.json": "330c335057f5b4c6e2ce1f8dc61f1583ee2f23cb4828d6be881d4957e7520a1c",
     "crates/contracts/schemas/TraceEvent.v1.schema.json": "beced50b5ae0c2bc5523635db3a1735efd3e75be702f22fff874ce6f793747a7",
-    "docs/openapi/pecr.v1.yaml": "0331860283365e0b3424e77ed88c5065de435142ff000603f468ed094cdfbc9c"
+    "docs/openapi/pecr.v1.yaml": "b4b886b196deb2af1543a8c253e4079476c1264e1fb1a6d9f55db323df804e87"
   },
   "generated_by": "scripts/contracts/update_contract_lock.py",
   "schema_version": 1

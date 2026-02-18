@@ -92,6 +92,23 @@ class RlmBridgeTests(unittest.TestCase):
         self.assertEqual(len(fetch_span_calls), 2)
         self.assertEqual(result["operator_calls_used"], 5)
 
+    def test_negotiate_protocol_version_accepts_default_legacy_message(self):
+        version = self.mod.negotiate_protocol_version({"type": "start"})
+        self.assertEqual(version, 1)
+
+    def test_negotiate_protocol_version_accepts_supported_range(self):
+        version = self.mod.negotiate_protocol_version(
+            {"type": "start", "protocol": {"min_version": 1, "max_version": 1}}
+        )
+        self.assertEqual(version, 1)
+
+    def test_negotiate_protocol_version_rejects_unsupported_range(self):
+        with self.assertRaises(ValueError) as ctx:
+            self.mod.negotiate_protocol_version(
+                {"type": "start", "protocol": {"min_version": 2, "max_version": 3}}
+            )
+        self.assertIn("unsupported bridge protocol range", str(ctx.exception))
+
 
 if __name__ == "__main__":
     unittest.main()

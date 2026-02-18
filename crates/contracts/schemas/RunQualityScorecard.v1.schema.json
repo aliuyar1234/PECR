@@ -1,0 +1,25 @@
+{
+  "$id": "pecr.schemas.RunQualityScorecard.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "engine_mode",
+    "run_count",
+    "average_quality_score",
+    "minimum_quality_score",
+    "maximum_quality_score",
+    "supported_rate",
+    "source_unavailable_rate",
+    "average_coverage_observed"
+  ],
+  "properties": {
+    "engine_mode": { "$ref": "pecr.schemas.EngineMode.v1" },
+    "run_count": { "type": "integer", "minimum": 0 },
+    "average_quality_score": { "type": "number", "minimum": 0, "maximum": 100 },
+    "minimum_quality_score": { "type": "number", "minimum": 0, "maximum": 100 },
+    "maximum_quality_score": { "type": "number", "minimum": 0, "maximum": 100 },
+    "supported_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+    "source_unavailable_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+    "average_coverage_observed": { "type": "number", "minimum": 0, "maximum": 1 }
+  }
+}

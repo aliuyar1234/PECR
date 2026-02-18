@@ -1,0 +1,38 @@
+{
+  "$id": "pecr.schemas.ReplayEvaluationResult.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "evaluation_id",
+    "evaluation_name",
+    "principal_id_hash",
+    "created_at_unix_ms",
+    "replay_ids",
+    "run_results",
+    "scorecards",
+    "overall_pass"
+  ],
+  "properties": {
+    "evaluation_id": { "type": "string", "minLength": 1 },
+    "evaluation_name": { "type": "string", "minLength": 1 },
+    "principal_id_hash": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "created_at_unix_ms": { "type": "integer", "minimum": 0 },
+    "replay_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "missing_replay_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "run_results": {
+      "type": "array",
+      "items": { "$ref": "pecr.schemas.ReplayRunScore.v1" }
+    },
+    "scorecards": {
+      "type": "array",
+      "items": { "$ref": "pecr.schemas.RunQualityScorecard.v1" }
+    },
+    "overall_pass": { "type": "boolean" }
+  }
+}

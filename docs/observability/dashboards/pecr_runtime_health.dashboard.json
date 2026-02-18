@@ -1,0 +1,106 @@
+{
+  "title": "PECR / Runtime Health",
+  "uid": "pecr-runtime-health",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "tags": [
+    "pecr",
+    "slo",
+    "runtime"
+  ],
+  "timezone": "browser",
+  "time": {
+    "from": "now-6h",
+    "to": "now"
+  },
+  "refresh": "30s",
+  "panels": [
+    {
+      "id": 1,
+      "type": "timeseries",
+      "title": "Controller Latency (p95/p99) by Route",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(pecr_controller_http_request_duration_seconds_bucket[5m])) by (le, route))",
+          "legendFormat": "controller {{route}} p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(pecr_controller_http_request_duration_seconds_bucket[5m])) by (le, route))",
+          "legendFormat": "controller {{route}} p99"
+        }
+      ]
+    },
+    {
+      "id": 2,
+      "type": "timeseries",
+      "title": "Gateway Latency (p95/p99) by Route",
+      "targets": [
+        {
+          "expr": "histogram_quantile(0.95, sum(rate(pecr_gateway_http_request_duration_seconds_bucket[5m])) by (le, route))",
+          "legendFormat": "gateway {{route}} p95"
+        },
+        {
+          "expr": "histogram_quantile(0.99, sum(rate(pecr_gateway_http_request_duration_seconds_bucket[5m])) by (le, route))",
+          "legendFormat": "gateway {{route}} p99"
+        }
+      ]
+    },
+    {
+      "id": 3,
+      "type": "timeseries",
+      "title": "Controller 5xx Error Rate",
+      "targets": [
+        {
+          "expr": "sum(rate(pecr_controller_http_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum(rate(pecr_controller_http_requests_total[5m])), 0.0001)",
+          "legendFormat": "controller 5xx rate"
+        }
+      ]
+    },
+    {
+      "id": 4,
+      "type": "timeseries",
+      "title": "Gateway 5xx Error Rate",
+      "targets": [
+        {
+          "expr": "sum(rate(pecr_gateway_http_requests_total{status=~\"5..\"}[5m])) / clamp_min(sum(rate(pecr_gateway_http_requests_total[5m])), 0.0001)",
+          "legendFormat": "gateway 5xx rate"
+        }
+      ]
+    },
+    {
+      "id": 5,
+      "type": "timeseries",
+      "title": "Controller Terminal Mode Drift",
+      "targets": [
+        {
+          "expr": "sum(rate(pecr_controller_terminal_modes_total{terminal_mode=\"SOURCE_UNAVAILABLE\"}[5m]))",
+          "legendFormat": "SOURCE_UNAVAILABLE"
+        },
+        {
+          "expr": "sum(rate(pecr_controller_terminal_modes_total{terminal_mode=\"INSUFFICIENT_EVIDENCE\"}[5m]))",
+          "legendFormat": "INSUFFICIENT_EVIDENCE"
+        },
+        {
+          "expr": "sum(rate(pecr_controller_terminal_modes_total{terminal_mode=\"INSUFFICIENT_PERMISSION\"}[5m]))",
+          "legendFormat": "INSUFFICIENT_PERMISSION"
+        }
+      ]
+    },
+    {
+      "id": 6,
+      "type": "timeseries",
+      "title": "OPA Availability Signals",
+      "targets": [
+        {
+          "expr": "sum(rate(pecr_gateway_terminal_modes_total{terminal_mode=\"SOURCE_UNAVAILABLE\"}[5m]))",
+          "legendFormat": "gateway SOURCE_UNAVAILABLE/s"
+        },
+        {
+          "expr": "sum(rate(pecr_gateway_operator_calls_total{outcome=\"error\"}[5m]))",
+          "legendFormat": "operator error/s"
+        }
+      ]
+    }
+  ]
+}

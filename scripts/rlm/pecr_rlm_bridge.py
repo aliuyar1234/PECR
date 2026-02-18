@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+SUPPORTED_PROTOCOL_VERSION = 1
+
 
 def eprint(*args: object) -> None:
     print(*args, file=sys.stderr, flush=True)
@@ -52,6 +54,28 @@ def read_json_line() -> dict[str, Any]:
 def write_json_line(msg: dict[str, Any]) -> None:
     sys.stdout.write(json.dumps(msg, separators=(",", ":"), ensure_ascii=False) + "\n")
     sys.stdout.flush()
+
+
+def negotiate_protocol_version(start: dict[str, Any]) -> int:
+    protocol = start.get("protocol")
+    if protocol is None:
+        # Backward compatibility for older controller messages.
+        return SUPPORTED_PROTOCOL_VERSION
+    if not isinstance(protocol, dict):
+        raise ValueError("start.protocol must be an object")
+
+    min_version_raw = protocol.get("min_version", SUPPORTED_PROTOCOL_VERSION)
+    max_version_raw = protocol.get("max_version", SUPPORTED_PROTOCOL_VERSION)
+    if not isinstance(min_version_raw, int) or not isinstance(max_version_raw, int):
+        raise ValueError("start.protocol.{min_version,max_version} must be integers")
+    if min_version_raw > max_version_raw:
+        raise ValueError("start.protocol min_version must be <= max_version")
+    if not (min_version_raw <= SUPPORTED_PROTOCOL_VERSION <= max_version_raw):
+        raise ValueError(
+            "unsupported bridge protocol range "
+            f"{min_version_raw}-{max_version_raw}; supported={SUPPORTED_PROTOCOL_VERSION}"
+        )
+    return SUPPORTED_PROTOCOL_VERSION
 
 
 @dataclass
@@ -235,6 +259,13 @@ def main() -> int:
         return 2
     budget = Budget.from_json(budget_raw)
 
+    try:
+        protocol_version = negotiate_protocol_version(start)
+    except ValueError as exc:
+        eprint(str(exc))
+        return 2
+    write_json_line({"type": "start_ack", "protocol_version": protocol_version})
+
     backend = os.getenv("PECR_RLM_BACKEND", "mock").strip().lower() or "mock"
     if backend != "mock":
         eprint("only PECR_RLM_BACKEND=mock is supported in this build")
@@ -245,6 +276,7 @@ def main() -> int:
     write_json_line(
         {
             "type": "done",
+            "protocol_version": protocol_version,
             "final_answer": result["final_answer"],
             "stop_reason": result["stop_reason"],
             "operator_calls_used": result["operator_calls_used"],

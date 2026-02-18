@@ -68,6 +68,12 @@ jobs:
       - name: Image pinning policy
         run: python3 scripts/security/check_image_tags.py
 
+      - name: Security script syntax check
+        run: |
+          python3 -m py_compile \
+            scripts/security/check_image_tags.py \
+            scripts/security/verify_release_attestations.py
+
       - name: Upload Trivy JSON
         if: always()
         uses: actions/upload-artifact@v4

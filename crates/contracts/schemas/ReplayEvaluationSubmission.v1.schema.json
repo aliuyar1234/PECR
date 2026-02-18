@@ -1,0 +1,16 @@
+{
+  "$id": "pecr.schemas.ReplayEvaluationSubmission.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["evaluation_name"],
+  "properties": {
+    "evaluation_name": { "type": "string", "minLength": 1 },
+    "replay_ids": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "engine_mode": { "$ref": "pecr.schemas.EngineMode.v1" },
+    "min_quality_score": { "type": "number", "minimum": 0, "maximum": 100 },
+    "max_source_unavailable_rate": { "type": "number", "minimum": 0, "maximum": 1 }
+  }
+}

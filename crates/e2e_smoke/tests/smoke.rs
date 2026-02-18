@@ -2908,7 +2908,7 @@ async fn failure_mode_suite_source_unavailable_and_timeout() {
             "PECR_POLICY_BUNDLE_HASH".to_string(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
         ),
-        ("PECR_FS_CORPUS_PATH".to_string(), fs_corpus_path),
+        ("PECR_FS_CORPUS_PATH".to_string(), fs_corpus_path.clone()),
         (
             "PECR_AS_OF_TIME_DEFAULT".to_string(),
             "1970-01-01T00:00:00Z".to_string(),
@@ -2947,6 +2947,185 @@ async fn failure_mode_suite_source_unavailable_and_timeout() {
     let _ = slow_opa_shutdown.send(());
     let _ = tokio::time::timeout(Duration::from_secs(3), timeout_task).await;
     let _ = tokio::time::timeout(Duration::from_secs(3), slow_opa_task).await;
+
+    // PG statement-timeout path -> source unavailable.
+    let pg_timeout_opa_app =
+        Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let (pg_timeout_opa_addr, pg_timeout_opa_shutdown, pg_timeout_opa_task) =
+        spawn_server(pg_timeout_opa_app).await;
+
+    let pg_timeout_gateway = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
+        ("PECR_BIND_ADDR".to_string(), "127.0.0.1:0".to_string()),
+        ("PECR_DB_URL".to_string(), schema_url.clone()),
+        (
+            "PECR_OPA_URL".to_string(),
+            format!("http://{}", pg_timeout_opa_addr),
+        ),
+        (
+            "PECR_POLICY_BUNDLE_HASH".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ),
+        (
+            "PECR_PG_SAFEVIEW_QUERY_TIMEOUT_MS".to_string(),
+            "25".to_string(),
+        ),
+        ("PECR_FS_CORPUS_PATH".to_string(), fs_corpus_path.clone()),
+        (
+            "PECR_AS_OF_TIME_DEFAULT".to_string(),
+            "1970-01-01T00:00:00Z".to_string(),
+        ),
+    ]))
+    .expect("pg-timeout gateway config should be valid");
+
+    let (pg_timeout_addr, pg_timeout_shutdown, pg_timeout_task) = spawn_server(
+        pecr_gateway::http::router(pg_timeout_gateway)
+            .await
+            .expect("pg-timeout gateway router should init"),
+    )
+    .await;
+
+    wait_for_healthz(&client, pg_timeout_addr).await;
+
+    let (pg_timeout_session, pg_timeout_token, _, _) =
+        gateway_create_session(&client, pg_timeout_addr, "dev", &request_id).await;
+
+    let pg_timeout_response = client
+        .post(format!(
+            "http://{}/v1/operators/fetch_rows",
+            pg_timeout_addr
+        ))
+        .header("x-pecr-principal-id", "dev")
+        .header("x-pecr-request-id", &request_id)
+        .header("x-pecr-session-token", &pg_timeout_token)
+        .json(&serde_json::json!({
+            "session_id": pg_timeout_session,
+            "params": {
+                "view_id": "safe_customer_view_public_slow",
+                "fields": ["status"],
+                "filter_spec": {"customer_id": "cust_public_1"}
+            }
+        }))
+        .send()
+        .await
+        .expect("pg-timeout fetch_rows request should return a response");
+
+    assert_eq!(
+        pg_timeout_response.status(),
+        StatusCode::SERVICE_UNAVAILABLE
+    );
+    let pg_timeout_body = pg_timeout_response
+        .json::<serde_json::Value>()
+        .await
+        .expect("pg-timeout response should be JSON");
+    assert_eq!(
+        pg_timeout_body
+            .get("code")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        "ERR_SOURCE_UNAVAILABLE"
+    );
+    assert_eq!(
+        pg_timeout_body
+            .get("terminal_mode_hint")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        "SOURCE_UNAVAILABLE"
+    );
+    assert_eq!(
+        pg_timeout_body.get("retryable").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let _ = pg_timeout_shutdown.send(());
+    let _ = pg_timeout_opa_shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), pg_timeout_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), pg_timeout_opa_task).await;
+
+    // DB availability failure path -> source unavailable.
+    let db_outage_opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let (db_outage_opa_addr, db_outage_opa_shutdown, db_outage_opa_task) =
+        spawn_server(db_outage_opa_app).await;
+
+    let db_outage_gateway = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
+        ("PECR_BIND_ADDR".to_string(), "127.0.0.1:0".to_string()),
+        ("PECR_DB_URL".to_string(), schema_url.clone()),
+        (
+            "PECR_OPA_URL".to_string(),
+            format!("http://{}", db_outage_opa_addr),
+        ),
+        (
+            "PECR_POLICY_BUNDLE_HASH".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ),
+        ("PECR_FS_CORPUS_PATH".to_string(), fs_corpus_path.clone()),
+        (
+            "PECR_AS_OF_TIME_DEFAULT".to_string(),
+            "1970-01-01T00:00:00Z".to_string(),
+        ),
+    ]))
+    .expect("db-outage gateway config should be valid");
+
+    let (db_outage_addr, db_outage_shutdown, db_outage_task) = spawn_server(
+        pecr_gateway::http::router(db_outage_gateway)
+            .await
+            .expect("db-outage gateway router should init"),
+    )
+    .await;
+
+    wait_for_healthz(&client, db_outage_addr).await;
+
+    // Simulate source outage after startup by dropping the scoped schema that backs ledger + safe-view tables.
+    drop_test_schema(&schema_pool, &schema_name).await;
+
+    let db_outage_response = client
+        .post(format!("http://{}/v1/sessions", db_outage_addr))
+        .header("x-pecr-principal-id", "dev")
+        .header("x-pecr-request-id", &request_id)
+        .json(&serde_json::json!({
+            "budget": {
+                "max_operator_calls": 10,
+                "max_bytes": 1048576,
+                "max_wallclock_ms": 1000,
+                "max_recursion_depth": 3
+            }
+        }))
+        .send()
+        .await
+        .expect("db outage request should return a response");
+
+    assert_eq!(db_outage_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let db_outage_body = db_outage_response
+        .json::<serde_json::Value>()
+        .await
+        .expect("db outage response should be JSON");
+    let db_outage_code = db_outage_body
+        .get("code")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        matches!(
+            db_outage_code,
+            "ERR_SOURCE_UNAVAILABLE" | "ERR_LEDGER_UNAVAILABLE" | "ERR_DB_UNAVAILABLE"
+        ),
+        "unexpected db outage error code: {}",
+        db_outage_code
+    );
+    assert_eq!(
+        db_outage_body
+            .get("terminal_mode_hint")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default(),
+        "SOURCE_UNAVAILABLE"
+    );
+    assert_eq!(
+        db_outage_body.get("retryable").and_then(|v| v.as_bool()),
+        Some(true)
+    );
+
+    let _ = db_outage_shutdown.send(());
+    let _ = db_outage_opa_shutdown.send(());
+    let _ = tokio::time::timeout(Duration::from_secs(3), db_outage_task).await;
+    let _ = tokio::time::timeout(Duration::from_secs(3), db_outage_opa_task).await;
 
     let _ = std::fs::remove_dir_all(&fs_corpus_root);
     drop_test_schema(&schema_pool, &schema_name).await;

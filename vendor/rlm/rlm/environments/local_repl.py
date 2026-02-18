@@ -8,12 +8,18 @@ import tempfile
 import threading
 import time
 import uuid
+from collections.abc import Callable
 from contextlib import contextmanager
 from typing import Any
 
 from rlm.core.comms_utils import LMRequest, send_lm_request, send_lm_request_batched
 from rlm.core.types import REPLResult, RLMChatCompletion
-from rlm.environments.base_env import NonIsolatedEnv
+from rlm.environments.base_env import (
+    RESERVED_TOOL_NAMES,
+    NonIsolatedEnv,
+    extract_tool_value,
+    validate_custom_tools,
+)
 
 # =============================================================================
 # Safe Builtins
@@ -125,19 +131,39 @@ class LocalREPL(NonIsolatedEnv):
         setup_code: str | None = None,
         persistent: bool = False,
         depth: int = 1,
+        subcall_fn: Callable[[str, str | None], RLMChatCompletion] | None = None,
+        custom_tools: dict[str, Any] | None = None,
+        custom_sub_tools: dict[str, Any] | None = None,
+        compaction: bool = False,
         **kwargs,
     ):
         super().__init__(persistent=persistent, depth=depth, **kwargs)
 
         self.lm_handler_address = lm_handler_address
+        self.subcall_fn = subcall_fn  # Callback for recursive RLM calls (depth > 1 support)
         self.original_cwd = os.getcwd()
         self.temp_dir = tempfile.mkdtemp(prefix=f"repl_env_{uuid.uuid4()}_")
         self._lock = threading.Lock()
         self._context_count: int = 0
         self._history_count: int = 0
+        self.compaction = compaction
+
+        # Custom tools: functions available in the REPL
+        self.custom_tools = custom_tools or {}
+        # Sub-tools: inherited from custom_tools if not specified
+        self.custom_sub_tools = (
+            custom_sub_tools if custom_sub_tools is not None else self.custom_tools
+        )
+
+        # Validate custom tools don't override reserved names
+        validate_custom_tools(self.custom_tools)
 
         # Setup globals, locals, and modules in environment.
         self.setup()
+
+        if compaction:
+            self._compaction_history: list[Any] = []
+            self.locals["history"] = self._compaction_history
 
         # Load context if provided
         if context_payload is not None:
@@ -158,20 +184,40 @@ class LocalREPL(NonIsolatedEnv):
 
         # Track LLM calls made during code execution
         self._pending_llm_calls: list[RLMChatCompletion] = []
+        # When FINAL_VAR is called inside a REPL block, we store the value here for the main loop
+        self._last_final_answer: str | None = None
 
         # Add helper functions
         self.globals["FINAL_VAR"] = self._final_var
         self.globals["SHOW_VARS"] = self._show_vars
         self.globals["llm_query"] = self._llm_query
         self.globals["llm_query_batched"] = self._llm_query_batched
+        self.globals["rlm_query"] = self._rlm_query
+        self.globals["rlm_query_batched"] = self._rlm_query_batched
 
-    def _final_var(self, variable_name: str) -> str:
-        """Return the value of a variable as a final answer."""
+        # Add custom tools to globals
+        # Tools can be either plain values or (value, description) tuples
+        for name, entry in self.custom_tools.items():
+            value = extract_tool_value(entry)
+            if callable(value):
+                self.globals[name] = value
+            else:
+                # For non-callable values (constants, data), add to locals
+                self.locals[name] = value
+
+    def _final_var(self, variable_name: str | Any) -> str:
+        """Return the value of a variable as a final answer for the main model, or stringify a direct value."""
+        if not isinstance(variable_name, str):
+            answer = str(variable_name)
+            self._last_final_answer = answer
+            return answer
         variable_name = variable_name.strip().strip("\"'")
         if variable_name in self.locals:
-            return str(self.locals[variable_name])
+            answer = str(self.locals[variable_name])
+            self._last_final_answer = answer
+            return answer
 
-        # Provide helpful error message with available variables
+        # Provide helpful error message with available variables (do not set _last_final_answer)
         available = [k for k in self.locals.keys() if not k.startswith("_")]
         if available:
             return (
@@ -193,7 +239,9 @@ class LocalREPL(NonIsolatedEnv):
         return f"Available variables: {available}"
 
     def _llm_query(self, prompt: str, model: str | None = None) -> str:
-        """Query the LM via socket connection to the handler.
+        """Query the LM with a single plain completion (no REPL, no recursion).
+
+        This always makes a direct LM call via the handler, regardless of depth.
 
         Args:
             prompt: The prompt to send to the LM.
@@ -209,17 +257,15 @@ class LocalREPL(NonIsolatedEnv):
             if not response.success:
                 return f"Error: {response.error}"
 
-            # Track this LLM call
-            self._pending_llm_calls.append(
-                response.chat_completion,
-            )
-
+            self._pending_llm_calls.append(response.chat_completion)
             return response.chat_completion.response
         except Exception as e:
             return f"Error: LM query failed - {e}"
 
     def _llm_query_batched(self, prompts: list[str], model: str | None = None) -> list[str]:
-        """Query the LM with multiple prompts concurrently.
+        """Query the LM with multiple prompts concurrently (no REPL, no recursion).
+
+        This always makes direct LM calls via the handler, regardless of depth.
 
         Args:
             prompts: List of prompts to send to the LM.
@@ -230,7 +276,6 @@ class LocalREPL(NonIsolatedEnv):
         """
         if not self.lm_handler_address:
             return ["Error: No LM handler configured"] * len(prompts)
-
         try:
             responses = send_lm_request_batched(
                 self.lm_handler_address, prompts, model=model, depth=self.depth
@@ -241,13 +286,61 @@ class LocalREPL(NonIsolatedEnv):
                 if not response.success:
                     results.append(f"Error: {response.error}")
                 else:
-                    # Track this LLM call in list of all calls -- we may want to do this hierarchically
                     self._pending_llm_calls.append(response.chat_completion)
                     results.append(response.chat_completion.response)
 
             return results
         except Exception as e:
             return [f"Error: LM query failed - {e}"] * len(prompts)
+
+    def _rlm_query(self, prompt: str, model: str | None = None) -> str:
+        """Spawn a recursive RLM sub-call for deeper thinking on a subtask.
+
+        When a subcall callback is available (max_depth > 1), this spawns a child
+        RLM with its own REPL that can reason over the prompt iteratively.
+        Falls back to a plain llm_query if no recursive capability is configured.
+
+        Args:
+            prompt: The prompt to send to the child RLM.
+            model: Optional model name override for the child.
+        """
+        if self.subcall_fn is not None:
+            try:
+                completion = self.subcall_fn(prompt, model)
+                self._pending_llm_calls.append(completion)
+                return completion.response
+            except Exception as e:
+                return f"Error: RLM query failed - {e}"
+
+        # Fall back to plain LM call if no recursive capability
+        return self._llm_query(prompt, model)
+
+    def _rlm_query_batched(self, prompts: list[str], model: str | None = None) -> list[str]:
+        """Spawn recursive RLM sub-calls for multiple prompts.
+
+        Each prompt gets its own child RLM for deeper thinking.
+        Falls back to llm_query_batched if no recursive capability is configured.
+
+        Args:
+            prompts: List of prompts for child RLMs.
+            model: Optional model name override for the children.
+
+        Returns:
+            List of responses in the same order as input prompts.
+        """
+        if self.subcall_fn is not None:
+            results = []
+            for prompt in prompts:
+                try:
+                    completion = self.subcall_fn(prompt, model)
+                    self._pending_llm_calls.append(completion)
+                    results.append(completion.response)
+                except Exception as e:
+                    results.append(f"Error: RLM query failed - {e}")
+            return results
+
+        # Fall back to plain batched LM call if no recursive capability
+        return self._llm_query_batched(prompts, model)
 
     def load_context(self, context_payload: dict | list | str):
         """Load context into the environment as context_0 (and 'context' alias)."""
@@ -331,6 +424,17 @@ class LocalREPL(NonIsolatedEnv):
         """Return the number of conversation histories stored."""
         return self._history_count
 
+    def append_compaction_entry(self, entry: list[dict[str, Any]] | dict[str, Any]) -> None:
+        """
+        Append a trajectory segment or a summary to the compaction history.
+
+        Entry is either a list of message dicts (trajectory segment) or
+        a dict with "type": "summary" and "content": str.
+        """
+        if not self.compaction:
+            return
+        self._compaction_history.append(copy.deepcopy(entry))
+
     @contextmanager
     def _capture_output(self):
         """Thread-safe context manager to capture stdout/stderr."""
@@ -353,6 +457,28 @@ class LocalREPL(NonIsolatedEnv):
         finally:
             os.chdir(old_cwd)
 
+    def _restore_scaffold(self) -> None:
+        """Restore scaffold names after execution so overwrites (e.g. context = 'x') don't persist."""
+        for name in RESERVED_TOOL_NAMES:
+            if name == "llm_query":
+                self.globals["llm_query"] = self._llm_query
+            elif name == "llm_query_batched":
+                self.globals["llm_query_batched"] = self._llm_query_batched
+            elif name == "rlm_query":
+                self.globals["rlm_query"] = self._rlm_query
+            elif name == "rlm_query_batched":
+                self.globals["rlm_query_batched"] = self._rlm_query_batched
+            elif name == "FINAL_VAR":
+                self.globals["FINAL_VAR"] = self._final_var
+            elif name == "SHOW_VARS":
+                self.globals["SHOW_VARS"] = self._show_vars
+            elif name == "context" and "context_0" in self.locals:
+                self.locals["context"] = self.locals["context_0"]
+            elif name == "history" and "history_0" in self.locals and not self.compaction:
+                self.locals["history"] = self.locals["history_0"]
+            elif name == "history" and self.compaction:
+                self.locals["history"] = self._compaction_history
+
     def execute_code(self, code: str) -> REPLResult:
         """Execute code in the persistent namespace and return result."""
         start_time = time.perf_counter()
@@ -370,11 +496,17 @@ class LocalREPL(NonIsolatedEnv):
                     if key not in self.globals and not key.startswith("_"):
                         self.locals[key] = value
 
+                # Restore scaffold so model overwrites (context = ..., llm_query = ...) don't persist
+                self._restore_scaffold()
+
                 stdout = stdout_buf.getvalue()
                 stderr = stderr_buf.getvalue()
             except Exception as e:
                 stdout = stdout_buf.getvalue()
                 stderr = stderr_buf.getvalue() + f"\n{type(e).__name__}: {e}"
+
+        final_answer = self._last_final_answer
+        self._last_final_answer = None
 
         return REPLResult(
             stdout=stdout,
@@ -382,6 +514,7 @@ class LocalREPL(NonIsolatedEnv):
             locals=self.locals.copy(),
             execution_time=time.perf_counter() - start_time,
             rlm_calls=self._pending_llm_calls.copy(),
+            final_answer=final_answer,
         )
 
     def __enter__(self):
@@ -397,8 +530,10 @@ class LocalREPL(NonIsolatedEnv):
             shutil.rmtree(self.temp_dir)
         except Exception:
             pass
-        self.globals.clear()
-        self.locals.clear()
+        if hasattr(self, "globals"):
+            self.globals.clear()
+        if hasattr(self, "locals"):
+            self.locals.clear()
 
     def __del__(self):
         self.cleanup()
