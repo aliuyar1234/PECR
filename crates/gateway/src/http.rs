@@ -1197,12 +1197,28 @@ async fn call_operator(
                         return Ok::<_, ApiError>((terminal_mode, result, true));
                     }
 
-                    let refs = search_from_fs(
-                        &state.config.fs_corpus_path,
-                        session.as_of_time.as_str(),
-                        &session.policy_snapshot_hash,
-                        &req.params,
-                    )?;
+                    let fs_corpus_path = state.config.fs_corpus_path.clone();
+                    let as_of_time = session.as_of_time.clone();
+                    let policy_snapshot_hash = session.policy_snapshot_hash.clone();
+                    let params = req.params.clone();
+                    let refs = tokio::task::spawn_blocking(move || {
+                        search_from_fs(
+                            fs_corpus_path.as_str(),
+                            as_of_time.as_str(),
+                            policy_snapshot_hash.as_str(),
+                            &params,
+                        )
+                    })
+                    .await
+                    .map_err(|_| {
+                        json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "ERR_INTERNAL",
+                            "search execution task failed".to_string(),
+                            TerminalMode::SourceUnavailable,
+                            false,
+                        )
+                    })??;
                     let result = serde_json::json!({ "refs": refs });
                     state
                         .operator_cache
