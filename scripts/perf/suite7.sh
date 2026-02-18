@@ -224,6 +224,7 @@ run_k6_gateway_fetch_rows_checked() {
   fi
 
   echo "[suite7] warning: gateway fetch_rows scenario failed (${name}); continuing because SUITE7_ENFORCE_GATEWAY_FETCH_ROWS=0" >&2
+  return 0
 }
 
 wait_for_postgres
