@@ -833,7 +833,116 @@ mod tests {
         (addr, shutdown_tx, handle)
     }
 
-    fn controller_state(gateway_addr: SocketAddr, budget: Budget) -> AppState {
+    async fn spawn_parallel_fetch_gateway(
+        in_flight: Arc<AtomicUsize>,
+        max_in_flight: Arc<AtomicUsize>,
+    ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+        async fn list_versions(Json(_): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "terminal_mode": "SUPPORTED",
+                "result": { "versions": [] }
+            }))
+        }
+
+        async fn fetch_rows(Json(_): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "terminal_mode": "SUPPORTED",
+                "result": []
+            }))
+        }
+
+        async fn search(Json(_): Json<serde_json::Value>) -> Json<serde_json::Value> {
+            Json(serde_json::json!({
+                "terminal_mode": "SUPPORTED",
+                "result": {
+                    "refs": [
+                        {
+                            "evidence_unit_id": "ev1",
+                            "source_system": "fs_corpus",
+                            "object_id": "public/public_1.txt",
+                            "version_id": "v1"
+                        },
+                        {
+                            "evidence_unit_id": "ev2",
+                            "source_system": "fs_corpus",
+                            "object_id": "public/public_2.txt",
+                            "version_id": "v2"
+                        }
+                    ]
+                }
+            }))
+        }
+
+        async fn fetch_span(
+            State((in_flight, max_in_flight)): State<(Arc<AtomicUsize>, Arc<AtomicUsize>)>,
+            Json(_): Json<serde_json::Value>,
+        ) -> Json<serde_json::Value> {
+            let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            loop {
+                let seen = max_in_flight.load(Ordering::SeqCst);
+                if seen >= current {
+                    break;
+                }
+                if max_in_flight
+                    .compare_exchange(seen, current, Ordering::SeqCst, Ordering::SeqCst)
+                    .is_ok()
+                {
+                    break;
+                }
+            }
+
+            tokio::time::sleep(Duration::from_millis(75)).await;
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+
+            Json(serde_json::json!({
+                "terminal_mode": "SUPPORTED",
+                "result": {
+                    "source_system": "fs_corpus",
+                    "object_id": "public/public_1.txt",
+                    "version_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                    "span_or_row_spec": { "type": "text_span", "start_byte": 0, "end_byte": 0, "line_start": 1, "line_end": 1 },
+                    "content_type": "text/plain",
+                    "content": "unit-test",
+                    "content_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                    "retrieved_at": "1970-01-01T00:00:00Z",
+                    "as_of_time": "1970-01-01T00:00:00Z",
+                    "policy_snapshot_id": "policy",
+                    "policy_snapshot_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+                    "transform_chain": [],
+                    "evidence_unit_id": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+                }
+            }))
+        }
+
+        let app = Router::new()
+            .route("/v1/operators/list_versions", post(list_versions))
+            .route("/v1/operators/fetch_rows", post(fetch_rows))
+            .route("/v1/operators/search", post(search))
+            .route("/v1/operators/fetch_span", post(fetch_span))
+            .with_state((in_flight, max_in_flight));
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind should succeed");
+        let addr = listener.local_addr().expect("local_addr should succeed");
+
+        let (shutdown_tx, shutdown_rx) = oneshot::channel::<()>();
+        let handle = tokio::spawn(async move {
+            let _ = axum::serve(listener, app)
+                .with_graceful_shutdown(async {
+                    let _ = shutdown_rx.await;
+                })
+                .await;
+        });
+
+        (addr, shutdown_tx, handle)
+    }
+
+    fn controller_state(
+        gateway_addr: SocketAddr,
+        budget: Budget,
+        baseline_plan: Vec<crate::config::BaselinePlanStep>,
+    ) -> AppState {
         AppState {
             config: ControllerConfig {
                 bind_addr: "127.0.0.1:0".parse().expect("bind addr must parse"),
@@ -841,7 +950,7 @@ mod tests {
                 controller_engine: crate::config::ControllerEngine::Baseline,
                 model_provider: crate::config::ModelProvider::Mock,
                 budget_defaults: budget,
-                baseline_plan: crate::config::default_baseline_plan(),
+                baseline_plan,
                 auth_mode: crate::config::AuthMode::Local,
                 local_auth_shared_secret: None,
                 oidc: None,
@@ -868,7 +977,11 @@ mod tests {
             max_parallelism: None,
         };
 
-        let state = controller_state(gateway_addr, budget.clone());
+        let state = controller_state(
+            gateway_addr,
+            budget.clone(),
+            crate::config::default_baseline_plan(),
+        );
         let ctx = GatewayCallContext {
             principal_id: "dev",
             authz_header: None,
@@ -902,7 +1015,11 @@ mod tests {
             max_parallelism: None,
         };
 
-        let state = controller_state(gateway_addr, budget.clone());
+        let state = controller_state(
+            gateway_addr,
+            budget.clone(),
+            crate::config::default_baseline_plan(),
+        );
         let ctx = GatewayCallContext {
             principal_id: "dev",
             authz_header: None,
@@ -937,7 +1054,11 @@ mod tests {
             max_parallelism: None,
         };
 
-        let state = controller_state(gateway_addr, budget.clone());
+        let state = controller_state(
+            gateway_addr,
+            budget.clone(),
+            crate::config::default_baseline_plan(),
+        );
         let ctx = GatewayCallContext {
             principal_id: "dev",
             authz_header: None,
@@ -972,7 +1093,11 @@ mod tests {
             max_parallelism: None,
         };
 
-        let state = controller_state(gateway_addr, budget.clone());
+        let state = controller_state(
+            gateway_addr,
+            budget.clone(),
+            crate::config::default_baseline_plan(),
+        );
         let ctx = GatewayCallContext {
             principal_id: "dev",
             authz_header: None,
@@ -992,6 +1117,114 @@ mod tests {
         assert_eq!(counter.load(Ordering::Relaxed), 3);
         assert_eq!(result.operator_calls_used, 3);
         assert_eq!(result.depth_used, 4);
+    }
+
+    #[tokio::test]
+    async fn context_loop_applies_max_parallelism_to_fetch_span_fan_out() {
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let (gateway_addr, shutdown, task) =
+            spawn_parallel_fetch_gateway(in_flight, max_in_flight.clone()).await;
+
+        let budget = Budget {
+            max_operator_calls: 100,
+            max_bytes: 1024 * 1024,
+            max_wallclock_ms: 10_000,
+            max_recursion_depth: 10,
+            max_parallelism: Some(2),
+        };
+        let plan = vec![
+            crate::config::BaselinePlanStep::Operator {
+                op_name: "search".to_string(),
+                params: serde_json::json!({ "query": "$query", "limit": 2 }),
+            },
+            crate::config::BaselinePlanStep::SearchRefFetchSpan { max_refs: 2 },
+        ];
+
+        let state = controller_state(gateway_addr, budget.clone(), plan);
+        let ctx = GatewayCallContext {
+            principal_id: "dev",
+            authz_header: None,
+            local_auth_shared_secret: None,
+            request_id: "req_test_parallelism",
+            trace_id: "trace_test_parallelism",
+            session_token: "token",
+            session_id: "session",
+        };
+        let result = run_context_loop(&state, ctx, "query", &budget)
+            .await
+            .expect("context loop should succeed");
+
+        shutdown.send(()).ok();
+        let _ = task.await;
+
+        assert_eq!(result.operator_calls_used, 3);
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 2);
+    }
+
+    #[cfg(feature = "rlm")]
+    #[tokio::test]
+    async fn rlm_loop_executes_batch_calls_with_parallelism_budget() {
+        let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+            .join("scripts")
+            .join("rlm")
+            .join("pecr_rlm_bridge.py");
+        assert!(script_path.exists(), "rlm bridge script must exist");
+        let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+        // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+        }
+
+        let in_flight = Arc::new(AtomicUsize::new(0));
+        let max_in_flight = Arc::new(AtomicUsize::new(0));
+        let (gateway_addr, shutdown, task) =
+            spawn_parallel_fetch_gateway(in_flight, max_in_flight.clone()).await;
+
+        let budget = Budget {
+            max_operator_calls: 100,
+            max_bytes: 1024 * 1024,
+            max_wallclock_ms: 10_000,
+            max_recursion_depth: 10,
+            max_parallelism: Some(2),
+        };
+        let state = controller_state(
+            gateway_addr,
+            budget.clone(),
+            crate::config::default_baseline_plan(),
+        );
+        let ctx = GatewayCallContext {
+            principal_id: "dev",
+            authz_header: None,
+            local_auth_shared_secret: None,
+            request_id: "req_test_rlm_parallelism",
+            trace_id: "trace_test_rlm_parallelism",
+            session_token: "token",
+            session_id: "session",
+        };
+        let result = run_context_loop_rlm(&state, ctx, "query", &budget).await;
+
+        shutdown.send(()).ok();
+        let _ = task.await;
+        if let Some(previous) = previous_script_path {
+            // Safety: restoring the test-local env var mutation.
+            unsafe {
+                std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+            }
+        } else {
+            // Safety: restoring the test-local env var mutation.
+            unsafe {
+                std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+            }
+        }
+
+        let result = result.expect("rlm context loop should succeed");
+
+        assert_eq!(result.operator_calls_used, 5);
+        assert_eq!(max_in_flight.load(Ordering::SeqCst), 2);
+        assert_eq!(result.evidence_refs.len(), 2);
     }
 
     #[test]
