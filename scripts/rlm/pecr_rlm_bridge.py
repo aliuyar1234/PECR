@@ -60,14 +60,24 @@ class Budget:
     max_bytes: int
     max_wallclock_ms: int
     max_recursion_depth: int
+    max_parallelism: int
 
     @classmethod
     def from_json(cls, raw: dict[str, Any]) -> "Budget":
+        max_parallelism = raw.get("max_parallelism")
+        if max_parallelism is None:
+            parsed_parallelism = 1
+        else:
+            parsed_parallelism = int(max_parallelism)
+            if parsed_parallelism <= 0:
+                parsed_parallelism = 1
+
         return cls(
             max_operator_calls=int(raw.get("max_operator_calls", 0)),
             max_bytes=int(raw.get("max_bytes", 0)),
             max_wallclock_ms=int(raw.get("max_wallclock_ms", 0)),
             max_recursion_depth=int(raw.get("max_recursion_depth", 0)),
+            max_parallelism=parsed_parallelism,
         )
 
 
@@ -87,6 +97,24 @@ class Bridge:
         if resp.get("type") != "operator_result" or resp.get("id") != call_id:
             raise SystemExit(f"protocol error: expected operator_result for id={call_id}")
         return resp
+
+    def call_operator_batch(self, *, depth: int, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        call_id = uuid.uuid4().hex
+        write_json_line(
+            {
+                "type": "call_operator_batch",
+                "id": call_id,
+                "depth": depth,
+                "calls": calls,
+            }
+        )
+        resp = read_json_line()
+        if resp.get("type") != "operator_batch_result" or resp.get("id") != call_id:
+            raise SystemExit(f"protocol error: expected operator_batch_result for id={call_id}")
+        results = resp.get("results")
+        if not isinstance(results, list):
+            raise SystemExit(f"protocol error: expected list results for id={call_id}")
+        return [r for r in results if isinstance(r, dict)]
 
 
 def run_mock(bridge: Bridge, query: str, budget: Budget) -> dict[str, Any]:
@@ -140,6 +168,10 @@ def run_mock(bridge: Bridge, query: str, budget: Budget) -> dict[str, Any]:
                 object_id = r.get("object_id")
                 if isinstance(object_id, str) and object_id.strip():
                     calls.append({"op_name": "fetch_span", "params": {"object_id": object_id}})
+
+            if calls and budget.max_parallelism > 1:
+                operator_calls_used += len(bridge.call_operator_batch(depth=depth, calls=calls))
+                continue
 
             if not calls:
                 response = "PLAN: no spans\n"

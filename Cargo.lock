@@ -1223,6 +1223,7 @@ name = "pecr-controller"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",

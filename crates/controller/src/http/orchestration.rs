@@ -1,6 +1,7 @@
 use std::time::{Duration, Instant};
 
 use axum::http::StatusCode;
+use futures_util::stream::{FuturesUnordered, StreamExt};
 use pecr_contracts::{Budget, EvidenceUnit, EvidenceUnitRef, TerminalMode};
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
@@ -55,6 +56,14 @@ struct OperatorCallOutcome {
     bytes_len: usize,
 }
 
+#[cfg(feature = "rlm")]
+#[derive(Debug, Deserialize)]
+struct BatchBridgeCall {
+    op_name: String,
+    #[serde(default)]
+    params: serde_json::Value,
+}
+
 #[derive(Clone, Copy)]
 pub(super) struct GatewayCallContext<'a> {
     pub(super) principal_id: &'a str,
@@ -64,6 +73,39 @@ pub(super) struct GatewayCallContext<'a> {
     pub(super) trace_id: &'a str,
     pub(super) session_token: &'a str,
     pub(super) session_id: &'a str,
+}
+
+#[cfg(feature = "rlm")]
+fn allowed_operator(op_name: &str) -> bool {
+    matches!(
+        op_name,
+        "search" | "fetch_span" | "fetch_rows" | "aggregate" | "list_versions" | "diff" | "redact"
+    )
+}
+
+fn effective_parallelism(budget: &Budget) -> usize {
+    budget.max_parallelism.unwrap_or(1).max(1) as usize
+}
+
+#[cfg(feature = "rlm")]
+fn record_operator_result(
+    op_name: &str,
+    result: &serde_json::Value,
+    evidence_refs: &mut Vec<EvidenceUnitRef>,
+    evidence_units: &mut Vec<EvidenceUnit>,
+) {
+    if op_name == "search"
+        && let Some(refs_value) = result.get("refs").cloned()
+        && let Ok(refs) = serde_json::from_value::<Vec<EvidenceUnitRef>>(refs_value)
+    {
+        *evidence_refs = refs;
+    }
+
+    if let Ok(units) = serde_json::from_value::<Vec<EvidenceUnit>>(result.clone()) {
+        evidence_units.extend(units);
+    } else if let Ok(unit) = serde_json::from_value::<EvidenceUnit>(result.clone()) {
+        evidence_units.push(unit);
+    }
 }
 
 async fn call_operator(
@@ -384,26 +426,52 @@ pub(super) async fn run_context_loop(
                 }
             }
             BaselinePlanStep::SearchRefFetchSpan { max_refs } => {
-                for r in search_refs.iter().take(*max_refs) {
-                    if operator_calls_used >= budget.max_operator_calls {
-                        stop_reason = "budget_max_operator_calls";
-                        budget_violation = true;
-                        break 'plan_loop;
-                    }
-                    let Some(timeout) = remaining_wallclock(budget, loop_start) else {
-                        stop_reason = "budget_max_wallclock_ms";
-                        budget_violation = true;
-                        break 'plan_loop;
-                    };
+                let mut refs_to_fetch = search_refs
+                    .iter()
+                    .take(*max_refs)
+                    .map(|r| r.object_id.clone());
+                let mut in_flight = FuturesUnordered::new();
+                let mut scheduled_calls: u32 = 0;
+                let parallelism = effective_parallelism(budget);
 
-                    let outcome = call_operator(
-                        state,
-                        ctx,
-                        "fetch_span",
-                        serde_json::json!({ "object_id": r.object_id }),
-                        timeout,
-                    )
-                    .await?;
+                loop {
+                    while in_flight.len() < parallelism {
+                        if operator_calls_used.saturating_add(scheduled_calls)
+                            >= budget.max_operator_calls
+                        {
+                            stop_reason = "budget_max_operator_calls";
+                            budget_violation = true;
+                            break 'plan_loop;
+                        }
+
+                        let Some(object_id) = refs_to_fetch.next() else {
+                            break;
+                        };
+                        let Some(timeout) = remaining_wallclock(budget, loop_start) else {
+                            stop_reason = "budget_max_wallclock_ms";
+                            budget_violation = true;
+                            break 'plan_loop;
+                        };
+
+                        scheduled_calls = scheduled_calls.saturating_add(1);
+                        in_flight.push(async move {
+                            call_operator(
+                                state,
+                                ctx,
+                                "fetch_span",
+                                serde_json::json!({ "object_id": object_id }),
+                                timeout,
+                            )
+                            .await
+                        });
+                    }
+
+                    let Some(outcome) = in_flight.next().await else {
+                        break;
+                    };
+                    scheduled_calls = scheduled_calls.saturating_sub(1);
+
+                    let outcome = outcome?;
                     operator_calls_used = operator_calls_used.saturating_add(1);
                     bytes_used = bytes_used.saturating_add(outcome.bytes_len as u64);
 
@@ -415,6 +483,13 @@ pub(super) async fn run_context_loop(
 
                     if let Ok(unit) = serde_json::from_value::<EvidenceUnit>(body.result) {
                         evidence_units.push(unit);
+                    }
+
+                    if bytes_used > budget.max_bytes {
+                        terminal_mode = TerminalMode::InsufficientEvidence;
+                        stop_reason = "budget_max_bytes";
+                        budget_violation = true;
+                        break 'plan_loop;
                     }
                 }
             }
@@ -495,7 +570,7 @@ pub(super) async fn run_context_loop_rlm(
     let mut operator_calls_used: u32 = 0;
     let mut bytes_used: u64 = 0;
     let mut depth_used: u32 = 0;
-    let stop_reason: Option<&'static str>;
+    let mut stop_reason: Option<&'static str> = None;
     let mut budget_violation = false;
 
     let mut evidence_refs = Vec::<EvidenceUnitRef>::new();
@@ -698,17 +773,7 @@ pub(super) async fn run_context_loop_rlm(
                     break;
                 }
 
-                let allowed = matches!(
-                    op_name.as_str(),
-                    "search"
-                        | "fetch_span"
-                        | "fetch_rows"
-                        | "aggregate"
-                        | "list_versions"
-                        | "diff"
-                        | "redact"
-                );
-                if !allowed {
+                if !allowed_operator(op_name.as_str()) {
                     stop_reason = Some("bridge_operator_not_allowlisted");
                     break;
                 }
@@ -720,21 +785,12 @@ pub(super) async fn run_context_loop_rlm(
                 if let Some(body) = outcome.body {
                     let terminal_mode_for_resp = body.terminal_mode;
                     let result = body.result;
-                    if op_name == "search" {
-                        if let Some(refs_value) = result.get("refs").cloned()
-                            && let Ok(refs) =
-                                serde_json::from_value::<Vec<EvidenceUnitRef>>(refs_value)
-                        {
-                            evidence_refs = refs;
-                        }
-                    }
-
-                    if let Ok(units) = serde_json::from_value::<Vec<EvidenceUnit>>(result.clone()) {
-                        evidence_units.extend(units);
-                    } else if let Ok(unit) = serde_json::from_value::<EvidenceUnit>(result.clone())
-                    {
-                        evidence_units.push(unit);
-                    }
+                    record_operator_result(
+                        op_name.as_str(),
+                        &result,
+                        &mut evidence_refs,
+                        &mut evidence_units,
+                    );
 
                     let resp = serde_json::json!({
                         "type": "operator_result",
@@ -798,6 +854,160 @@ pub(super) async fn run_context_loop_rlm(
                     break;
                 }
             }
+            "call_operator_batch" => {
+                let id = msg
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                let depth = msg.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
+                let calls = msg
+                    .get("calls")
+                    .cloned()
+                    .and_then(|value| serde_json::from_value::<Vec<BatchBridgeCall>>(value).ok())
+                    .unwrap_or_default();
+
+                if id.is_empty() || calls.is_empty() {
+                    stop_reason = Some("bridge_invalid_message");
+                    break;
+                }
+                if depth >= budget.max_recursion_depth {
+                    stop_reason = Some("budget_max_recursion_depth");
+                    budget_violation = true;
+                    break;
+                }
+                depth_used = depth_used.max(depth.saturating_add(1));
+
+                let parallelism = effective_parallelism(budget);
+                let mut next_call_idx = 0usize;
+                let mut in_flight = FuturesUnordered::new();
+                let mut scheduled_calls: u32 = 0;
+                let mut batch_results = vec![serde_json::Value::Null; calls.len()];
+                let mut break_outer = false;
+
+                'batch_loop: loop {
+                    while in_flight.len() < parallelism {
+                        if operator_calls_used.saturating_add(scheduled_calls)
+                            >= budget.max_operator_calls
+                        {
+                            stop_reason = Some("budget_max_operator_calls");
+                            budget_violation = true;
+                            break_outer = true;
+                            break 'batch_loop;
+                        }
+
+                        let Some(call) = calls.get(next_call_idx) else {
+                            break;
+                        };
+
+                        let op_name = call.op_name.trim();
+                        if op_name.is_empty() || !allowed_operator(op_name) {
+                            stop_reason = Some("bridge_operator_not_allowlisted");
+                            break_outer = true;
+                            break 'batch_loop;
+                        }
+
+                        let Some(timeout) = remaining_wallclock(budget, loop_start) else {
+                            stop_reason = Some("budget_max_wallclock_ms");
+                            budget_violation = true;
+                            break_outer = true;
+                            break 'batch_loop;
+                        };
+
+                        let idx = next_call_idx;
+                        next_call_idx += 1;
+                        scheduled_calls = scheduled_calls.saturating_add(1);
+                        let params = call.params.clone();
+                        let op_name_owned = op_name.to_string();
+                        in_flight.push(async move {
+                            (
+                                idx,
+                                op_name_owned.clone(),
+                                call_operator(state, ctx, op_name_owned.as_str(), params, timeout)
+                                    .await,
+                            )
+                        });
+                    }
+
+                    let Some((idx, op_name, outcome)) = in_flight.next().await else {
+                        break;
+                    };
+                    scheduled_calls = scheduled_calls.saturating_sub(1);
+
+                    let outcome = outcome?;
+                    operator_calls_used = operator_calls_used.saturating_add(1);
+                    bytes_used = bytes_used.saturating_add(outcome.bytes_len as u64);
+
+                    if let Some(body) = outcome.body {
+                        let terminal_mode_for_resp = body.terminal_mode;
+                        let result = body.result;
+                        record_operator_result(
+                            op_name.as_str(),
+                            &result,
+                            &mut evidence_refs,
+                            &mut evidence_units,
+                        );
+
+                        batch_results[idx] = serde_json::json!({
+                            "ok": true,
+                            "op_name": op_name,
+                            "terminal_mode": terminal_mode_for_resp.as_str(),
+                            "result": result,
+                            "bytes_len": outcome.bytes_len,
+                        });
+                    } else {
+                        terminal_mode = outcome.terminal_mode_hint;
+                        stop_reason = Some("operator_error");
+                        batch_results[idx] = serde_json::json!({
+                            "ok": false,
+                            "op_name": op_name,
+                            "terminal_mode": outcome.terminal_mode_hint.as_str(),
+                            "result": serde_json::Value::Null,
+                            "bytes_len": outcome.bytes_len,
+                        });
+                        break_outer = true;
+                        break;
+                    }
+
+                    if bytes_used > budget.max_bytes {
+                        stop_reason = Some("budget_max_bytes");
+                        budget_violation = true;
+                        break_outer = true;
+                        break;
+                    }
+                }
+
+                if break_outer {
+                    break;
+                }
+
+                let resp = serde_json::json!({
+                    "type": "operator_batch_result",
+                    "id": id,
+                    "results": batch_results,
+                });
+                let resp_line = serde_json::to_string(&resp).map_err(|_| {
+                    json_error(
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        "ERR_RLM_BRIDGE_INTERNAL",
+                        "failed to serialize rlm bridge batch response".to_string(),
+                        TerminalMode::SourceUnavailable,
+                        false,
+                    )
+                })?;
+                child_stdin
+                    .write_all(format!("{}\n", resp_line).as_bytes())
+                    .await
+                    .map_err(|_| {
+                        json_error(
+                            StatusCode::INTERNAL_SERVER_ERROR,
+                            "ERR_RLM_BRIDGE_PROTOCOL",
+                            "failed to write rlm bridge batch response".to_string(),
+                            TerminalMode::SourceUnavailable,
+                            false,
+                        )
+                    })?;
+            }
             "done" => {
                 response_text = msg
                     .get("final_answer")
@@ -833,7 +1043,7 @@ pub(super) async fn run_context_loop_rlm(
             .ok()
             .and_then(Result::ok)
     } else {
-        let _ = child.kill();
+        let _ = child.kill().await;
         let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
         None
     };
