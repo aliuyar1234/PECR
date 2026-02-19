@@ -12,6 +12,25 @@ const viewId = __ENV.VIEW_ID || "safe_customer_view_public_slow";
 const enforceP99 = (__ENV.ENFORCE_P99 || "0") === "1";
 const p99BudgetMs = parseInt(__ENV.P99_BUDGET_MS || "1500", 10);
 const healthTimeoutMs = parseInt(__ENV.HEALTH_TIMEOUT_MS || "60000", 10);
+const sessionCreateRetries = parseInt(__ENV.SESSION_CREATE_RETRIES || "8", 10);
+const sessionCreateRetrySleepMs = parseInt(__ENV.SESSION_CREATE_RETRY_SLEEP_MS || "100", 10);
+const sessionBudgetMaxOperatorCalls = parseInt(
+  __ENV.SESSION_BUDGET_MAX_OPERATOR_CALLS || "10000",
+  10
+);
+const sessionBudgetMaxBytes = parseInt(__ENV.SESSION_BUDGET_MAX_BYTES || "67108864", 10);
+const sessionBudgetMaxWallclockMs = parseInt(
+  __ENV.SESSION_BUDGET_MAX_WALLCLOCK_MS || "300000",
+  10
+);
+const sessionBudgetMaxRecursionDepth = parseInt(
+  __ENV.SESSION_BUDGET_MAX_RECURSION_DEPTH || "16",
+  10
+);
+const sessionBudgetMaxParallelism = parseInt(
+  __ENV.SESSION_BUDGET_MAX_PARALLELISM || "1",
+  10
+);
 
 const wrongModeRate = new Rate("wrong_mode_rate");
 
@@ -29,14 +48,27 @@ export const options = {
   thresholds,
 };
 
-function waitForHealthz() {
+function waitForGatewayReady() {
   const deadline = Date.now() + healthTimeoutMs;
   while (Date.now() < deadline) {
-    const res = http.get(`${baseUrl}/healthz`);
-    if (res.status === 200) return;
+    const readyRes = http.get(`${baseUrl}/readyz`);
+    if (readyRes.status === 200) return;
+
+    // Backward-compatible fallback if /readyz is unavailable.
+    if (readyRes.status === 404) {
+      const healthRes = http.get(`${baseUrl}/healthz`);
+      if (healthRes.status === 200) return;
+    }
+
     sleep(0.25);
   }
-  throw new Error(`gateway not ready at ${baseUrl}/healthz after ${healthTimeoutMs}ms`);
+  throw new Error(
+    `gateway not ready at ${baseUrl}/readyz (or /healthz fallback) after ${healthTimeoutMs}ms`
+  );
+}
+
+function isTransientSessionStatus(status) {
+  return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
 
 function extractTerminalMode(res) {
@@ -67,33 +99,57 @@ function createSession(requestId) {
     headers["x-pecr-local-auth-secret"] = localAuthSecret;
   }
 
-  const res = http.post(
-    `${baseUrl}/v1/sessions`,
-    JSON.stringify({
-      budget: {
-        // Perf harness reuses this session across VUs and iterations.
-        max_operator_calls: 1000000,
-        max_bytes: 104857600,
-        max_wallclock_ms: 600000,
-        max_recursion_depth: 16,
-        max_parallelism: 1,
-      },
-    }),
-    {
-      headers,
-      timeout: "10s",
-    }
-  );
+  let last = {
+    res: null,
+    sessionId: "",
+    sessionToken: "",
+  };
 
-  const sessionToken = headerValue(res, "x-pecr-session-token");
-  let sessionId = "";
-  try {
-    sessionId = res.json().session_id || "";
-  } catch (_) {
-    sessionId = "";
+  for (let attempt = 1; attempt <= sessionCreateRetries; attempt += 1) {
+    const res = http.post(
+      `${baseUrl}/v1/sessions`,
+      JSON.stringify({
+        budget: {
+          // Keep defaults within Budget hard limits; allow env overrides for experiments.
+          max_operator_calls: sessionBudgetMaxOperatorCalls,
+          max_bytes: sessionBudgetMaxBytes,
+          max_wallclock_ms: sessionBudgetMaxWallclockMs,
+          max_recursion_depth: sessionBudgetMaxRecursionDepth,
+          max_parallelism: sessionBudgetMaxParallelism,
+        },
+      }),
+      {
+        headers,
+        timeout: "10s",
+      }
+    );
+
+    const sessionToken = headerValue(res, "x-pecr-session-token");
+    let sessionId = "";
+    try {
+      sessionId = res.json().session_id || "";
+    } catch (_) {
+      sessionId = "";
+    }
+
+    last = { res, sessionId, sessionToken };
+
+    if (res.status === 200 && sessionId && sessionToken) {
+      return last;
+    }
+
+    const shouldRetry =
+      attempt < sessionCreateRetries &&
+      (isTransientSessionStatus(res.status) ||
+        (res.status === 200 && (!sessionId || !sessionToken)));
+    if (!shouldRetry) {
+      return last;
+    }
+
+    sleep((sessionCreateRetrySleepMs * attempt) / 1000);
   }
 
-  return { res, sessionId, sessionToken };
+  return last;
 }
 
 export default function (data) {
@@ -147,7 +203,7 @@ export default function (data) {
 }
 
 export function setup() {
-  waitForHealthz();
+  waitForGatewayReady();
   const requestId = `setup-${Date.now()}`;
   const session = createSession(requestId);
   const ok = check(session.res, {
