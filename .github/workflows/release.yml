@@ -43,6 +43,10 @@ permissions:
   id-token: write
   attestations: write
 
+concurrency:
+  group: release-${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+
 jobs:
   resolve_meta:
     runs-on: ubuntu-latest
@@ -89,6 +93,14 @@ jobs:
           version="${tag#v}"
           binaries_artifact_name="${BIN_ARTIFACT_INPUT:-release-binaries}"
           images_artifact_name="${IMG_ARTIFACT_INPUT:-release-images}"
+          if [[ -z "${binaries_artifact_name// }" || -z "${images_artifact_name// }" ]]; then
+            echo "artifact names must be non-empty" >&2
+            exit 1
+          fi
+          if [[ "${binaries_artifact_name}" == "${images_artifact_name}" ]]; then
+            echo "binaries and images artifact names must differ" >&2
+            exit 1
+          fi
 
           case "${publish_mode}" in
             full)
@@ -98,6 +110,10 @@ jobs:
             republish)
               if [[ -z "${SOURCE_RUN_ID_INPUT:-}" ]]; then
                 echo "source_run_id is required when mode=republish" >&2
+                exit 1
+              fi
+              if ! [[ "${SOURCE_RUN_ID_INPUT}" =~ ^[0-9]+$ ]]; then
+                echo "source_run_id must be a numeric GitHub run ID (got: ${SOURCE_RUN_ID_INPUT})" >&2
                 exit 1
               fi
               source_run_id="${SOURCE_RUN_ID_INPUT}"
@@ -337,6 +353,10 @@ jobs:
 
           if [[ -z "${binaries_artifact}" || -z "${images_artifact}" ]]; then
             echo "artifact names could not be resolved (mode=${PUBLISH_MODE})" >&2
+            exit 1
+          fi
+          if ! [[ "${SOURCE_RUN_ID}" =~ ^[0-9]+$ ]]; then
+            echo "resolved source_run_id is not numeric: ${SOURCE_RUN_ID}" >&2
             exit 1
           fi
 

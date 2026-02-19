@@ -13,7 +13,10 @@ bash -n scripts/perf/suite7.sh
 python3 -m unittest discover -s scripts/tests -p "test_*.py"
 python3 -m unittest discover -s scripts/perf -p "test_*.py"
 python3 -m unittest discover -s scripts/ops -p "test_*.py"
-python3 -m py_compile scripts/security/release_smoke_check.py
+python3 -m py_compile \
+  scripts/security/check_image_tags.py \
+  scripts/security/verify_release_attestations.py \
+  scripts/security/release_smoke_check.py
 python3 scripts/replay/regression_gate.py --store "${PECR_REPLAY_STORE_DIR:-target/replay}" --allow-empty
 python3 scripts/contracts/check_contract_lock.py
 python3 scripts/security/check_image_tags.py
