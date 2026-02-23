@@ -199,7 +199,7 @@ jobs:
           subject-path: release/SHA256SUMS.txt
 
       - name: Upload release binary artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: release
@@ -310,7 +310,7 @@ jobs:
           subject-path: release/image-digests.txt
 
       - name: Upload release image manifest
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ${{ steps.artifact.outputs.name }}
           path: release/image-digests.txt

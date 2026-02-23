@@ -57,7 +57,7 @@ jobs:
 
       - name: Upload quality artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ci-quality-artifacts
           path: artifacts
@@ -371,7 +371,7 @@ jobs:
 
       - name: Upload perf artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: ci-perf-artifacts
           path: artifacts
