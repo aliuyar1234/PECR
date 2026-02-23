@@ -56,7 +56,7 @@ jobs:
           if-no-files-found: error
 
       - name: "Trivy filesystem scan (vuln budget: no HIGH/CRITICAL)"
-        uses: aquasecurity/trivy-action@0.28.0
+        uses: aquasecurity/trivy-action@0.34.1
         with:
           scan-type: fs
           scan-ref: .
