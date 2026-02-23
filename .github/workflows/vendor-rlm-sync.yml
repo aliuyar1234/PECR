@@ -32,7 +32,7 @@ jobs:
           python3 scripts/rlm/sync_vendor_rlm.py
 
       - name: Create pull request
-        uses: peter-evans/create-pull-request@v7
+        uses: peter-evans/create-pull-request@v8
         with:
           branch: chore/vendor-rlm-sync
           commit-message: "chore(rlm): sync vendored upstream rlm"
