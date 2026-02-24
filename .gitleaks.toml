@@ -1,0 +1,10 @@
+title = "PECR gitleaks config"
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Test fixtures with non-production keys"
+paths = [
+  '''^crates/auth/tests/fixtures/test_rsa_private\.pem$''',
+]
