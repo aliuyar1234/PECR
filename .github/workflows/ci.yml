@@ -11,6 +11,17 @@ permissions:
   contents: read
 
 jobs:
+  workflow_validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Validate workflow files
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/validate_workflows.py .github/workflows
+
   quality:
     runs-on: ubuntu-latest
     services:
@@ -28,16 +39,16 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: 1.91.1
           components: rustfmt, clippy
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
       - name: Ensure scripts executable
         shell: bash
@@ -48,8 +59,6 @@ jobs:
 
       - name: CI checks (fmt/clippy/test)
         shell: bash
-        env:
-          PECR_TEST_DB_URL: postgres://pecr:pecr@localhost:5432/pecr
         run: |
           set -euo pipefail
           mkdir -p artifacts
@@ -57,9 +66,102 @@ jobs:
 
       - name: Upload quality artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ci-quality-artifacts
+          path: artifacts
+          if-no-files-found: error
+
+  e2e_smoke:
+    needs: quality
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pecr
+          POSTGRES_PASSWORD: pecr
+          POSTGRES_DB: pecr
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pecr -d pecr"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.91.1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Run e2e smoke suites
+        shell: bash
+        env:
+          PECR_TEST_DB_URL: postgres://pecr:pecr@localhost:5432/pecr
+          PECR_E2E_REQUIRE_DB_URL: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          cargo test -p e2e_smoke -- --nocapture 2>&1 | tee artifacts/e2e_smoke.log
+
+      - name: Upload e2e smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-e2e-smoke-artifacts
+          path: artifacts
+          if-no-files-found: error
+
+  usefulness_integration:
+    needs: quality
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pecr
+          POSTGRES_PASSWORD: pecr
+          POSTGRES_DB: pecr
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pecr -d pecr"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.91.1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Run usefulness integration suites
+        shell: bash
+        env:
+          PECR_TEST_DB_URL: postgres://pecr:pecr@localhost:5432/pecr
+          PECR_E2E_REQUIRE_DB_URL: "1"
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          chmod +x scripts/run_useful_e2e.sh
+          ./scripts/run_useful_e2e.sh 2>&1 | tee artifacts/usefulness_integration.log
+
+      - name: Upload usefulness artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-usefulness-integration-artifacts
           path: artifacts
           if-no-files-found: error
 
@@ -67,15 +169,15 @@ jobs:
     needs: quality
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Set up Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
         with:
           toolchain: 1.91.1
 
       - name: Cache cargo
-        uses: Swatinem/rust-cache@v2
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
       - name: Ensure scripts executable
         shell: bash
@@ -114,8 +216,9 @@ jobs:
           PECR_CANARY_SOURCE_UNAVAILABLE_MAX_RATE: "0.05"
           SUITE7_EXPECTATIONS_FILE: "perf/config/suite7_expectations.v1.json"
           SUITE7_EXPECTATIONS_SCHEMA_VERSION: "1"
-          SUITE7_ENFORCE_TERMINAL_MODE_ASSERTIONS: "0"
+          SUITE7_ENFORCE_TERMINAL_MODE_ASSERTIONS: "1"
           SUITE7_BASELINE_REPEATS: "3"
+          SUITE7_USEFUL_CONTROLLER_QUERY: "What is the customer status and plan tier?"
         run: |
           set -euo pipefail
           mkdir -p artifacts artifacts/perf artifacts/ops
@@ -134,7 +237,6 @@ jobs:
           set +e
           PECR_CONTROLLER_ENGINE_OVERRIDE="rlm" \
           PECR_RLM_SANDBOX_ACK="1" \
-          SUITE7_SKIP_FAULTS="1" \
           CONTROLLER_BASELINE_SUMMARY_NAME="suite7_rlm_baseline.summary.json" \
           GATEWAY_BASELINE_SUMMARY_NAME="suite7_rlm_gateway_baseline.summary.json" \
           METRICS_GATES_FILE="target/perf/suite7_rlm_metrics_gates.json" \
@@ -371,9 +473,62 @@ jobs:
 
       - name: Upload perf artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: ci-perf-artifacts
+          path: artifacts
+          if-no-files-found: error
+
+  operator_contracts:
+    needs: quality
+    runs-on: ubuntu-latest
+    env:
+      COMPOSE_PROJECT_NAME: pecr-operator-contracts-${{ github.run_id }}-${{ github.run_attempt }}
+      PECR_LOCAL_AUTH_SHARED_SECRET: ci-operator-contract-secret
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Start gateway stack for operator contract tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          docker compose up -d --build postgres opa gateway
+
+      - name: Wait for gateway health
+        shell: bash
+        run: |
+          set -euo pipefail
+          deadline=$((SECONDS + 120))
+          until curl -fsS http://127.0.0.1:8080/healthz >/dev/null 2>&1; do
+            if (( SECONDS >= deadline )); then
+              docker compose logs --no-color gateway opa postgres > artifacts/operator_contract_stack.log
+              exit 1
+            fi
+            sleep 2
+          done
+
+      - name: Run operator contract tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          python3 scripts/replay/run_operator_contract_tests.py \
+            --local-auth-secret "${PECR_LOCAL_AUTH_SHARED_SECRET}" \
+            2>&1 | tee artifacts/operator_contract_tests.log
+
+      - name: Stop operator contract stack
+        if: always()
+        shell: bash
+        run: |
+          set +e
+          docker compose down -v --remove-orphans
+
+      - name: Upload operator contract artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: ci-operator-contract-artifacts
           path: artifacts
           if-no-files-found: error
 
@@ -381,7 +536,7 @@ jobs:
     needs: quality
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
 
       - name: Contract lock check
         run: python3 scripts/contracts/check_contract_lock.py
@@ -389,14 +544,20 @@ jobs:
   gate:
     if: always()
     needs:
+      - workflow_validation
       - quality
+      - e2e_smoke
       - perf
+      - operator_contracts
       - contracts
     runs-on: ubuntu-latest
     steps:
       - name: Enforce all CI gates passed
         run: |
           set -euo pipefail
+          test "${{ needs.workflow_validation.result }}" = "success"
           test "${{ needs.quality.result }}" = "success"
+          test "${{ needs.e2e_smoke.result }}" = "success"
           test "${{ needs.perf.result }}" = "success"
+          test "${{ needs.operator_contracts.result }}" = "success"
           test "${{ needs.contracts.result }}" = "success"

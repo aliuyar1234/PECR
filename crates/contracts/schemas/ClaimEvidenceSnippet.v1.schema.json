@@ -1,0 +1,11 @@
+{
+  "$id": "pecr.schemas.ClaimEvidenceSnippet.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["evidence_unit_id", "location", "snippet"],
+  "properties": {
+    "evidence_unit_id": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
+    "location": { "type": "string", "minLength": 1 },
+    "snippet": { "type": "string", "minLength": 1 }
+  }
+}

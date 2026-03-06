@@ -1,0 +1,49 @@
+{
+  "budget": {
+    "max_bytes": 4096,
+    "max_operator_calls": 10,
+    "max_parallelism": 1,
+    "max_recursion_depth": 3,
+    "max_wallclock_ms": 1000
+  },
+  "bytes_used": 436,
+  "claim_map": {
+    "claim_map_id": "claim-map-billing-terms-policy",
+    "claims": [
+      {
+        "claim_id": "5656565656565656565656565656565656565656565656565656565656565656",
+        "claim_text": "fs_corpus/public/billing_terms.txt line 8: Starter plans bill monthly at the published rate",
+        "evidence_unit_ids": [
+          "7878787878787878787878787878787878787878787878787878787878787878"
+        ],
+        "status": "SUPPORTED"
+      }
+    ],
+    "coverage_observed": 1.0,
+    "coverage_threshold": 0.95,
+    "terminal_mode": "SUPPORTED"
+  },
+  "depth_used": 2,
+  "evidence_ref_count": 1,
+  "evidence_unit_ids": [
+    "7878787878787878787878787878787878787878787878787878787878787878"
+  ],
+  "loop_terminal_mode": "SUPPORTED",
+  "metadata": {
+    "bundle_hash": "9090909090909090909090909090909090909090909090909090909090909090",
+    "engine_mode": "rlm",
+    "principal_id_hash": "abababababababababababababababababababababababababababababababab",
+    "quality_score": 92.0,
+    "recorded_at_unix_ms": 1700000104000,
+    "request_id": "req-useful-billing-terms-policy",
+    "run_id": "useful-billing-terms-policy",
+    "schema_version": 1,
+    "terminal_mode": "SUPPORTED",
+    "trace_id": "01ARZ3NDEKTSV4RRFFQ69G5FAE"
+  },
+  "operator_calls_used": 2,
+  "policy_snapshot_id": "policy-useful-billing-terms-policy",
+  "query": "Show evidence for the billing terms policy",
+  "response_text": "SUPPORTED: fs_corpus/public/billing_terms.txt line 8: Starter plans bill monthly at the published rate",
+  "session_id": "session-useful-billing-terms-policy"
+}

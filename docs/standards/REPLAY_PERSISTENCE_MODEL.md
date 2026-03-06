@@ -21,6 +21,7 @@
   - finalize output (`response_text`, `claim_map`)
   - execution counters (`operator_calls_used`, `bytes_used`, `depth_used`)
   - evidence summary (`evidence_ref_count`, `evidence_unit_ids`)
+  - optional planner traces (`plan_request`, planner output steps, and decision summary) for shadow comparison and later planner evaluation
 
 ## Hash Invariants
 

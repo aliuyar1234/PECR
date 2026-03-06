@@ -11,17 +11,26 @@ This repo follows the SSOT runbook baseline in `pcdr/spec/12_RUNBOOK.md`.
 ## Deterministic local run
 
 1) Start services:
-- `export PECR_LOCAL_AUTH_SHARED_SECRET='replace-with-random-secret'; docker compose up -d`
+- `docker compose up -d`
 
 Notes:
 - Postgres is exposed on `127.0.0.1:${PECR_POSTGRES_PORT:-55432}` by default (override via `PECR_POSTGRES_PORT`).
+- Local compose defaults `PECR_LOCAL_AUTH_SHARED_SECRET` to `pecr-local-demo-secret` so the demo commands below work without extra setup.
 
 2) Run the end-to-end suites (requires a Postgres URL):
 - PowerShell: `$env:PECR_TEST_DB_URL='postgres://pecr:pecr@localhost:55432/pecr'; cargo test -p e2e_smoke`
 - Bash: `PECR_TEST_DB_URL=postgres://pecr:pecr@localhost:55432/pecr cargo test -p e2e_smoke`
 
-3) Run the full CI script locally:
-- `bash scripts/ci.sh`
+3) Run the one-command verification path locally:
+- Bash: `bash scripts/verify.sh`
+- PowerShell: `.\scripts\verify.ps1`
+- Optional live smoke in PowerShell: `.\scripts\verify.ps1 -RunE2ESmoke`
+
+4) See useful behavior quickly:
+ - `python3 scripts/demo/useful_workflows.py tour`
+ - `python3 scripts/demo/useful_workflows.py live-tour`
+- `python3 scripts/demo/useful_workflows.py live-scenario customer-status`
+- `python3 scripts/demo/useful_workflows.py live-smoke`
 
 ## RLM vendor update workflow
 
@@ -83,6 +92,30 @@ Replay/eval knobs:
   - `python3 scripts/replay/run_operator_contract_tests.py --gateway-url http://127.0.0.1:8080 --local-auth-secret "$PECR_LOCAL_AUTH_SHARED_SECRET"`
   - `scripts/replay/OPERATOR_CONTRACT_CHECKLIST.md`
 
+## Useful demo workflows
+
+Use the fixture-backed usefulness corpus when you want fast product demos without bringing up the full stack:
+
+- List the named scenarios:
+  - `python3 scripts/demo/useful_workflows.py catalog`
+- Run the curated product walkthrough from stored fixtures:
+  - `python3 scripts/demo/useful_workflows.py tour`
+- Inspect a structured lookup or aggregate scenario:
+  - `python3 scripts/demo/useful_workflows.py scenario customer-status`
+  - `python3 scripts/demo/useful_workflows.py scenario customer-counts-by-plan`
+- Show the overall benchmark summary:
+  - `python3 scripts/demo/useful_workflows.py benchmark`
+- Run the same guided tour or named scenarios against a local controller:
+  - `python3 scripts/demo/useful_workflows.py live-tour`
+  - `python3 scripts/demo/useful_workflows.py live-scenario customer-status`
+  - `python3 scripts/demo/useful_workflows.py live-smoke`
+
+For benchmark definitions and validation, see `docs/useful_benchmark.md`.
+
+`tour` is the quickest product-value walkthrough when you only want the named usefulness corpus. `live-tour` is the best local contributor demo because it waits for `/v1/capabilities`, shows what is safe to ask, and then runs the curated end-to-end scenarios.
+
+The `live-*` commands assume the default local compose secret `pecr-local-demo-secret` unless `PECR_LOCAL_AUTH_SHARED_SECRET` overrides it. For the real-stack usefulness lane used in CI, set `PECR_TEST_DB_URL` and run `scripts/run_useful_e2e.sh`.
+
 ## Canary rollout guard (OPS-002 path)
 
 - Evaluate canary SLOs and auto-fallback action:
@@ -101,11 +134,19 @@ Replay/eval knobs:
   - `docs/observability/alerts/pecr_slo_alerts.yaml`
 - Index and ownership notes:
   - `docs/observability/README.md`
+- Production baselines:
+  - `docs/observability/baselines.md`
+
+## Architecture guardrails
+
+- Contributor invariants:
+  - `docs/architecture/invariants.md`
 
 ## Auth modes
 
 Default docker compose uses `PECR_AUTH_MODE=local`.
 - For local auth on non-loopback binds, set `PECR_LOCAL_AUTH_SHARED_SECRET` and send `x-pecr-local-auth-secret` on client requests.
+- Local docker compose defaults that shared secret to `pecr-local-demo-secret`.
 - Metrics default to auth-required on non-loopback binds (`PECR_METRICS_REQUIRE_AUTH=1`).
 
 OIDC mode (RS256 / JWKS) is available in both gateway and controller:

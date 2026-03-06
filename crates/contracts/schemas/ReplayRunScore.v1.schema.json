@@ -8,7 +8,8 @@
     "engine_mode",
     "terminal_mode",
     "quality_score",
-    "coverage_observed"
+    "coverage_observed",
+    "citation_quality"
   ],
   "properties": {
     "run_id": { "type": "string", "minLength": 1 },
@@ -16,6 +17,7 @@
     "engine_mode": { "$ref": "pecr.schemas.EngineMode.v1" },
     "terminal_mode": { "$ref": "pecr.schemas.TerminalMode.v1" },
     "quality_score": { "type": "number", "minimum": 0, "maximum": 100 },
-    "coverage_observed": { "type": "number", "minimum": 0, "maximum": 1 }
+    "coverage_observed": { "type": "number", "minimum": 0, "maximum": 1 },
+    "citation_quality": { "type": "number", "minimum": 0, "maximum": 1 }
   }
 }

@@ -14,6 +14,10 @@ pub struct ControllerConfig {
     pub model_provider: ModelProvider,
     pub budget_defaults: Budget,
     pub baseline_plan: Vec<BaselinePlanStep>,
+    pub planner_mode: PlannerMode,
+    pub planner_client: PlannerClientKind,
+    pub planner_client_url: Option<String>,
+    pub planner_client_timeout_ms: u64,
     pub adaptive_parallelism_enabled: bool,
     pub batch_mode_enabled: bool,
     pub operator_concurrency_policies: HashMap<String, OperatorConcurrencyPolicy>,
@@ -65,7 +69,20 @@ pub enum AuthMode {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ControllerEngine {
     Baseline,
+    BeamPlanner,
     Rlm,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannerMode {
+    RustOwned,
+    Shadow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlannerClientKind {
+    Disabled,
+    Beam,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -196,6 +213,35 @@ impl ControllerConfig {
             message: format!("PECR_BUDGET_DEFAULTS invalid: {}", reason),
         })?;
         let baseline_plan = parse_baseline_plan(kv.get("PECR_BASELINE_PLAN"))?;
+        let planner_mode = parse_planner_mode(kv.get("PECR_CONTROLLER_PLANNER_MODE"))?;
+        let planner_client = parse_planner_client_kind(kv.get("PECR_CONTROLLER_PLANNER_CLIENT"))?;
+        let planner_client_url = kv
+            .get("PECR_CONTROLLER_PLANNER_URL")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string());
+        let planner_client_timeout_ms = parse_u64(
+            kv.get("PECR_CONTROLLER_PLANNER_TIMEOUT_MS"),
+            500,
+            "PECR_CONTROLLER_PLANNER_TIMEOUT_MS",
+        )?;
+        if controller_engine == ControllerEngine::BeamPlanner
+            && planner_client != PlannerClientKind::Beam
+        {
+            return Err(StartupError {
+                code: "ERR_BEAM_PLANNER_CLIENT_REQUIRED",
+                message:
+                    "PECR_CONTROLLER_ENGINE=beam_planner requires PECR_CONTROLLER_PLANNER_CLIENT=beam"
+                        .to_string(),
+            });
+        }
+        if controller_engine == ControllerEngine::BeamPlanner && planner_client_url.is_none() {
+            return Err(StartupError {
+                code: "ERR_BEAM_PLANNER_URL_REQUIRED",
+                message: "PECR_CONTROLLER_ENGINE=beam_planner requires PECR_CONTROLLER_PLANNER_URL"
+                    .to_string(),
+            });
+        }
         let adaptive_parallelism_enabled =
             parse_bool_from_env_keys(kv, ADAPTIVE_PARALLELISM_ENV_KEYS, true);
         let batch_mode_enabled = parse_bool_from_env_keys(kv, BATCH_MODE_ENV_KEYS, true);
@@ -251,6 +297,10 @@ impl ControllerConfig {
             model_provider,
             budget_defaults,
             baseline_plan,
+            planner_mode,
+            planner_client,
+            planner_client_url,
+            planner_client_timeout_ms,
             adaptive_parallelism_enabled,
             batch_mode_enabled,
             operator_concurrency_policies,
@@ -410,6 +460,16 @@ pub fn default_baseline_plan() -> Vec<BaselinePlanStep> {
             }),
         },
         BaselinePlanStep::Operator {
+            op_name: "aggregate".to_string(),
+            params: serde_json::json!({
+                "view_id": "safe_customer_view_public",
+                "group_by": ["status"],
+                "metrics": [
+                    { "name": "count", "field": "customer_id" }
+                ]
+            }),
+        },
+        BaselinePlanStep::Operator {
             op_name: "search".to_string(),
             params: serde_json::json!({ "query": "$query", "limit": 5 }),
         },
@@ -551,6 +611,38 @@ fn parse_model_provider(value: Option<&String>) -> Result<ModelProvider, Startup
     }
 }
 
+fn parse_planner_mode(value: Option<&String>) -> Result<PlannerMode, StartupError> {
+    let mode = value
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("rust_owned");
+
+    match mode {
+        "rust_owned" | "rust" | "baseline" => Ok(PlannerMode::RustOwned),
+        "shadow" | "shadow_only" | "advisory" | "client_advisory" => Ok(PlannerMode::Shadow),
+        _ => Err(StartupError {
+            code: "ERR_INVALID_CONFIG",
+            message: "PECR_CONTROLLER_PLANNER_MODE must be rust_owned or shadow".to_string(),
+        }),
+    }
+}
+
+fn parse_planner_client_kind(value: Option<&String>) -> Result<PlannerClientKind, StartupError> {
+    let client = value
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .unwrap_or("disabled");
+
+    match client {
+        "disabled" | "none" => Ok(PlannerClientKind::Disabled),
+        "beam" => Ok(PlannerClientKind::Beam),
+        _ => Err(StartupError {
+            code: "ERR_INVALID_CONFIG",
+            message: "PECR_CONTROLLER_PLANNER_CLIENT must be disabled or beam".to_string(),
+        }),
+    }
+}
+
 fn parse_controller_engine(value: Option<&String>) -> Result<ControllerEngine, StartupError> {
     let engine = value
         .map(|s| s.trim())
@@ -559,10 +651,11 @@ fn parse_controller_engine(value: Option<&String>) -> Result<ControllerEngine, S
 
     match engine {
         "baseline" => Ok(ControllerEngine::Baseline),
+        "beam_planner" | "beam" => Ok(ControllerEngine::BeamPlanner),
         "rlm" => Ok(ControllerEngine::Rlm),
         _ => Err(StartupError {
             code: "ERR_INVALID_CONFIG",
-            message: "PECR_CONTROLLER_ENGINE must be baseline or rlm".to_string(),
+            message: "PECR_CONTROLLER_ENGINE must be baseline, beam_planner, or rlm".to_string(),
         }),
     }
 }
@@ -802,12 +895,101 @@ mod tests {
         let env = minimal_ok_env();
         let cfg = ControllerConfig::from_kv(&env).expect("config should load");
 
+        assert_eq!(cfg.planner_mode, PlannerMode::RustOwned);
+        assert_eq!(cfg.planner_client, PlannerClientKind::Disabled);
+        assert_eq!(cfg.planner_client_url, None);
+        assert_eq!(cfg.planner_client_timeout_ms, 500);
         assert!(cfg.adaptive_parallelism_enabled);
         assert!(cfg.batch_mode_enabled);
         assert!(cfg.operator_concurrency_policies.is_empty());
         assert_eq!(cfg.replay_store_dir, "target/replay");
         assert_eq!(cfg.replay_retention_days, 30);
         assert_eq!(cfg.replay_list_limit, 200);
+    }
+
+    #[test]
+    fn planner_mode_and_client_parse_from_env() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_CONTROLLER_PLANNER_MODE".to_string(),
+            "shadow".to_string(),
+        );
+        env.insert(
+            "PECR_CONTROLLER_PLANNER_CLIENT".to_string(),
+            "beam".to_string(),
+        );
+        env.insert(
+            "PECR_CONTROLLER_PLANNER_URL".to_string(),
+            "http://127.0.0.1:9090/plan".to_string(),
+        );
+        env.insert(
+            "PECR_CONTROLLER_PLANNER_TIMEOUT_MS".to_string(),
+            "750".to_string(),
+        );
+
+        let cfg = ControllerConfig::from_kv(&env).expect("config should load");
+        assert_eq!(cfg.planner_mode, PlannerMode::Shadow);
+        assert_eq!(cfg.planner_client, PlannerClientKind::Beam);
+        assert_eq!(
+            cfg.planner_client_url.as_deref(),
+            Some("http://127.0.0.1:9090/plan")
+        );
+        assert_eq!(cfg.planner_client_timeout_ms, 750);
+    }
+
+    #[test]
+    fn beam_planner_engine_requires_beam_client_and_url() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_CONTROLLER_ENGINE".to_string(),
+            "beam_planner".to_string(),
+        );
+
+        let err = ControllerConfig::from_kv(&env).expect_err("beam planner client must be set");
+        assert_eq!(err.code, "ERR_BEAM_PLANNER_CLIENT_REQUIRED");
+
+        env.insert(
+            "PECR_CONTROLLER_PLANNER_CLIENT".to_string(),
+            "beam".to_string(),
+        );
+        let err = ControllerConfig::from_kv(&env).expect_err("beam planner url must be set");
+        assert_eq!(err.code, "ERR_BEAM_PLANNER_URL_REQUIRED");
+
+        env.insert(
+            "PECR_CONTROLLER_PLANNER_URL".to_string(),
+            "http://127.0.0.1:9090/plan".to_string(),
+        );
+        let cfg = ControllerConfig::from_kv(&env).expect("beam planner config should load");
+        assert_eq!(cfg.controller_engine, ControllerEngine::BeamPlanner);
+        assert_eq!(cfg.planner_client, PlannerClientKind::Beam);
+        assert_eq!(
+            cfg.planner_client_url.as_deref(),
+            Some("http://127.0.0.1:9090/plan")
+        );
+    }
+
+    #[test]
+    fn invalid_planner_mode_fails() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_CONTROLLER_PLANNER_MODE".to_string(),
+            "beam".to_string(),
+        );
+
+        let err = ControllerConfig::from_kv(&env).expect_err("invalid planner mode must fail");
+        assert_eq!(err.code, "ERR_INVALID_CONFIG");
+    }
+
+    #[test]
+    fn invalid_planner_client_fails() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_CONTROLLER_PLANNER_CLIENT".to_string(),
+            "grpc".to_string(),
+        );
+
+        let err = ControllerConfig::from_kv(&env).expect_err("invalid planner client must fail");
+        assert_eq!(err.code, "ERR_INVALID_CONFIG");
     }
 
     #[test]

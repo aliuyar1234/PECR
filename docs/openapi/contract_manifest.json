@@ -1,0 +1,219 @@
+{
+  "route_sets": {
+    "gateway": {
+      "source": "crates/gateway/src/http.rs",
+      "routes": {
+        "/healthz": ["get"],
+        "/readyz": ["get"],
+        "/metrics": ["get"],
+        "/v1/sessions": ["post"],
+        "/v1/policies/capabilities": ["get"],
+        "/v1/policies/simulate": ["post"],
+        "/v1/operators/{op_name}": ["post"],
+        "/v1/finalize": ["post"]
+      }
+    },
+    "controller": {
+      "source": "crates/controller/src/http.rs",
+      "routes": {
+        "/healthz": ["get"],
+        "/readyz": ["get"],
+        "/metrics": ["get"],
+        "/v1/capabilities": ["get"],
+        "/v1/run": ["post"],
+        "/v1/replays": ["get"],
+        "/v1/replays/{run_id}": ["get"],
+        "/v1/evaluations": ["post"],
+        "/v1/evaluations/scorecards": ["get"],
+        "/v1/evaluations/{evaluation_id}": ["get"]
+      }
+    }
+  },
+  "schemas": {
+    "ReadyzResponse": {
+      "source": { "type": "component", "name": "ReadyzResponse" },
+      "required": ["status", "checks"],
+      "optional": []
+    },
+    "ErrorResponse": {
+      "source": { "type": "component", "name": "ErrorResponse" },
+      "required": ["code", "message", "terminal_mode_hint", "retryable"],
+      "optional": ["response_kind", "detail", "what_failed", "safe_alternative"]
+    },
+    "PolicyDecision": {
+      "source": { "type": "component", "name": "PolicyDecision" },
+      "required": ["allow", "cacheable"],
+      "optional": ["reason", "redaction", "narrowing"]
+    },
+    "ReplayEvaluationSubmission": {
+      "source": { "type": "component", "name": "ReplayEvaluationSubmission" },
+      "required": ["evaluation_name"],
+      "optional": ["replay_ids", "engine_mode", "min_quality_score", "max_source_unavailable_rate"]
+    },
+    "ReplayEvaluationResult": {
+      "source": { "type": "component", "name": "ReplayEvaluationResult" },
+      "required": ["evaluation_id", "evaluation_name", "principal_id_hash", "created_at_unix_ms", "replay_ids", "run_results", "scorecards", "overall_pass"],
+      "optional": ["missing_replay_ids", "engine_comparisons"]
+    },
+    "ReplayRunScore": {
+      "source": { "type": "component", "name": "ReplayRunScore" },
+      "required": ["run_id", "trace_id", "engine_mode", "terminal_mode", "quality_score", "coverage_observed", "citation_quality"],
+      "optional": ["response_kind"]
+    },
+    "RunQualityScorecard": {
+      "source": { "type": "component", "name": "RunQualityScorecard" },
+      "required": ["engine_mode", "run_count", "average_quality_score", "minimum_quality_score", "maximum_quality_score", "supported_rate", "source_unavailable_rate", "ambiguity_rate", "partial_answer_rate", "refusal_friction_rate", "average_coverage_observed", "average_citation_quality"],
+      "optional": []
+    },
+    "EngineComparisonSummary": {
+      "source": { "type": "component", "name": "EngineComparisonSummary" },
+      "required": ["primary_engine_mode", "secondary_engine_mode", "paired_query_count", "average_quality_score_delta", "supported_rate_delta", "source_unavailable_rate_delta", "average_coverage_observed_delta", "average_citation_quality_delta", "primary_win_rate", "secondary_win_rate", "tie_rate"],
+      "optional": ["more_helpful_engine_mode"]
+    },
+    "PlannerOperatorStep": {
+      "source": { "type": "component", "name": "PlannerOperatorStep" },
+      "required": ["kind", "op_name", "params"],
+      "optional": []
+    },
+    "PlannerSearchRefFetchSpanStep": {
+      "source": { "type": "component", "name": "PlannerSearchRefFetchSpanStep" },
+      "required": ["kind", "max_refs"],
+      "optional": []
+    },
+    "PlannerHints": {
+      "source": { "type": "component", "name": "PlannerHints" },
+      "required": ["intent", "recommended_path"],
+      "optional": []
+    },
+    "PlannerRecoveryContext": {
+      "source": { "type": "component", "name": "PlannerRecoveryContext" },
+      "required": ["failed_step", "failure_terminal_mode", "attempted_path"],
+      "optional": []
+    },
+    "PlanRequest": {
+      "source": { "type": "component", "name": "PlanRequest" },
+      "required": ["schema_version", "query", "budget", "planner_hints", "available_operator_names", "allow_search_ref_fetch_span"],
+      "optional": ["recovery_context"]
+    },
+    "PlanResponse": {
+      "source": { "type": "component", "name": "PlanResponse" },
+      "required": ["schema_version", "steps"],
+      "optional": ["planner_summary"]
+    },
+    "ReplayPlannerDecisionSummary": {
+      "source": { "type": "component", "name": "ReplayPlannerDecisionSummary" },
+      "required": ["planner_source", "stop_reason", "selected_for_execution", "used_fallback_plan"],
+      "optional": ["fallback_from_step", "expected_usefulness_score", "expected_usefulness_reasons", "selection_rationale", "planner_summary"]
+    },
+    "ReplayPlannerTrace": {
+      "source": { "type": "component", "name": "ReplayPlannerTrace" },
+      "required": ["plan_request", "decision_summary"],
+      "optional": ["output_steps"]
+    },
+    "ReplayBundle": {
+      "source": { "type": "component", "name": "ReplayBundle" },
+      "required": ["metadata", "query", "budget", "session_id", "policy_snapshot_id", "loop_terminal_mode", "response_text", "claim_map", "operator_calls_used", "bytes_used", "depth_used", "evidence_ref_count", "evidence_unit_ids"],
+      "optional": ["loop_response_text", "planner_traces"]
+    },
+    "ClaimEvidenceSnippet": {
+      "source": { "type": "component", "name": "ClaimEvidenceSnippet" },
+      "required": ["evidence_unit_id", "location", "snippet"],
+      "optional": []
+    },
+    "Claim": {
+      "source": { "type": "component", "name": "Claim" },
+      "required": ["claim_id", "claim_text", "status", "evidence_unit_ids"],
+      "optional": ["evidence_snippets"]
+    },
+    "SafeAskCapability": {
+      "source": { "type": "component", "name": "SafeAskCapability" },
+      "required": ["capability_id", "intent", "title", "description"],
+      "optional": ["examples", "scope_labels", "view_ids", "field_labels", "dimension_labels", "source_scopes", "document_hints"]
+    },
+    "SafeAskCatalog": {
+      "source": { "type": "component", "name": "SafeAskCatalog" },
+      "required": [],
+      "optional": ["capabilities", "suggested_queries"]
+    },
+    "ClarificationPrompt": {
+      "source": { "type": "component", "name": "ClarificationPrompt" },
+      "required": ["question"],
+      "optional": ["options"]
+    },
+    "ClaimMap": {
+      "source": { "type": "component", "name": "ClaimMap" },
+      "required": ["claim_map_id", "terminal_mode", "claims", "coverage_threshold", "coverage_observed"],
+      "optional": ["clarification_prompt", "notes"]
+    },
+    "gateway.CreateSessionRequest": {
+      "source": { "type": "path_request", "path": "/v1/sessions", "method": "post" },
+      "required": ["budget"],
+      "optional": ["as_of_time"]
+    },
+    "gateway.CreateSessionResponse": {
+      "source": { "type": "path_response", "path": "/v1/sessions", "method": "post", "status": "200" },
+      "required": ["session_id", "trace_id", "policy_snapshot_id", "budget"],
+      "optional": []
+    },
+    "gateway.PolicySimulateRequest": {
+      "source": { "type": "path_request", "path": "/v1/policies/simulate", "method": "post" },
+      "required": ["action", "params"],
+      "optional": ["policy_snapshot_hash", "policy_bundle_hash", "as_of_time"]
+    },
+    "gateway.PolicySimulateResponse": {
+      "source": { "type": "path_response", "path": "/v1/policies/simulate", "method": "post", "status": "200" },
+      "required": ["allow", "cacheable"],
+      "optional": ["reason", "redaction", "narrowing"]
+    },
+    "gateway.SafeAskCatalogResponse": {
+      "source": { "type": "path_response", "path": "/v1/policies/capabilities", "method": "get", "status": "200" },
+      "required": [],
+      "optional": ["capabilities", "suggested_queries"]
+    },
+    "gateway.OperatorCallRequest": {
+      "source": { "type": "path_request", "path": "/v1/operators/{op_name}", "method": "post" },
+      "required": ["session_id", "params"],
+      "optional": []
+    },
+    "gateway.OperatorCallResponse": {
+      "source": { "type": "path_response", "path": "/v1/operators/{op_name}", "method": "post", "status": "200" },
+      "required": ["terminal_mode", "result"],
+      "optional": ["result_summary", "policy_decision"]
+    },
+    "gateway.FinalizeRequest": {
+      "source": { "type": "path_request", "path": "/v1/finalize", "method": "post" },
+      "required": ["session_id", "response_text", "claim_map"],
+      "optional": []
+    },
+    "gateway.FinalizeResponse": {
+      "source": { "type": "path_response", "path": "/v1/finalize", "method": "post", "status": "200" },
+      "required": ["terminal_mode", "trace_id", "claim_map", "response_text"],
+      "optional": []
+    },
+    "controller.RunRequest": {
+      "source": { "type": "path_request", "path": "/v1/run", "method": "post" },
+      "required": ["query"],
+      "optional": ["budget"]
+    },
+    "controller.RunResponse": {
+      "source": { "type": "path_response", "path": "/v1/run", "method": "post", "status": "200" },
+      "required": ["terminal_mode", "trace_id", "claim_map", "response_text"],
+      "optional": ["response_kind"]
+    },
+    "controller.SafeAskCatalogResponse": {
+      "source": { "type": "path_response", "path": "/v1/capabilities", "method": "get", "status": "200" },
+      "required": [],
+      "optional": ["capabilities", "suggested_queries"]
+    },
+    "controller.ReplayListResponse": {
+      "source": { "type": "path_response", "path": "/v1/replays", "method": "get", "status": "200" },
+      "required": ["replays"],
+      "optional": []
+    },
+    "controller.ReplayScorecardsResponse": {
+      "source": { "type": "path_response", "path": "/v1/evaluations/scorecards", "method": "get", "status": "200" },
+      "required": ["scorecards"],
+      "optional": []
+    }
+  }
+}

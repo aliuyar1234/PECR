@@ -34,6 +34,10 @@
     "evidence_unit_ids": {
       "type": "array",
       "items": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+    },
+    "planner_traces": {
+      "type": "array",
+      "items": { "$ref": "pecr.schemas.ReplayPlannerTrace.v1" }
     }
   }
 }

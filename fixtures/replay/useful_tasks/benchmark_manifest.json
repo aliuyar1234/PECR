@@ -1,0 +1,145 @@
+{
+  "benchmark_name": "useful_answer_benchmark_v1",
+  "description": "Named product-value scenarios for replayable PECR usefulness checks.",
+  "scenarios": [
+    {
+      "scenario_id": "customer-status",
+      "title": "Customer status and plan lookup",
+      "category": "structured_lookup",
+      "job": "Verify the current customer status and plan tier from safeview data.",
+      "query": "What is the customer status and plan tier?",
+      "run_id": "useful-customer-status",
+      "replay_path": "replays/customer_status_plan.json",
+      "expected_terminal_mode": "SUPPORTED",
+      "expected_planner_prefixes": [["fetch_rows"]],
+      "minimum_quality_score": 95.0
+    },
+    {
+      "scenario_id": "support-policy-source",
+      "title": "Support policy source citation",
+      "category": "evidence_lookup",
+      "job": "Quote the support policy directly from source text with corroborating evidence.",
+      "query": "Show the source text and evidence for the support policy",
+      "run_id": "useful-support-policy-source",
+      "replay_path": "replays/support_policy_source_text.json",
+      "expected_terminal_mode": "SUPPORTED",
+      "expected_planner_prefixes": [["lookup_evidence"], ["search", "fetch_span"]],
+      "minimum_supported_claim_evidence_units": 2,
+      "minimum_quality_score": 94.0
+    },
+    {
+      "scenario_id": "latest-support-change",
+      "title": "Latest support document change review",
+      "category": "version_review",
+      "job": "Explain what changed in the newest version of the support document.",
+      "query": "What changed in the latest version of the support document?",
+      "run_id": "useful-latest-support-change",
+      "replay_path": "replays/latest_support_document_change.json",
+      "expected_terminal_mode": "SUPPORTED",
+      "expected_planner_prefixes": [["list_versions"]],
+      "minimum_quality_score": 93.0
+    },
+    {
+      "scenario_id": "annual-refund-source",
+      "title": "Annual refund source lookup",
+      "category": "evidence_lookup",
+      "job": "Find the exact annual refund language in source text.",
+      "query": "Show the source text for annual refund terms",
+      "run_id": "useful-annual-refund-source",
+      "replay_path": "replays/annual_refund_source_text.json",
+      "expected_terminal_mode": "SUPPORTED",
+      "expected_planner_prefixes": [["lookup_evidence"], ["search", "fetch_span"]],
+      "minimum_quality_score": 91.0
+    },
+    {
+      "scenario_id": "billing-terms-policy",
+      "title": "Billing terms evidence lookup",
+      "category": "evidence_lookup",
+      "job": "Return evidence for the billing terms policy without guessing.",
+      "query": "Show evidence for the billing terms policy",
+      "run_id": "useful-billing-terms-policy",
+      "replay_path": "replays/billing_terms_policy.json",
+      "expected_terminal_mode": "SUPPORTED",
+      "expected_planner_prefixes": [["lookup_evidence"], ["search", "fetch_span"]],
+      "minimum_quality_score": 92.0
+    },
+    {
+      "scenario_id": "customer-counts-by-plan",
+      "title": "Customer counts by plan tier",
+      "category": "aggregate_compare",
+      "job": "Compare active customer counts by plan tier using structured aggregation.",
+      "query": "Compare active customer counts by plan tier",
+      "run_id": "useful-customer-counts-by-plan",
+      "replay_path": "replays/customer_counts_by_plan_tier.json",
+      "expected_terminal_mode": "SUPPORTED",
+      "expected_planner_prefixes": [["compare"], ["aggregate"]],
+      "minimum_quality_score": 95.0
+    },
+    {
+      "scenario_id": "monthly-customer-trend",
+      "title": "Monthly customer trend",
+      "category": "aggregate_trend",
+      "job": "Summarize the customer trend over time without falling back to raw source search.",
+      "query": "Show monthly customer trend over time",
+      "run_id": "useful-monthly-customer-trend",
+      "replay_path": "replays/monthly_customer_trend.json",
+      "expected_terminal_mode": "SUPPORTED",
+      "expected_planner_prefixes": [["aggregate"]],
+      "minimum_quality_score": 94.0
+    },
+    {
+      "scenario_id": "broad-customer-query",
+      "title": "Broad customer query narrowing",
+      "category": "ambiguity_guidance",
+      "job": "Offer a safe narrowing hint instead of a dead-end answer for an over-broad structured request.",
+      "query": "customer",
+      "run_id": "useful-broad-customer-query",
+      "replay_path": "replays/broad_customer_query_narrowing.json",
+      "expected_terminal_mode": "INSUFFICIENT_EVIDENCE",
+      "expected_response_kind": "ambiguous",
+      "expected_planner_prefixes": [["fetch_rows"]],
+      "expected_response_substrings": [
+        "structured lookup is underspecified",
+        "safe_customer_view_public"
+      ],
+      "minimum_quality_score": 90.0
+    },
+    {
+      "scenario_id": "broad-policy-query",
+      "title": "Broad policy query narrowing",
+      "category": "ambiguity_guidance",
+      "job": "Offer a document-scoped narrowing hint for a broad evidence request instead of failing flatly.",
+      "query": "policy",
+      "run_id": "useful-broad-policy-query",
+      "replay_path": "replays/broad_policy_query_narrowing.json",
+      "expected_terminal_mode": "INSUFFICIENT_EVIDENCE",
+      "expected_response_kind": "ambiguous",
+      "expected_planner_prefixes": [["lookup_evidence"], ["search", "fetch_span"]],
+      "expected_response_substrings": [
+        "specify which document or policy",
+        "public documents under public/"
+      ],
+      "minimum_quality_score": 90.0
+    },
+    {
+      "scenario_id": "partial-billing-answer",
+      "title": "Partial billing answer with unresolved remainder",
+      "category": "partial_answer",
+      "job": "Return grounded billing terms while clearly flagging unresolved refund exceptions.",
+      "query": "Summarize the billing terms and any unresolved refund exceptions",
+      "run_id": "useful-partial-billing-answer",
+      "replay_path": "replays/partial_billing_answer.json",
+      "expected_terminal_mode": "SUPPORTED",
+      "expected_response_kind": "partial_answer",
+      "expected_planner_prefixes": [["lookup_evidence"], ["search", "fetch_span"]],
+      "expected_response_substrings": [
+        "SUPPORTED:",
+        "UNKNOWN:"
+      ],
+      "expected_note_substrings": [
+        "Partial answer:"
+      ],
+      "minimum_quality_score": 90.0
+    }
+  ]
+}

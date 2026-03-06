@@ -1,0 +1,63 @@
+{
+  "budget": {
+    "max_bytes": 4096,
+    "max_operator_calls": 10,
+    "max_parallelism": 1,
+    "max_recursion_depth": 3,
+    "max_wallclock_ms": 1000
+  },
+  "bytes_used": 392,
+  "claim_map": {
+    "claim_map_id": "claim-map-partial-billing-answer",
+    "claims": [
+      {
+        "claim_id": "1616161616161616161616161616161616161616161616161616161616161616",
+        "claim_text": "fs_corpus/public/billing_terms.txt line 8: Annual plans may request refunds within 30 days of purchase.",
+        "evidence_snippets": [
+          {
+            "evidence_unit_id": "1717171717171717171717171717171717171717171717171717171717171717",
+            "location": "fs_corpus/public/billing_terms.txt line 8",
+            "snippet": "Annual plans may request refunds within 30 days of purchase."
+          }
+        ],
+        "evidence_unit_ids": [
+          "1717171717171717171717171717171717171717171717171717171717171717"
+        ],
+        "status": "SUPPORTED"
+      },
+      {
+        "claim_id": "1818181818181818181818181818181818181818181818181818181818181818",
+        "claim_text": "The available evidence does not resolve every refund exception or override.",
+        "evidence_unit_ids": [],
+        "status": "UNKNOWN"
+      }
+    ],
+    "coverage_observed": 1.0,
+    "coverage_threshold": 0.95,
+    "notes": "Partial answer: supported claims are grounded, but some requested details remain unresolved.",
+    "terminal_mode": "SUPPORTED"
+  },
+  "depth_used": 2,
+  "evidence_ref_count": 1,
+  "evidence_unit_ids": [
+    "1717171717171717171717171717171717171717171717171717171717171717"
+  ],
+  "loop_terminal_mode": "INSUFFICIENT_EVIDENCE",
+  "metadata": {
+    "bundle_hash": "1919191919191919191919191919191919191919191919191919191919191919",
+    "engine_mode": "baseline",
+    "principal_id_hash": "2020202020202020202020202020202020202020202020202020202020202020",
+    "quality_score": 91.0,
+    "recorded_at_unix_ms": 1700000802000,
+    "request_id": "req-useful-partial-billing-answer",
+    "run_id": "useful-partial-billing-answer",
+    "schema_version": 1,
+    "terminal_mode": "SUPPORTED",
+    "trace_id": "01ARZ3NDEKTSV4RRFFQ69G5FAJ"
+  },
+  "operator_calls_used": 2,
+  "policy_snapshot_id": "policy-useful-partial-billing-answer",
+  "query": "Summarize the billing terms and any unresolved refund exceptions",
+  "response_text": "SUPPORTED: Annual plans may request refunds within 30 days of purchase.\nUNKNOWN: The available evidence does not resolve every refund exception or override.",
+  "session_id": "session-useful-partial-billing-answer"
+}

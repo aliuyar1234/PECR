@@ -1,0 +1,4 @@
+Annual refund terms for the PECR demo environment.
+
+Annual refund terms: refunds are available for annual plans within 30 days of renewal.
+Refunds after that window require manual approval.

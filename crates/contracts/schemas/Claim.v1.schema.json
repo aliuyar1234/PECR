@@ -10,6 +10,10 @@
     "evidence_unit_ids": {
       "type": "array",
       "items": { "type": "string", "pattern": "^[a-f0-9]{64}$" }
+    },
+    "evidence_snippets": {
+      "type": "array",
+      "items": { "$ref": "pecr.schemas.ClaimEvidenceSnippet.v1" }
     }
   }
 }

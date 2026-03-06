@@ -9,6 +9,7 @@ BASELINE_DURATION="${BASELINE_DURATION:-10s}"
 FAULT_VUS="${FAULT_VUS:-10}"
 FAULT_DURATION="${FAULT_DURATION:-5s}"
 CONTROLLER_P99_BUDGET_MS="${CONTROLLER_P99_BUDGET_MS:-${P99_BUDGET_MS:-1500}}"
+USEFUL_CONTROLLER_P99_BUDGET_MS="${USEFUL_CONTROLLER_P99_BUDGET_MS:-${CONTROLLER_P99_BUDGET_MS}}"
 GATEWAY_P99_BUDGET_MS="${GATEWAY_P99_BUDGET_MS:-900}"
 BVR_THRESHOLD="${BVR_THRESHOLD:-0.005}"
 SER_THRESHOLD="${SER_THRESHOLD:-0.005}"
@@ -24,6 +25,8 @@ SUITE7_EXPECTATIONS_FILE="${SUITE7_EXPECTATIONS_FILE:-perf/config/suite7_expecta
 SUITE7_EXPECTATIONS_SCHEMA_VERSION="${SUITE7_EXPECTATIONS_SCHEMA_VERSION:-1}"
 SUITE7_ENFORCE_TERMINAL_MODE_ASSERTIONS="${SUITE7_ENFORCE_TERMINAL_MODE_ASSERTIONS:-0}"
 SUITE7_BASELINE_REPEATS="${SUITE7_BASELINE_REPEATS:-1}"
+SUITE7_SKIP_USEFUL_SCENARIOS="${SUITE7_SKIP_USEFUL_SCENARIOS:-0}"
+SUITE7_USEFUL_CONTROLLER_QUERY="${SUITE7_USEFUL_CONTROLLER_QUERY:-What is the customer status and plan tier?}"
 USER_CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE="${CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE-__UNSET__}"
 USER_RLM_BASELINE_EXPECT_TERMINAL_MODE="${RLM_BASELINE_EXPECT_TERMINAL_MODE-__UNSET__}"
 USER_GATEWAY_BASELINE_EXPECT_TERMINAL_MODE="${GATEWAY_BASELINE_EXPECT_TERMINAL_MODE-__UNSET__}"
@@ -268,6 +271,54 @@ validate_suite7_runtime_args() {
     echo "SUITE7_BASELINE_REPEATS must be a positive integer (>=1)" >&2
     return 1
   fi
+
+  case "${SUITE7_SKIP_USEFUL_SCENARIOS}" in
+    0|1) ;;
+    *)
+      echo "SUITE7_SKIP_USEFUL_SCENARIOS must be 0 or 1" >&2
+      return 1
+      ;;
+  esac
+
+  if [[ "${SUITE7_SKIP_USEFUL_SCENARIOS}" != "1" && -z "${SUITE7_USEFUL_CONTROLLER_QUERY}" ]]; then
+    echo "SUITE7_USEFUL_CONTROLLER_QUERY must be non-empty when useful scenarios are enabled" >&2
+    return 1
+  fi
+
+  if [[ "${SUITE7_ENFORCE_TERMINAL_MODE_ASSERTIONS}" != "1" ]]; then
+    return 0
+  fi
+
+  local controller_expected="${CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE}"
+  if [[ "${PECR_CONTROLLER_ENGINE_OVERRIDE,,}" == "rlm" ]]; then
+    controller_expected="${RLM_BASELINE_EXPECT_TERMINAL_MODE}"
+  fi
+  if [[ -z "${controller_expected}" ]]; then
+    echo "controller baseline expected terminal mode must be configured when assertions are enabled" >&2
+    return 1
+  fi
+
+  if [[ "${SUITE7_ENFORCE_GATEWAY_FETCH_ROWS}" == "1" && -z "${GATEWAY_BASELINE_EXPECT_TERMINAL_MODE}" ]]; then
+    echo "gateway fetch_rows expected terminal mode must be configured when assertions are enabled" >&2
+    return 1
+  fi
+
+  if [[ "${SUITE7_SKIP_FAULTS}" == "1" ]]; then
+    return 0
+  fi
+
+  local fault_mode
+  for fault_mode in \
+    "${SUITE7_FAULT_OPA_UNAVAILABLE_EXPECT_TERMINAL_MODE}" \
+    "${SUITE7_FAULT_OPA_TIMEOUT_EXPECT_TERMINAL_MODE}" \
+    "${SUITE7_FAULT_POSTGRES_UNAVAILABLE_EXPECT_TERMINAL_MODE}" \
+    "${SUITE7_FAULT_PG_STATEMENT_TIMEOUT_EXPECT_TERMINAL_MODE}"
+  do
+    if [[ -z "${fault_mode}" ]]; then
+      echo "all fault expected terminal modes must be configured when assertions are enabled" >&2
+      return 1
+    fi
+  done
 }
 
 effective_expected_mode() {
@@ -348,36 +399,33 @@ run_k6_controller() {
   local name="$1"
   local expected="$2"
   local enforce_p99="$3"
+  local query="${4:-smoke}"
+  local p99_budget_ms="${5:-$CONTROLLER_P99_BUDGET_MS}"
+  local summary_name="${name}.summary.json"
+  if [[ "${name}" == *.summary.json ]]; then
+    summary_name="${name}"
+  fi
   docker_compose --profile perf run --rm -T \
     -e BASE_URL="http://controller:8081" \
     -e PRINCIPAL_ID="dev" \
     -e LOCAL_AUTH_SECRET="${PECR_LOCAL_AUTH_SHARED_SECRET}" \
-    -e QUERY="smoke" \
+    -e QUERY="${query}" \
     -e EXPECT_TERMINAL_MODE="$expected" \
     -e ENFORCE_P99="$enforce_p99" \
-    -e P99_BUDGET_MS="$CONTROLLER_P99_BUDGET_MS" \
+    -e P99_BUDGET_MS="${p99_budget_ms}" \
     -e VUS="$FAULT_VUS" \
     -e DURATION="$FAULT_DURATION" \
     k6 run --summary-trend-stats "min,avg,med,max,p(90),p(95),p(99)" \
-      --summary-export "/results/${name}.summary.json" /scripts/suite7_controller_run.js
+      --summary-export "/results/${summary_name}" /scripts/suite7_controller_run.js
 }
 
 run_k6_controller_baseline_once() {
   local summary_name="$1"
   local expected_mode="$2"
 
-  docker_compose --profile perf run --rm -T \
-    -e BASE_URL="http://controller:8081" \
-    -e PRINCIPAL_ID="dev" \
-    -e LOCAL_AUTH_SECRET="${PECR_LOCAL_AUTH_SHARED_SECRET}" \
-    -e QUERY="smoke" \
-    -e EXPECT_TERMINAL_MODE="${expected_mode}" \
-    -e ENFORCE_P99="1" \
-    -e P99_BUDGET_MS="$CONTROLLER_P99_BUDGET_MS" \
-    -e VUS="$BASELINE_VUS" \
-    -e DURATION="$BASELINE_DURATION" \
-    k6 run --summary-trend-stats "min,avg,med,max,p(90),p(95),p(99)" \
-      --summary-export "/results/${summary_name}" /scripts/suite7_controller_run.js
+  FAULT_VUS="${BASELINE_VUS}" \
+  FAULT_DURATION="${BASELINE_DURATION}" \
+    run_k6_controller "${summary_name}" "${expected_mode}" "1" "smoke" "${CONTROLLER_P99_BUDGET_MS}"
 }
 
 run_k6_controller_baseline() {
@@ -480,12 +528,32 @@ run_k6_gateway_fetch_rows_checked \
   "1" \
   "$GATEWAY_P99_BUDGET_MS"
 
+if [[ "${SUITE7_SKIP_USEFUL_SCENARIOS}" == "1" ]]; then
+  echo "[suite7] useful controller probes skipped (SUITE7_SKIP_USEFUL_SCENARIOS=1)"
+else
+  useful_expected_mode="$(effective_expected_mode "${CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE}")"
+  echo "[suite7] useful controller baseline query=${SUITE7_USEFUL_CONTROLLER_QUERY@Q}"
+  run_k6_controller \
+    "suite7_useful_baseline" \
+    "${useful_expected_mode}" \
+    "1" \
+    "${SUITE7_USEFUL_CONTROLLER_QUERY}" \
+    "${USEFUL_CONTROLLER_P99_BUDGET_MS}"
+fi
+
 if [[ "${SUITE7_SKIP_FAULTS}" == "1" ]]; then
   echo "[suite7] faults skipped (SUITE7_SKIP_FAULTS=1)"
 else
   echo "[suite7] fault: opa unavailable"
   retry_cmd docker_compose stop opa
   run_k6_controller "suite7_fault_opa_unavailable" "$(effective_expected_mode "${SUITE7_FAULT_OPA_UNAVAILABLE_EXPECT_TERMINAL_MODE}")" "0"
+  if [[ "${SUITE7_SKIP_USEFUL_SCENARIOS}" != "1" ]]; then
+    run_k6_controller \
+      "suite7_useful_fault_opa_unavailable" \
+      "$(effective_expected_mode "${SUITE7_FAULT_OPA_UNAVAILABLE_EXPECT_TERMINAL_MODE}")" \
+      "0" \
+      "${SUITE7_USEFUL_CONTROLLER_QUERY}"
+  fi
   retry_cmd docker_compose start opa
   wait_for_http "gateway" "http://127.0.0.1:8080/healthz"
 
@@ -499,6 +567,13 @@ else
   echo "[suite7] fault: postgres unavailable"
   retry_cmd docker_compose stop postgres
   run_k6_controller "suite7_fault_postgres_unavailable" "$(effective_expected_mode "${SUITE7_FAULT_POSTGRES_UNAVAILABLE_EXPECT_TERMINAL_MODE}")" "0"
+  if [[ "${SUITE7_SKIP_USEFUL_SCENARIOS}" != "1" ]]; then
+    run_k6_controller \
+      "suite7_useful_fault_postgres_unavailable" \
+      "$(effective_expected_mode "${SUITE7_FAULT_POSTGRES_UNAVAILABLE_EXPECT_TERMINAL_MODE}")" \
+      "0" \
+      "${SUITE7_USEFUL_CONTROLLER_QUERY}"
+  fi
   retry_cmd docker_compose start postgres
   wait_for_postgres
   ensure_safeview_fixtures

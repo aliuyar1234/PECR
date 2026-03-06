@@ -1,0 +1,45 @@
+{
+  "budget": {
+    "max_bytes": 2048,
+    "max_operator_calls": 10,
+    "max_parallelism": 1,
+    "max_recursion_depth": 3,
+    "max_wallclock_ms": 1000
+  },
+  "bytes_used": 0,
+  "claim_map": {
+    "claim_map_id": "claim-map-source-unavailable",
+    "claims": [
+      {
+        "claim_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "claim_text": "source unavailable",
+        "evidence_unit_ids": [],
+        "status": "UNKNOWN"
+      }
+    ],
+    "coverage_observed": 0.0,
+    "coverage_threshold": 0.95,
+    "terminal_mode": "SOURCE_UNAVAILABLE"
+  },
+  "depth_used": 1,
+  "evidence_ref_count": 0,
+  "evidence_unit_ids": [],
+  "loop_terminal_mode": "SOURCE_UNAVAILABLE",
+  "metadata": {
+    "bundle_hash": "9999999999999999999999999999999999999999999999999999999999999999",
+    "engine_mode": "rlm",
+    "principal_id_hash": "abababababababababababababababababababababababababababababababab",
+    "quality_score": 12.0,
+    "recorded_at_unix_ms": 1700000000004,
+    "request_id": "req-source-unavailable",
+    "run_id": "rlm-source-unavailable",
+    "schema_version": 1,
+    "terminal_mode": "SOURCE_UNAVAILABLE",
+    "trace_id": "01ARZ3NDEKTSV4RRFFQ69G5FAY"
+  },
+  "operator_calls_used": 0,
+  "policy_snapshot_id": "policy-rlm-su",
+  "query": "smoke source unavailable",
+  "response_text": "UNKNOWN: required sources were unavailable within budget.",
+  "session_id": "session-rlm-su"
+}

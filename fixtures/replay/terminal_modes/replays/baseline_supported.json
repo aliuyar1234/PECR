@@ -1,0 +1,49 @@
+{
+  "budget": {
+    "max_bytes": 2048,
+    "max_operator_calls": 10,
+    "max_parallelism": 1,
+    "max_recursion_depth": 3,
+    "max_wallclock_ms": 1000
+  },
+  "bytes_used": 128,
+  "claim_map": {
+    "claim_map_id": "claim-map-supported",
+    "claims": [
+      {
+        "claim_id": "2222222222222222222222222222222222222222222222222222222222222222",
+        "claim_text": "customer plan tier is starter",
+        "evidence_unit_ids": [
+          "3333333333333333333333333333333333333333333333333333333333333333"
+        ],
+        "status": "SUPPORTED"
+      }
+    ],
+    "coverage_observed": 1.0,
+    "coverage_threshold": 0.95,
+    "terminal_mode": "SUPPORTED"
+  },
+  "depth_used": 2,
+  "evidence_ref_count": 1,
+  "evidence_unit_ids": [
+    "3333333333333333333333333333333333333333333333333333333333333333"
+  ],
+  "loop_terminal_mode": "SUPPORTED",
+  "metadata": {
+    "bundle_hash": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+    "engine_mode": "baseline",
+    "principal_id_hash": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+    "quality_score": 92.0,
+    "recorded_at_unix_ms": 1700000000002,
+    "request_id": "req-supported",
+    "run_id": "baseline-supported",
+    "schema_version": 1,
+    "terminal_mode": "SUPPORTED",
+    "trace_id": "01ARZ3NDEKTSV4RRFFQ69G5FAW"
+  },
+  "operator_calls_used": 2,
+  "policy_snapshot_id": "policy-baseline-supported",
+  "query": "smoke supported",
+  "response_text": "SUPPORTED: customer plan tier is starter",
+  "session_id": "session-baseline-supported"
+}

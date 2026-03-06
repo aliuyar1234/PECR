@@ -1,0 +1,45 @@
+{
+  "budget": {
+    "max_bytes": 2048,
+    "max_operator_calls": 10,
+    "max_parallelism": 1,
+    "max_recursion_depth": 3,
+    "max_wallclock_ms": 1000
+  },
+  "bytes_used": 32,
+  "claim_map": {
+    "claim_map_id": "claim-map-insufficient-permission",
+    "claims": [
+      {
+        "claim_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "claim_text": "permission denied",
+        "evidence_unit_ids": [],
+        "status": "UNKNOWN"
+      }
+    ],
+    "coverage_observed": 0.0,
+    "coverage_threshold": 0.95,
+    "terminal_mode": "INSUFFICIENT_PERMISSION"
+  },
+  "depth_used": 1,
+  "evidence_ref_count": 0,
+  "evidence_unit_ids": [],
+  "loop_terminal_mode": "INSUFFICIENT_PERMISSION",
+  "metadata": {
+    "bundle_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "engine_mode": "rlm",
+    "principal_id_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "quality_score": 41.0,
+    "recorded_at_unix_ms": 1700000000003,
+    "request_id": "req-insufficient-permission",
+    "run_id": "rlm-insufficient-permission",
+    "schema_version": 1,
+    "terminal_mode": "INSUFFICIENT_PERMISSION",
+    "trace_id": "01ARZ3NDEKTSV4RRFFQ69G5FAX"
+  },
+  "operator_calls_used": 1,
+  "policy_snapshot_id": "policy-rlm-ip",
+  "query": "smoke insufficient permission",
+  "response_text": "UNKNOWN: insufficient permission to access required evidence.",
+  "session_id": "session-rlm-ip"
+}

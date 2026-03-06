@@ -1,0 +1,4 @@
+Support policy for the PECR demo environment.
+
+Support policy: the support team may inspect public documentation and approved safe-view records during business hours.
+Escalations are handled within one business day when evidence is available.

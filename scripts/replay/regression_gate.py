@@ -21,6 +21,12 @@ def main() -> int:
     parser.add_argument("--min-quality-score", type=float, default=0.0)
     parser.add_argument("--max-source-unavailable-rate", type=float, default=1.0)
     parser.add_argument(
+        "--require-terminal-mode",
+        action="append",
+        default=[],
+        help="Require at least one replay bundle for the given terminal mode. May be passed multiple times.",
+    )
+    parser.add_argument(
         "--allow-empty",
         action="store_true",
         help="Pass when there are no replay bundles (default for CI compatibility).",
@@ -36,6 +42,14 @@ def main() -> int:
         return 1
 
     failures: list[str] = []
+    observed_terminal_modes = {
+        str(bundle.get("metadata", {}).get("terminal_mode", "")).strip()
+        for bundle in bundles
+    }
+    for required_terminal_mode in args.require_terminal_mode:
+        if required_terminal_mode not in observed_terminal_modes:
+            failures.append(f"missing required terminal_mode fixture: {required_terminal_mode}")
+
     for bundle in bundles:
         metadata = bundle.get("metadata", {})
         run_id = metadata.get("run_id", "<unknown>")

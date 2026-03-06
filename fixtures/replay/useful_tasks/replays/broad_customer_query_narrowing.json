@@ -1,0 +1,45 @@
+{
+  "budget": {
+    "max_bytes": 4096,
+    "max_operator_calls": 10,
+    "max_parallelism": 1,
+    "max_recursion_depth": 3,
+    "max_wallclock_ms": 1000
+  },
+  "bytes_used": 144,
+  "claim_map": {
+    "claim_map_id": "claim-map-broad-customer-query",
+    "claims": [
+      {
+        "claim_id": "1010101010101010101010101010101010101010101010101010101010101010",
+        "claim_text": "the structured lookup is underspecified. Narrow it to a specific field or filter, for example: 'What is the customer status and plan tier?' Safe scopes for the current principal: customer rows in safe_customer_view_public. Try: 'What is the customer status and plan tier in safe_customer_view_public?' or 'Compare customer counts by plan tier in safe_customer_view_public.'",
+        "evidence_unit_ids": [],
+        "status": "UNKNOWN"
+      }
+    ],
+    "coverage_observed": 1.0,
+    "coverage_threshold": 0.95,
+    "terminal_mode": "INSUFFICIENT_EVIDENCE"
+  },
+  "depth_used": 1,
+  "evidence_ref_count": 0,
+  "evidence_unit_ids": [],
+  "loop_terminal_mode": "INSUFFICIENT_EVIDENCE",
+  "metadata": {
+    "bundle_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+    "engine_mode": "baseline",
+    "principal_id_hash": "1212121212121212121212121212121212121212121212121212121212121212",
+    "quality_score": 91.0,
+    "recorded_at_unix_ms": 1700000800000,
+    "request_id": "req-useful-broad-customer-query",
+    "run_id": "useful-broad-customer-query",
+    "schema_version": 1,
+    "terminal_mode": "INSUFFICIENT_EVIDENCE",
+    "trace_id": "01ARZ3NDEKTSV4RRFFQ69G5FAH"
+  },
+  "operator_calls_used": 1,
+  "policy_snapshot_id": "policy-useful-broad-customer-query",
+  "query": "customer",
+  "response_text": "UNKNOWN: the structured lookup is underspecified. Narrow it to a specific field or filter, for example: 'What is the customer status and plan tier?' Safe scopes for the current principal: customer rows in safe_customer_view_public. Try: 'What is the customer status and plan tier in safe_customer_view_public?' or 'Compare customer counts by plan tier in safe_customer_view_public.'",
+  "session_id": "session-useful-broad-customer-query"
+}

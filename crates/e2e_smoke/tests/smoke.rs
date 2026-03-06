@@ -20,11 +20,21 @@ use tokio::sync::oneshot;
 static TEST_COUNTER: AtomicUsize = AtomicUsize::new(0);
 
 fn test_db_url() -> Option<String> {
-    std::env::var("PECR_TEST_DB_URL")
+    let db_url = std::env::var("PECR_TEST_DB_URL")
         .ok()
         .or_else(|| std::env::var("DATABASE_URL").ok())
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
+        .filter(|s| !s.is_empty());
+
+    let require_db_url = std::env::var("PECR_E2E_REQUIRE_DB_URL")
+        .ok()
+        .is_some_and(|value| matches!(value.trim(), "1" | "true" | "TRUE" | "yes" | "YES"));
+
+    if require_db_url && db_url.is_none() {
+        panic!("PECR_TEST_DB_URL must be set when PECR_E2E_REQUIRE_DB_URL is enabled");
+    }
+
+    db_url
 }
 
 fn next_suffix() -> usize {
@@ -2525,6 +2535,57 @@ async fn observability_coverage_suite_required_signals_exist() {
         .get("trace_id")
         .and_then(|v| v.as_str())
         .expect("trace_id should exist");
+    assert_eq!(
+        body.get("terminal_mode").and_then(|v| v.as_str()),
+        Some("SUPPORTED"),
+        "controller run should produce SUPPORTED terminal_mode: {}",
+        body
+    );
+    assert!(
+        body.get("response_text")
+            .and_then(|v| v.as_str())
+            .is_some_and(|text| text.contains("SUPPORTED:")),
+        "response_text should include SUPPORTED claims: {}",
+        body
+    );
+    let claims = body
+        .get("claim_map")
+        .and_then(|v| v.get("claims"))
+        .and_then(|v| v.as_array())
+        .expect("claim_map.claims should exist");
+    assert!(
+        claims.iter().any(|claim| {
+            claim.get("status").and_then(|v| v.as_str()) == Some("SUPPORTED")
+                && claim
+                    .get("evidence_unit_ids")
+                    .and_then(|v| v.as_array())
+                    .is_some_and(|ids| !ids.is_empty())
+        }),
+        "claim_map should contain a supported claim with evidence: {}",
+        body
+    );
+
+    let replay_list = client
+        .get(format!("http://{}/v1/replays", controller_addr))
+        .header("x-pecr-principal-id", "dev")
+        .send()
+        .await
+        .expect("replay list request should succeed")
+        .json::<serde_json::Value>()
+        .await
+        .expect("replay list response should be JSON");
+    let replays = replay_list
+        .get("replays")
+        .and_then(|v| v.as_array())
+        .expect("replay list should include replays array");
+    assert!(
+        replays
+            .iter()
+            .any(|replay| replay.get("trace_id").and_then(|v| v.as_str()) == Some(trace_id)),
+        "replay metadata should contain the completed run trace_id {}; replays:\n{}",
+        trace_id,
+        replay_list
+    );
 
     let gateway_metrics = client
         .get(format!("http://{}/metrics", gateway_addr))
@@ -3132,6 +3193,467 @@ async fn failure_mode_suite_source_unavailable_and_timeout() {
     schema_pool.close().await;
 }
 
+struct RealStack {
+    schema_pool: PgPool,
+    schema_name: String,
+    fs_corpus_root: PathBuf,
+    replay_store_dir: PathBuf,
+    gateway_addr: SocketAddr,
+    gateway_shutdown: Option<oneshot::Sender<()>>,
+    gateway_task: Option<tokio::task::JoinHandle<()>>,
+    controller_addr: SocketAddr,
+    controller_shutdown: Option<oneshot::Sender<()>>,
+    controller_task: Option<tokio::task::JoinHandle<()>>,
+    opa_shutdown: Option<oneshot::Sender<()>>,
+    opa_task: Option<tokio::task::JoinHandle<()>>,
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn useful_real_stack_suite_exercises_named_queries() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping useful real-stack suite; set PECR_TEST_DB_URL to enable");
+        return;
+    };
+
+    let request_prefix = format!("req_useful_suite_{}_{}", std::process::id(), next_suffix());
+    let stack = spawn_real_stack(&db_url, None).await;
+    let client = reqwest::Client::new();
+
+    let scenarios = [
+        (
+            "customer-status",
+            "What is the customer status and plan tier?",
+            vec!["status=active", "plan_tier=free"],
+        ),
+        (
+            "support-policy-source",
+            "Show the source text and evidence for the support policy",
+            vec!["Support policy", "approved safe-view records"],
+        ),
+        (
+            "annual-refund-source",
+            "Show the source text for annual refund terms",
+            vec!["Annual refund terms", "30 days"],
+        ),
+        (
+            "billing-terms-policy",
+            "Show evidence for the billing terms policy",
+            vec!["Billing terms policy", "15 days"],
+        ),
+        (
+            "customer-counts-by-plan",
+            "Compare customer counts by plan tier",
+            vec![
+                "plan_tier=enterprise",
+                "plan_tier=free",
+                "count(customer_id)=1",
+            ],
+        ),
+        (
+            "monthly-customer-trend",
+            "Show monthly customer trend over time",
+            vec!["time_bucket=2026-01", "time_bucket=2026-02"],
+        ),
+    ];
+
+    let mut trace_ids = Vec::new();
+    for (scenario_id, query, expected_fragments) in scenarios {
+        let request_id = format!("{request_prefix}_{scenario_id}");
+        let body =
+            controller_run_query_ok(&client, stack.controller_addr, "dev", &request_id, query)
+                .await;
+        assert_eq!(
+            body.get("terminal_mode").and_then(|value| value.as_str()),
+            Some("SUPPORTED"),
+            "scenario {} should be supported: {}",
+            scenario_id,
+            body
+        );
+
+        let rendered = serde_json::to_string(&body).expect("response JSON should serialize");
+        for fragment in expected_fragments {
+            assert!(
+                rendered.contains(fragment),
+                "scenario {} missing fragment {:?}: {}",
+                scenario_id,
+                fragment,
+                body
+            );
+        }
+
+        let claims = body
+            .pointer("/claim_map/claims")
+            .and_then(|value| value.as_array())
+            .expect("claim_map.claims should exist");
+        assert!(
+            claims.iter().any(|claim| {
+                claim.get("status").and_then(|value| value.as_str()) == Some("SUPPORTED")
+                    && claim
+                        .get("evidence_unit_ids")
+                        .and_then(|value| value.as_array())
+                        .is_some_and(|ids| !ids.is_empty())
+                    && claim
+                        .get("evidence_snippets")
+                        .and_then(|value| value.as_array())
+                        .is_some_and(|snippets| !snippets.is_empty())
+            }),
+            "scenario {} should include supported claims with evidence snippets: {}",
+            scenario_id,
+            body
+        );
+
+        trace_ids.push(
+            body.get("trace_id")
+                .and_then(|value| value.as_str())
+                .expect("trace_id should exist")
+                .to_string(),
+        );
+    }
+
+    let replay_list = client
+        .get(format!("http://{}/v1/replays", stack.controller_addr))
+        .header("x-pecr-principal-id", "dev")
+        .send()
+        .await
+        .expect("replay list request should succeed");
+    assert!(replay_list.status().is_success());
+    let replay_list_body = replay_list
+        .json::<serde_json::Value>()
+        .await
+        .expect("replay list response should be JSON");
+    let replays = replay_list_body
+        .get("replays")
+        .and_then(|value| value.as_array())
+        .expect("replay list should contain replays");
+    for trace_id in &trace_ids {
+        assert!(
+            replays.iter().any(
+                |replay| replay.get("trace_id").and_then(|value| value.as_str())
+                    == Some(trace_id.as_str())
+            ),
+            "replay list should contain trace_id {}: {}",
+            trace_id,
+            replay_list_body
+        );
+    }
+
+    let evaluation = client
+        .post(format!("http://{}/v1/evaluations", stack.controller_addr))
+        .header("x-pecr-principal-id", "dev")
+        .json(&serde_json::json!({
+            "evaluation_name": "useful-real-stack-suite",
+            "min_quality_score": 80.0,
+            "max_source_unavailable_rate": 0.0
+        }))
+        .send()
+        .await
+        .expect("evaluation request should succeed");
+    assert!(evaluation.status().is_success());
+    let evaluation_body = evaluation
+        .json::<serde_json::Value>()
+        .await
+        .expect("evaluation response should be JSON");
+    assert_eq!(
+        evaluation_body
+            .get("overall_pass")
+            .and_then(|value| value.as_bool()),
+        Some(true),
+        "useful real-stack evaluation should pass: {}",
+        evaluation_body
+    );
+    assert!(
+        evaluation_body
+            .pointer("/scorecards/0/average_citation_quality")
+            .and_then(|value| value.as_f64())
+            .is_some_and(|value| value >= 0.9),
+        "useful real-stack evaluation should report strong citation quality: {}",
+        evaluation_body
+    );
+
+    shutdown_real_stack(stack).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn useful_beam_planner_real_stack_falls_back_cleanly_when_planner_is_unavailable() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping beam planner real-stack suite; set PECR_TEST_DB_URL to enable");
+        return;
+    };
+
+    let stack = spawn_real_stack_with_controller_overrides(
+        &db_url,
+        None,
+        HashMap::from([
+            (
+                "PECR_CONTROLLER_ENGINE".to_string(),
+                "beam_planner".to_string(),
+            ),
+            (
+                "PECR_CONTROLLER_PLANNER_CLIENT".to_string(),
+                "beam".to_string(),
+            ),
+            (
+                "PECR_CONTROLLER_PLANNER_URL".to_string(),
+                "http://127.0.0.1:9/plan".to_string(),
+            ),
+        ]),
+    )
+    .await;
+    let client = reqwest::Client::new();
+
+    let body = controller_run_query_ok(
+        &client,
+        stack.controller_addr,
+        "dev",
+        &format!("req_beam_planner_unavailable_{}", next_suffix()),
+        "What is the customer status and plan tier?",
+    )
+    .await;
+    assert_eq!(
+        body.get("terminal_mode").and_then(|value| value.as_str()),
+        Some("SUPPORTED"),
+        "beam planner unavailability should still produce a supported answer: {}",
+        body
+    );
+
+    let evaluation = client
+        .post(format!("http://{}/v1/evaluations", stack.controller_addr))
+        .header("x-pecr-principal-id", "dev")
+        .json(&serde_json::json!({
+            "evaluation_name": "beam-planner-fallback-suite",
+            "engine_mode": "beam_planner",
+            "min_quality_score": 80.0,
+            "max_source_unavailable_rate": 0.0
+        }))
+        .send()
+        .await
+        .expect("evaluation request should succeed");
+    assert!(evaluation.status().is_success());
+    let evaluation_body = evaluation
+        .json::<serde_json::Value>()
+        .await
+        .expect("evaluation response should be JSON");
+    assert_eq!(
+        evaluation_body
+            .pointer("/scorecards/0/engine_mode")
+            .and_then(|value| value.as_str()),
+        Some("beam_planner"),
+        "evaluation should expose beam_planner scorecards: {}",
+        evaluation_body
+    );
+
+    let replay_dir = stack.replay_store_dir.join("replays");
+    let replay_path = std::fs::read_dir(&replay_dir)
+        .expect("replay directory should exist")
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        .expect("replay bundle should be persisted");
+    let replay_bundle = serde_json::from_str::<serde_json::Value>(
+        &std::fs::read_to_string(&replay_path).expect("replay bundle should be readable"),
+    )
+    .expect("replay bundle should parse");
+
+    assert_eq!(
+        replay_bundle
+            .pointer("/metadata/engine_mode")
+            .and_then(|value| value.as_str()),
+        Some("beam_planner"),
+        "replay metadata should preserve beam_planner engine mode: {}",
+        replay_bundle
+    );
+    assert!(
+        replay_bundle
+            .pointer("/planner_traces")
+            .and_then(|value| value.as_array())
+            .is_some_and(|traces| traces.iter().any(|trace| {
+                trace
+                    .pointer("/decision_summary/planner_source")
+                    .and_then(|value| value.as_str())
+                    == Some("beam_planner")
+                    && trace
+                        .pointer("/decision_summary/selected_for_execution")
+                        .and_then(|value| value.as_bool())
+                        == Some(false)
+                    && trace
+                        .pointer("/decision_summary/stop_reason")
+                        .and_then(|value| value.as_str())
+                        .is_some_and(|value| value.starts_with("ERR_PLANNER_CLIENT_"))
+            })),
+        "replay traces should show the beam planner fallback reason: {}",
+        replay_bundle
+    );
+    assert!(
+        replay_bundle
+            .pointer("/planner_traces")
+            .and_then(|value| value.as_array())
+            .is_some_and(|traces| traces.iter().any(|trace| {
+                trace
+                    .pointer("/decision_summary/planner_source")
+                    .and_then(|value| value.as_str())
+                    == Some("rust_owned")
+                    && trace
+                        .pointer("/decision_summary/selected_for_execution")
+                        .and_then(|value| value.as_bool())
+                        == Some(true)
+            })),
+        "replay traces should show the rust-owned fallback execution path: {}",
+        replay_bundle
+    );
+
+    shutdown_real_stack(stack).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn useful_fault_injection_suite_degrades_cleanly() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping useful fault suite; set PECR_TEST_DB_URL to enable");
+        return;
+    };
+
+    let client = reqwest::Client::new();
+    let useful_query = "What is the customer status and plan tier?";
+
+    let mut opa_stack = spawn_real_stack(&db_url, None).await;
+    let baseline = controller_run_query_ok(
+        &client,
+        opa_stack.controller_addr,
+        "dev",
+        &format!("req_fault_opa_baseline_{}", next_suffix()),
+        useful_query,
+    )
+    .await;
+    assert_eq!(
+        baseline
+            .get("terminal_mode")
+            .and_then(|value| value.as_str()),
+        Some("SUPPORTED")
+    );
+
+    stop_stack_opa(&mut opa_stack).await;
+    wait_for_http_status(
+        &client,
+        format!("http://{}/readyz", opa_stack.gateway_addr).as_str(),
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
+    wait_for_http_status(
+        &client,
+        format!("http://{}/readyz", opa_stack.controller_addr).as_str(),
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
+
+    let opa_fault = controller_run_query(
+        &client,
+        opa_stack.controller_addr,
+        "dev",
+        &format!("req_fault_opa_{}", next_suffix()),
+        useful_query,
+    )
+    .await;
+    assert!(matches!(
+        opa_fault.status(),
+        StatusCode::SERVICE_UNAVAILABLE | StatusCode::GATEWAY_TIMEOUT
+    ));
+    let opa_fault_body = opa_fault
+        .json::<serde_json::Value>()
+        .await
+        .expect("opa fault response should be JSON");
+    assert_eq!(
+        opa_fault_body
+            .get("terminal_mode_hint")
+            .and_then(|value| value.as_str()),
+        Some("SOURCE_UNAVAILABLE"),
+        "opa fault should degrade to source unavailable: {}",
+        opa_fault_body
+    );
+    shutdown_real_stack(opa_stack).await;
+
+    let source_stack = spawn_real_stack(&db_url, None).await;
+    drop_test_schema(&source_stack.schema_pool, &source_stack.schema_name).await;
+
+    let source_fault = controller_run_query(
+        &client,
+        source_stack.controller_addr,
+        "dev",
+        &format!("req_fault_source_{}", next_suffix()),
+        useful_query,
+    )
+    .await;
+    assert_eq!(source_fault.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let source_fault_body = source_fault
+        .json::<serde_json::Value>()
+        .await
+        .expect("source fault response should be JSON");
+    assert_eq!(
+        source_fault_body
+            .get("terminal_mode_hint")
+            .and_then(|value| value.as_str()),
+        Some("SOURCE_UNAVAILABLE"),
+        "source fault should degrade to source unavailable: {}",
+        source_fault_body
+    );
+    shutdown_real_stack(source_stack).await;
+
+    let replay_store_dir = std::env::temp_dir().join(format!(
+        "pecr_replay_fault_store_{}_{}",
+        std::process::id(),
+        next_suffix()
+    ));
+    let replay_stack = spawn_real_stack(&db_url, Some(replay_store_dir)).await;
+    break_replay_store(&replay_stack.replay_store_dir);
+
+    wait_for_http_status(
+        &client,
+        format!("http://{}/readyz", replay_stack.controller_addr).as_str(),
+        StatusCode::SERVICE_UNAVAILABLE,
+    )
+    .await;
+
+    let replay_fault = controller_run_query_ok(
+        &client,
+        replay_stack.controller_addr,
+        "dev",
+        &format!("req_fault_replay_{}", next_suffix()),
+        useful_query,
+    )
+    .await;
+    assert_eq!(
+        replay_fault
+            .get("terminal_mode")
+            .and_then(|value| value.as_str()),
+        Some("SUPPORTED"),
+        "replay-store fault should not corrupt the answer itself: {}",
+        replay_fault
+    );
+
+    let replay_list = client
+        .get(format!(
+            "http://{}/v1/replays",
+            replay_stack.controller_addr
+        ))
+        .header("x-pecr-principal-id", "dev")
+        .send()
+        .await
+        .expect("replay list request should return a response");
+    assert_eq!(replay_list.status(), StatusCode::SERVICE_UNAVAILABLE);
+    let replay_list_body = replay_list
+        .json::<serde_json::Value>()
+        .await
+        .expect("replay fault response should be JSON");
+    assert_eq!(
+        replay_list_body
+            .get("code")
+            .and_then(|value| value.as_str()),
+        Some("ERR_REPLAY_STORE"),
+        "replay store fault should surface via replay APIs: {}",
+        replay_list_body
+    );
+
+    shutdown_real_stack(replay_stack).await;
+}
+
 async fn apply_pg_fixtures(db_url: &str, sql: &str) {
     let pool = PgPool::connect(db_url)
         .await
@@ -3251,6 +3773,150 @@ async fn gateway_create_session_at(
     (session_id, session_token, trace_id, policy_snapshot_id)
 }
 
+async fn spawn_real_stack(base_db_url: &str, replay_store_dir: Option<PathBuf>) -> RealStack {
+    spawn_real_stack_with_controller_overrides(base_db_url, replay_store_dir, HashMap::new()).await
+}
+
+async fn spawn_real_stack_with_controller_overrides(
+    base_db_url: &str,
+    replay_store_dir: Option<PathBuf>,
+    controller_overrides: HashMap<String, String>,
+) -> RealStack {
+    let fs_corpus_root = prepare_temp_fs_corpus();
+    let fs_corpus_path = fs_corpus_root.to_string_lossy().to_string();
+
+    let pg_fixtures_sql = std::fs::read_to_string(
+        workspace_root()
+            .join("db")
+            .join("init")
+            .join("002_safeview_fixtures.sql"),
+    )
+    .expect("postgres fixture SQL should be readable");
+
+    let (schema_pool, schema_name, schema_url) = create_test_schema(base_db_url).await;
+    apply_pg_fixtures(&schema_url, &pg_fixtures_sql).await;
+
+    let replay_store_dir = replay_store_dir.unwrap_or_else(|| {
+        std::env::temp_dir().join(format!(
+            "pecr_e2e_replays_{}_{}",
+            std::process::id(),
+            next_suffix()
+        ))
+    });
+
+    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
+
+    let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
+        ("PECR_BIND_ADDR".to_string(), "127.0.0.1:0".to_string()),
+        ("PECR_DB_URL".to_string(), schema_url.clone()),
+        ("PECR_OPA_URL".to_string(), format!("http://{}", opa_addr)),
+        (
+            "PECR_POLICY_BUNDLE_HASH".to_string(),
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
+        ),
+        ("PECR_FS_CORPUS_PATH".to_string(), fs_corpus_path.clone()),
+        (
+            "PECR_AS_OF_TIME_DEFAULT".to_string(),
+            "1970-01-01T00:00:00Z".to_string(),
+        ),
+    ]))
+    .expect("gateway config should be valid");
+
+    let (gateway_addr, gateway_shutdown, gateway_task) = spawn_server(
+        pecr_gateway::http::router(gateway_config)
+            .await
+            .expect("gateway router should init"),
+    )
+    .await;
+
+    let mut controller_env = HashMap::from([
+        (
+            "PECR_CONTROLLER_BIND_ADDR".to_string(),
+            "127.0.0.1:0".to_string(),
+        ),
+        (
+            "PECR_GATEWAY_URL".to_string(),
+            format!("http://{}", gateway_addr),
+        ),
+        ("PECR_MODEL_PROVIDER".to_string(), "mock".to_string()),
+        (
+            "PECR_BUDGET_DEFAULTS".to_string(),
+            r#"{"max_operator_calls":10,"max_bytes":1048576,"max_wallclock_ms":10000,"max_recursion_depth":5,"max_parallelism":4}"#
+                .to_string(),
+        ),
+        (
+            "PECR_REPLAY_STORE_DIR".to_string(),
+            replay_store_dir.to_string_lossy().to_string(),
+        ),
+    ]);
+    controller_env.extend(controller_overrides);
+    let controller_config = pecr_controller::config::ControllerConfig::from_kv(&controller_env)
+        .expect("controller config should be valid");
+
+    let (controller_addr, controller_shutdown, controller_task) = spawn_server(
+        pecr_controller::http::router(controller_config)
+            .await
+            .expect("controller router should init"),
+    )
+    .await;
+
+    let client = reqwest::Client::new();
+    wait_for_healthz(&client, gateway_addr).await;
+    wait_for_healthz(&client, controller_addr).await;
+
+    RealStack {
+        schema_pool,
+        schema_name,
+        fs_corpus_root,
+        replay_store_dir,
+        gateway_addr,
+        gateway_shutdown: Some(gateway_shutdown),
+        gateway_task: Some(gateway_task),
+        controller_addr,
+        controller_shutdown: Some(controller_shutdown),
+        controller_task: Some(controller_task),
+        opa_shutdown: Some(opa_shutdown),
+        opa_task: Some(opa_task),
+    }
+}
+
+async fn shutdown_real_stack(mut stack: RealStack) {
+    if let Some(shutdown) = stack.controller_shutdown.take() {
+        let _ = shutdown.send(());
+    }
+    if let Some(shutdown) = stack.gateway_shutdown.take() {
+        let _ = shutdown.send(());
+    }
+    if let Some(shutdown) = stack.opa_shutdown.take() {
+        let _ = shutdown.send(());
+    }
+
+    if let Some(task) = stack.controller_task.take() {
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+    if let Some(task) = stack.gateway_task.take() {
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+    if let Some(task) = stack.opa_task.take() {
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+
+    remove_test_path(&stack.fs_corpus_root);
+    remove_test_path(&stack.replay_store_dir);
+    drop_test_schema(&stack.schema_pool, &stack.schema_name).await;
+    stack.schema_pool.close().await;
+}
+
+async fn stop_stack_opa(stack: &mut RealStack) {
+    if let Some(shutdown) = stack.opa_shutdown.take() {
+        let _ = shutdown.send(());
+    }
+    if let Some(task) = stack.opa_task.take() {
+        let _ = tokio::time::timeout(Duration::from_secs(3), task).await;
+    }
+}
+
 async fn spawn_server(
     app: Router,
 ) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
@@ -3284,6 +3950,76 @@ async fn wait_for_healthz(client: &reqwest::Client, addr: SocketAddr) {
     }
 
     panic!("server did not become ready at {}", url);
+}
+
+async fn wait_for_http_status(client: &reqwest::Client, url: &str, expected: StatusCode) {
+    for _ in 0..50 {
+        if let Ok(response) = client.get(url).send().await
+            && response.status() == expected
+        {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!("server did not reach status {} at {}", expected, url);
+}
+
+async fn controller_run_query(
+    client: &reqwest::Client,
+    controller_addr: SocketAddr,
+    principal_id: &str,
+    request_id: &str,
+    query: &str,
+) -> reqwest::Response {
+    client
+        .post(format!("http://{}/v1/run", controller_addr))
+        .header("x-pecr-principal-id", principal_id)
+        .header("x-pecr-request-id", request_id)
+        .json(&serde_json::json!({ "query": query }))
+        .send()
+        .await
+        .expect("controller run request should return a response")
+}
+
+async fn controller_run_query_ok(
+    client: &reqwest::Client,
+    controller_addr: SocketAddr,
+    principal_id: &str,
+    request_id: &str,
+    query: &str,
+) -> serde_json::Value {
+    let response =
+        controller_run_query(client, controller_addr, principal_id, request_id, query).await;
+    let status = response.status();
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .expect("controller run response should be JSON");
+    assert!(
+        status.is_success(),
+        "expected /v1/run success for query {:?}, got {} with body {}",
+        query,
+        status,
+        body
+    );
+    body
+}
+
+fn break_replay_store(root: &Path) {
+    remove_test_path(root);
+    if let Some(parent) = root.parent() {
+        std::fs::create_dir_all(parent).expect("replay store parent should exist");
+    }
+    std::fs::write(root, b"blocked").expect("replay store fault file should be writable");
+}
+
+fn remove_test_path(path: &Path) {
+    if path.is_dir() {
+        let _ = std::fs::remove_dir_all(path);
+    } else if path.exists() {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 fn prepare_temp_fs_corpus() -> PathBuf {

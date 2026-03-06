@@ -1,0 +1,4 @@
+Billing terms policy for the PECR demo environment.
+
+Billing terms policy: invoices are due within 15 days of issue.
+Late fees are not applied during the trial window.

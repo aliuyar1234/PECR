@@ -15,6 +15,8 @@
       "$ref": "TerminalMode.v1.schema.json"
     },
     "retryable": { "type": "boolean" },
+    "what_failed": { "type": "string", "minLength": 1 },
+    "safe_alternative": { "type": "string", "minLength": 1 },
     "detail": {
       "oneOf": [
         { "type": "object" },

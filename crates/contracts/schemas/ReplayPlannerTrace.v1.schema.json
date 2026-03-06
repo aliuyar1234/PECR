@@ -1,0 +1,14 @@
+{
+  "$id": "pecr.schemas.ReplayPlannerTrace.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["plan_request", "decision_summary"],
+  "properties": {
+    "plan_request": { "$ref": "pecr.schemas.PlanRequest.v1" },
+    "output_steps": {
+      "type": "array",
+      "items": { "$ref": "pecr.schemas.PlannerStep.v1" }
+    },
+    "decision_summary": { "$ref": "pecr.schemas.ReplayPlannerDecisionSummary.v1" }
+  }
+}

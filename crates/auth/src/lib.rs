@@ -175,20 +175,9 @@ impl OidcAuthenticator {
             }
         }
 
-        let refresh_needed = {
-            let cache = self.jwks.read().await;
-            cache
-                .fetched_at
-                .map(|t| t.elapsed() > self.config.jwks_refresh_ttl)
-                .unwrap_or(true)
-        };
-
-        if refresh_needed {
-            let jwks = JwksCache::fetch_jwks(&self.http, &self.config).await?;
-            let mut cache = self.jwks.write().await;
-            cache.jwks = Some(jwks);
-            cache.fetched_at = Some(Instant::now());
-        }
+        // A cache miss should force one refresh so rotated signing keys become usable
+        // immediately instead of waiting for the refresh TTL to expire.
+        self.refresh_jwks().await?;
 
         {
             let cache = self.jwks.read().await;
@@ -201,6 +190,14 @@ impl OidcAuthenticator {
             code: "ERR_AUTH_INVALID",
             message: "JWT kid not found in JWKS".to_string(),
         })
+    }
+
+    async fn refresh_jwks(&self) -> Result<(), AuthError> {
+        let jwks = JwksCache::fetch_jwks(&self.http, &self.config).await?;
+        let mut cache = self.jwks.write().await;
+        cache.jwks = Some(jwks);
+        cache.fetched_at = Some(Instant::now());
+        Ok(())
     }
 }
 
@@ -363,6 +360,7 @@ fn attrs_hash(claims: &Value, abac_claims: &[String]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use jsonwebtoken::{Algorithm, EncodingKey, Header, encode};
 
     #[test]
     fn bearer_token_rejects_missing_header() {
@@ -431,5 +429,80 @@ mod tests {
         );
 
         assert_eq!(hash_a, hash_b);
+    }
+
+    #[tokio::test]
+    async fn authenticate_refreshes_jwks_immediately_for_unknown_kid() {
+        let private_key_pem = include_bytes!("../tests/fixtures/test_rsa_private.pem");
+        let initial_jwks = include_str!("../tests/fixtures/test_jwks.json");
+        let rotated_jwks = initial_jwks.replace("\"test-kid\"", "\"rotated-kid\"");
+
+        let mut auth = OidcAuthenticator::new(OidcConfig {
+            issuer: "https://issuer.example".to_string(),
+            audience: Some("pecr".to_string()),
+            jwks_url: None,
+            jwks_json: Some(initial_jwks.to_string()),
+            jwks_timeout: Duration::from_millis(2000),
+            jwks_refresh_ttl: Duration::from_secs(300),
+            clock_skew: Duration::from_secs(0),
+            principal_id_claim: "sub".to_string(),
+            tenant_claim: Some("tenant_id".to_string()),
+            tenant_id_static: None,
+            roles_claim: Some("groups".to_string()),
+            abac_claims: vec!["dept".to_string()],
+        })
+        .await
+        .expect("auth init should succeed");
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", encode_test_token(private_key_pem, "test-kid"))
+                .parse()
+                .expect("authorization header must parse"),
+        );
+        auth.authenticate(&headers)
+            .await
+            .expect("initial token should authenticate");
+
+        auth.config.jwks_json = Some(rotated_jwks);
+        headers.insert(
+            header::AUTHORIZATION,
+            format!(
+                "Bearer {}",
+                encode_test_token(private_key_pem, "rotated-kid")
+            )
+            .parse()
+            .expect("authorization header must parse"),
+        );
+
+        let principal = auth
+            .authenticate(&headers)
+            .await
+            .expect("unknown kid should trigger an immediate JWKS refresh");
+        assert_eq!(principal.principal_id, "dev");
+    }
+
+    fn encode_test_token(private_key_pem: &[u8], kid: &str) -> String {
+        let mut header = Header::new(Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+
+        let claims = serde_json::json!({
+            "iss": "https://issuer.example",
+            "sub": "dev",
+            "aud": "pecr",
+            "exp": 2000000000,
+            "iat": 1000000000,
+            "tenant_id": "local",
+            "groups": ["support", "dev"],
+            "dept": "eng"
+        });
+
+        encode(
+            &header,
+            &claims,
+            &EncodingKey::from_rsa_pem(private_key_pem).expect("private key must parse"),
+        )
+        .expect("token encode should succeed")
     }
 }

@@ -1,0 +1,14 @@
+{
+  "$id": "pecr.schemas.PlannerIntent.v1",
+  "type": "string",
+  "enum": [
+    "default",
+    "structured_lookup",
+    "structured_aggregation",
+    "evidence_lookup",
+    "version_review",
+    "structured_evidence_lookup",
+    "structured_aggregation_evidence",
+    "structured_version_review"
+  ]
+}

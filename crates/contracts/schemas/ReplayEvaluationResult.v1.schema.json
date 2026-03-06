@@ -33,6 +33,10 @@
       "type": "array",
       "items": { "$ref": "pecr.schemas.RunQualityScorecard.v1" }
     },
+    "engine_comparisons": {
+      "type": "array",
+      "items": { "$ref": "pecr.schemas.EngineComparisonSummary.v1" }
+    },
     "overall_pass": { "type": "boolean" }
   }
 }

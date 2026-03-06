@@ -1,0 +1,10 @@
+{
+  "$id": "pecr.schemas.PlannerSearchRefFetchSpanStep.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "max_refs"],
+  "properties": {
+    "kind": { "type": "string", "enum": ["search_ref_fetch_span"] },
+    "max_refs": { "type": "integer", "minimum": 1 }
+  }
+}

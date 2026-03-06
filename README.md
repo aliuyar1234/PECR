@@ -101,6 +101,7 @@ Gateway:
 - `GET /readyz`
 - `GET /metrics`
 - `POST /v1/sessions`
+- `GET /v1/policies/capabilities`
 - `POST /v1/policies/simulate`
 - `POST /v1/operators/{op_name}`
 - `POST /v1/finalize`
@@ -109,6 +110,7 @@ Controller:
 - `GET /healthz`
 - `GET /readyz`
 - `GET /metrics`
+- `GET /v1/capabilities`
 - `POST /v1/run`
 - `GET /v1/replays`
 - `GET /v1/replays/{run_id}`
@@ -129,18 +131,17 @@ Controller:
 Bash:
 
 ```bash
-export PECR_LOCAL_AUTH_SHARED_SECRET='pecr-dev-local-secret'
 docker compose up -d --build
 ```
 
 PowerShell:
 
 ```powershell
-$env:PECR_LOCAL_AUTH_SHARED_SECRET='pecr-dev-local-secret'
 docker compose up -d --build
 ```
 
 Postgres is exposed on `127.0.0.1:${PECR_POSTGRES_PORT:-55432}` by default.
+The local compose path also defaults `PECR_LOCAL_AUTH_SHARED_SECRET` to `pecr-local-demo-secret`, so the demo commands below work without extra tuning.
 
 ### 2) Verify health endpoints
 
@@ -149,21 +150,40 @@ curl -fsS http://127.0.0.1:8080/healthz
 curl -fsS http://127.0.0.1:8081/healthz
 ```
 
-### 3) Run a smoke request
+### 3) Run a useful live scenario
+
+```bash
+curl -sS http://127.0.0.1:8081/v1/capabilities \
+  -H 'x-pecr-principal-id: dev' \
+  -H 'x-pecr-local-auth-secret: pecr-local-demo-secret'
+
+python -B scripts/demo/useful_workflows.py tour
+python -B scripts/demo/useful_workflows.py live-tour
+python -B scripts/demo/useful_workflows.py live-scenario customer-status
+python -B scripts/demo/useful_workflows.py live-smoke
+```
+
+`tour` gives a fast fixture-backed product walkthrough. `live-tour` waits for the local controller, fetches the safe-ask catalog, then runs a curated set of grounded product scenarios so new contributors can see structured lookup, source citation, aggregate comparison, partial answers, and narrowing guidance in one pass.
+
+### 4) Run a raw smoke request
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8081/v1/run \
   -H 'content-type: application/json' \
   -H 'x-pecr-principal-id: dev' \
-  -H "x-pecr-local-auth-secret: ${PECR_LOCAL_AUTH_SHARED_SECRET}" \
+  -H 'x-pecr-local-auth-secret: pecr-local-demo-secret' \
   -H 'x-pecr-request-id: demo' \
-  -d '{"query":"smoke"}'
+  -d '{"query":"What is the customer status and plan tier?"}'
 ```
 
-### 4) Run local quality + perf smoke
+The capability catalog gives callers a low-friction way to discover safe structured lookups, comparisons, evidence asks, and version-review prompts before they send a full `/v1/run` request.
+
+### 5) Run local quality, e2e, and perf smoke
 
 ```bash
-PECR_TEST_DB_URL=postgres://pecr:pecr@localhost:55432/pecr bash scripts/ci.sh
+bash scripts/verify.sh
+pwsh -File scripts/verify.ps1
+PECR_TEST_DB_URL=postgres://pecr:pecr@localhost:55432/pecr cargo test -p e2e_smoke -- --nocapture
 SUITE7_SKIP_FAULTS=1 bash scripts/perf/suite7.sh
 ```
 
@@ -209,6 +229,38 @@ python3 scripts/replay/replay_eval_cli.py --store target/replay replay --run-id 
 python3 scripts/replay/replay_eval_cli.py --store target/replay scorecards
 python3 scripts/replay/regression_gate.py --store target/replay --allow-empty
 ```
+
+## Useful Demo Workflows
+
+If you want to see PECR’s user-value paths without booting the full stack first, use the named usefulness corpus in `fixtures/replay/useful_tasks/`.
+
+```bash
+python3 scripts/demo/useful_workflows.py catalog
+python3 scripts/demo/useful_workflows.py tour
+python3 scripts/demo/useful_workflows.py scenario customer-status
+python3 scripts/demo/useful_workflows.py scenario customer-counts-by-plan
+python3 scripts/demo/useful_workflows.py benchmark
+python3 scripts/demo/useful_workflows.py live-tour
+python3 scripts/demo/useful_workflows.py live-scenario customer-status
+python3 scripts/demo/useful_workflows.py live-smoke
+```
+
+`tour` is the quickest guided product summary without booting services. `live-tour` is the best under-five-minute contributor demo once `docker compose up -d --build` is running, because it uses `/v1/capabilities` and a curated set of live asks instead of isolated spot checks.
+
+These workflows cover structured lookup, source-backed evidence lookup, version review, compare, trend, partial-answer, and narrowing-guidance jobs. For the benchmark catalog and validation details, see `docs/useful_benchmark.md`.
+
+The `live-*` commands assume the default local compose secret `pecr-local-demo-secret` unless `PECR_LOCAL_AUTH_SHARED_SECRET` overrides it. To exercise the same named scenarios against the real stack, set `PECR_TEST_DB_URL` and run `scripts/run_useful_e2e.sh`.
+
+## Client Integration Semantics
+
+PECR returns `response_text` as the main user-facing answer, then uses `response_kind` and claim metadata to tell clients how to present edge cases cleanly:
+
+- No `response_kind`: treat the response as a normal grounded answer.
+- `partial_answer`: show the grounded portion normally and surface `claim_map.notes` as the unresolved-details callout.
+- `ambiguous`: render `claim_map.clarification_prompt.question` and its `options` as the next-step UX.
+- `blocked` or `source_down`: show the error `message`, then present `what_failed` and `safe_alternative` as the safe recovery path.
+
+For concrete payload examples, see `docs/client_integration.md` and the `/v1/run` examples in `docs/openapi/pecr.v1.yaml`.
 
 ## RLM Engine (Optional, Experimental)
 
@@ -302,8 +354,10 @@ Operational runbook: `RUNBOOK.md`
 ```bash
 cargo fmt --all
 cargo clippy --workspace --all-targets -- -D warnings
-cargo test --workspace
-bash scripts/ci.sh
+cargo test --workspace --exclude e2e_smoke
+PECR_TEST_DB_URL=postgres://pecr:pecr@localhost:55432/pecr cargo test -p e2e_smoke
+bash scripts/verify.sh
+pwsh -File scripts/verify.ps1
 ```
 
 ## Docs Index
@@ -311,13 +365,18 @@ bash scripts/ci.sh
 - Architecture:
   - `docs/architecture/controller_state_machine.md`
   - `docs/architecture/request_path_blocking_audit.md`
+  - `docs/architecture/invariants.md`
 - Runbook:
   - `RUNBOOK.md`
+  - `docs/observability/baselines.md`
 - Replay/Eval:
   - `scripts/replay/replay_eval_cli.py`
   - `scripts/replay/regression_gate.py`
   - `docs/standards/REPLAY_PERSISTENCE_MODEL.md`
   - `docs/standards/EVALUATION_DATA_LIFECYCLE.md`
+- Client integration:
+  - `docs/client_integration.md`
+  - `docs/openapi/pecr.v1.yaml`
 - Release:
   - `.github/workflows/release.yml`
   - `scripts/security/verify_release_attestations.py`

@@ -1,0 +1,7 @@
+{
+  "$id": "pecr.schemas.PlannerStep.v1",
+  "oneOf": [
+    { "$ref": "pecr.schemas.PlannerOperatorStep.v1" },
+    { "$ref": "pecr.schemas.PlannerSearchRefFetchSpanStep.v1" }
+  ]
+}

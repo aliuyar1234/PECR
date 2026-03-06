@@ -155,90 +155,129 @@ class Bridge:
         return [r for r in results if isinstance(r, dict)]
 
 
-def run_mock(bridge: Bridge, query: str, budget: Budget) -> dict[str, Any]:
+def default_mock_plan(query: str) -> list[dict[str, Any]]:
+    return [
+        {
+            "kind": "operator",
+            "op_name": "list_versions",
+            "params": {"object_id": "public/public_1.txt"},
+        },
+        {
+            "kind": "operator",
+            "op_name": "fetch_rows",
+            "params": {
+                "view_id": "safe_customer_view_public",
+                "filter_spec": {"customer_id": "cust_public_1"},
+                "fields": ["status", "plan_tier"],
+            },
+        },
+        {"kind": "operator", "op_name": "search", "params": {"query": query.strip(), "limit": 5}},
+        {"kind": "search_ref_fetch_span", "max_refs": 2},
+    ]
+
+
+def normalize_planner_step(raw: Any) -> dict[str, Any] | None:
+    if not isinstance(raw, dict):
+        return None
+
+    kind = raw.get("kind")
+    if kind == "operator":
+        op_name = raw.get("op_name")
+        params = raw.get("params")
+        if not isinstance(op_name, str) or not op_name.strip():
+            return None
+        return {"kind": "operator", "op_name": op_name.strip(), "params": params}
+
+    if kind == "search_ref_fetch_span":
+        max_refs_raw = raw.get("max_refs", 2)
+        try:
+            max_refs = int(max_refs_raw)
+        except (TypeError, ValueError):
+            return None
+        if max_refs <= 0:
+            return None
+        return {"kind": "search_ref_fetch_span", "max_refs": max_refs}
+
+    return None
+
+
+def planner_steps_for_run(query: str, planner_hints: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if isinstance(planner_hints, dict):
+        recommended_path = planner_hints.get("recommended_path")
+        if isinstance(recommended_path, list):
+            normalized = [
+                step for raw in recommended_path if (step := normalize_planner_step(raw)) is not None
+            ]
+            if normalized:
+                return normalized
+
+    return default_mock_plan(query)
+
+
+def run_mock(
+    bridge: Bridge,
+    query: str,
+    budget: Budget,
+    planner_hints: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     search_refs: list[dict[str, Any]] = []
     operator_calls_used = 0
     stop_reason = "plan_complete"
+    executed_steps = 0
 
     def do(depth: int, op_name: str, params: Any) -> dict[str, Any]:
         nonlocal operator_calls_used
         operator_calls_used += 1
         return bridge.call_operator(depth=depth, op_name=op_name, params=params)
 
-    # Depth is 0-indexed to match the controller's baseline loop convention.
-    for depth in range(max(0, budget.max_recursion_depth)):
-        if depth == 0:
-            response = (
-                "PLAN: list_versions\n```repl\n"
-                + json.dumps(
-                    {"op_name": "list_versions", "params": {"object_id": "public/public_1.txt"}}
-                )
-                + "\n```"
-            )
-        elif depth == 1:
-            response = (
-                "PLAN: fetch_rows\n```repl\n"
-                + json.dumps(
-                    {
-                        "op_name": "fetch_rows",
-                        "params": {
-                            "view_id": "safe_customer_view_public",
-                            "filter_spec": {"customer_id": "cust_public_1"},
-                            "fields": ["status", "plan_tier"],
-                        },
-                    }
-                )
-                + "\n```"
-            )
-        elif depth == 2:
-            response = (
-                "PLAN: search\n```repl\n"
-                + json.dumps(
-                    {"op_name": "search", "params": {"query": query.strip(), "limit": 5}}
-                )
-                + "\n```"
-            )
-        elif depth == 3:
-            calls: list[dict[str, Any]] = []
-            for r in search_refs[:2]:
-                object_id = r.get("object_id")
-                if isinstance(object_id, str) and object_id.strip():
-                    calls.append({"op_name": "fetch_span", "params": {"object_id": object_id}})
+    planned_steps = planner_steps_for_run(query, planner_hints)
+    max_depth = max(0, budget.max_recursion_depth)
 
-            if calls and budget.max_parallelism > 1:
-                operator_calls_used += len(bridge.call_operator_batch(depth=depth, calls=calls))
-                continue
-
-            if not calls:
-                response = "PLAN: no spans\n"
-            else:
-                response = "PLAN: fetch_span\n" + "\n".join(
-                    ["```repl\n" + json.dumps(call) + "\n```" for call in calls]
-                )
-        else:
+    for depth, step in enumerate(planned_steps):
+        if depth >= max_depth:
+            stop_reason = "budget_max_recursion_depth"
             break
 
-        for code in find_code_blocks(response):
-            try:
-                call = json.loads(code)
-            except json.JSONDecodeError:
+        executed_steps = depth + 1
+
+        if step["kind"] == "operator":
+            op_name = step["op_name"]
+            params = step.get("params")
+            if op_name == "search" and not query.strip():
                 continue
-            if not isinstance(call, dict):
-                continue
-            op_name = call.get("op_name")
-            params = call.get("params")
-            if not isinstance(op_name, str) or not op_name.strip():
-                continue
+
             resp = do(depth, op_name, params)
             if op_name == "search":
                 result = resp.get("result") if isinstance(resp.get("result"), dict) else {}
                 refs = result.get("refs") if isinstance(result, dict) else None
                 if isinstance(refs, list):
                     search_refs = [r for r in refs if isinstance(r, dict)]
+            continue
 
-    if budget.max_recursion_depth <= 0:
-        stop_reason = "budget_max_recursion_depth"
-    elif budget.max_recursion_depth <= 4:
+        if step["kind"] == "search_ref_fetch_span":
+            calls: list[dict[str, Any]] = []
+            max_refs = int(step.get("max_refs", 2))
+            for r in search_refs[:max_refs]:
+                object_id = r.get("object_id")
+                if isinstance(object_id, str) and object_id.strip():
+                    params = {"object_id": object_id}
+                    start_byte = r.get("start_byte")
+                    end_byte = r.get("end_byte")
+                    if isinstance(start_byte, int):
+                        params["start_byte"] = start_byte
+                    if isinstance(end_byte, int):
+                        params["end_byte"] = end_byte
+                    calls.append({"op_name": "fetch_span", "params": params})
+
+            if calls and budget.max_parallelism > 1:
+                operator_calls_used += len(bridge.call_operator_batch(depth=depth, calls=calls))
+                continue
+
+            for call in calls:
+                do(depth, call["op_name"], call["params"])
+            continue
+
+    if max_depth <= 0:
         stop_reason = "budget_max_recursion_depth"
 
     final_answer = find_final_answer("FINAL(UNKNOWN: insufficient evidence to answer the query.)")
@@ -248,7 +287,7 @@ def run_mock(bridge: Bridge, query: str, budget: Budget) -> dict[str, Any]:
         "final_answer": final_answer,
         "stop_reason": stop_reason,
         "operator_calls_used": operator_calls_used,
-        "depth_used": min(max(0, budget.max_recursion_depth), 5),
+        "depth_used": executed_steps,
     }
 
 
@@ -284,7 +323,11 @@ def main() -> int:
         return 3
 
     bridge = Bridge()
-    result = run_mock(bridge, query, budget)
+    planner_hints = start.get("planner_hints")
+    if not isinstance(planner_hints, dict):
+        planner_hints = None
+
+    result = run_mock(bridge, query, budget, planner_hints=planner_hints)
     write_json_line(
         {
             "type": "done",

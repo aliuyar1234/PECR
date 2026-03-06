@@ -1,0 +1,19 @@
+{
+  "$id": "pecr.schemas.ReplayPlannerDecisionSummary.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "planner_source",
+    "stop_reason",
+    "selected_for_execution",
+    "used_fallback_plan"
+  ],
+  "properties": {
+    "planner_source": { "type": "string", "minLength": 1 },
+    "stop_reason": { "type": "string", "minLength": 1 },
+    "selected_for_execution": { "type": "boolean" },
+    "used_fallback_plan": { "type": "boolean" },
+    "fallback_from_step": { "type": "string", "minLength": 1 },
+    "planner_summary": { "type": "string", "minLength": 1 }
+  }
+}

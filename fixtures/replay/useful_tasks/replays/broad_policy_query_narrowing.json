@@ -1,0 +1,45 @@
+{
+  "budget": {
+    "max_bytes": 4096,
+    "max_operator_calls": 10,
+    "max_parallelism": 1,
+    "max_recursion_depth": 3,
+    "max_wallclock_ms": 1000
+  },
+  "bytes_used": 168,
+  "claim_map": {
+    "claim_map_id": "claim-map-broad-policy-query",
+    "claims": [
+      {
+        "claim_id": "1313131313131313131313131313131313131313131313131313131313131313",
+        "claim_text": "specify which document or policy you want evidence from, for example: 'Show the source text and evidence for the support policy.' Safe scopes for the current principal: public documents under public/. Try: 'Show the source text and evidence for the support policy in public documents.' or 'What changed in the latest version of the support policy document under public/?'",
+        "evidence_unit_ids": [],
+        "status": "UNKNOWN"
+      }
+    ],
+    "coverage_observed": 1.0,
+    "coverage_threshold": 0.95,
+    "terminal_mode": "INSUFFICIENT_EVIDENCE"
+  },
+  "depth_used": 1,
+  "evidence_ref_count": 0,
+  "evidence_unit_ids": [],
+  "loop_terminal_mode": "INSUFFICIENT_EVIDENCE",
+  "metadata": {
+    "bundle_hash": "1414141414141414141414141414141414141414141414141414141414141414",
+    "engine_mode": "baseline",
+    "principal_id_hash": "1515151515151515151515151515151515151515151515151515151515151515",
+    "quality_score": 92.0,
+    "recorded_at_unix_ms": 1700000801000,
+    "request_id": "req-useful-broad-policy-query",
+    "run_id": "useful-broad-policy-query",
+    "schema_version": 1,
+    "terminal_mode": "INSUFFICIENT_EVIDENCE",
+    "trace_id": "01ARZ3NDEKTSV4RRFFQ69G5FAI"
+  },
+  "operator_calls_used": 1,
+  "policy_snapshot_id": "policy-useful-broad-policy-query",
+  "query": "policy",
+  "response_text": "UNKNOWN: specify which document or policy you want evidence from, for example: 'Show the source text and evidence for the support policy.' Safe scopes for the current principal: public documents under public/. Try: 'Show the source text and evidence for the support policy in public documents.' or 'What changed in the latest version of the support policy document under public/?'",
+  "session_id": "session-useful-broad-policy-query"
+}

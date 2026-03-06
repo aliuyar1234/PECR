@@ -1,0 +1,14 @@
+{
+  "$id": "pecr.schemas.PlanResponse.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "steps"],
+  "properties": {
+    "schema_version": { "type": "integer", "minimum": 1 },
+    "steps": {
+      "type": "array",
+      "items": { "$ref": "pecr.schemas.PlannerStep.v1" }
+    },
+    "planner_summary": { "type": "string", "minLength": 1 }
+  }
+}

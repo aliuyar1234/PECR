@@ -1,0 +1,32 @@
+{
+  "$id": "pecr.schemas.EngineComparisonSummary.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "primary_engine_mode",
+    "secondary_engine_mode",
+    "paired_query_count",
+    "average_quality_score_delta",
+    "supported_rate_delta",
+    "source_unavailable_rate_delta",
+    "average_coverage_observed_delta",
+    "average_citation_quality_delta",
+    "primary_win_rate",
+    "secondary_win_rate",
+    "tie_rate"
+  ],
+  "properties": {
+    "primary_engine_mode": { "$ref": "pecr.schemas.EngineMode.v1" },
+    "secondary_engine_mode": { "$ref": "pecr.schemas.EngineMode.v1" },
+    "paired_query_count": { "type": "integer", "minimum": 0 },
+    "average_quality_score_delta": { "type": "number" },
+    "supported_rate_delta": { "type": "number" },
+    "source_unavailable_rate_delta": { "type": "number" },
+    "average_coverage_observed_delta": { "type": "number" },
+    "average_citation_quality_delta": { "type": "number" },
+    "primary_win_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+    "secondary_win_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+    "tie_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+    "more_helpful_engine_mode": { "$ref": "pecr.schemas.EngineMode.v1" }
+  }
+}

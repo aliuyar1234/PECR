@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 axum = "0.8"
+pecr-adapters = { path = "../adapters" }
 pecr-auth = { path = "../auth" }
 pecr-contracts = { path = "../contracts" }
 pecr-ledger = { path = "../ledger" }

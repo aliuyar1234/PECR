@@ -1249,6 +1249,7 @@ dependencies = [
  "opentelemetry",
  "opentelemetry-otlp",
  "opentelemetry_sdk",
+ "pecr-adapters",
  "pecr-auth",
  "pecr-contracts",
  "pecr-ledger",

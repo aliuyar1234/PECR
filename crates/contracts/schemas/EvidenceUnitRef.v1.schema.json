@@ -7,6 +7,12 @@
     "evidence_unit_id": { "type": "string", "pattern": "^[a-f0-9]{64}$" },
     "source_system": { "type": "string", "minLength": 1 },
     "object_id": { "type": "string", "minLength": 1 },
-    "version_id": { "type": "string", "minLength": 1 }
+    "version_id": { "type": "string", "minLength": 1 },
+    "start_byte": { "type": "integer", "minimum": 0 },
+    "end_byte": { "type": "integer", "minimum": 0 },
+    "line_start": { "type": "integer", "minimum": 1 },
+    "line_end": { "type": "integer", "minimum": 1 },
+    "match_preview": { "type": "string", "minLength": 1 },
+    "match_score": { "type": "integer", "minimum": 0 }
   }
 }

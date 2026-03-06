@@ -1,0 +1,21 @@
+{
+  "$id": "pecr.schemas.PlannerOperatorStep.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["kind", "op_name", "params"],
+  "properties": {
+    "kind": { "type": "string", "enum": ["operator"] },
+    "op_name": { "type": "string", "minLength": 1 },
+    "params": {
+      "oneOf": [
+        { "type": "object" },
+        { "type": "array" },
+        { "type": "string" },
+        { "type": "number" },
+        { "type": "integer" },
+        { "type": "boolean" },
+        { "type": "null" }
+      ]
+    }
+  }
+}

@@ -10,7 +10,20 @@ import uuid
 from pathlib import Path
 from typing import Any
 
-from replay_lib import compute_scorecards, load_replay_bundles, reconstruct_outcome, source_unavailable_rate
+from replay_lib import (
+    benchmark_pass,
+    citation_quality,
+    compute_engine_comparisons,
+    compute_planner_comparisons,
+    compute_planner_scorecards,
+    compute_scorecards,
+    load_json,
+    load_replay_bundles,
+    planner_rows,
+    reconstruct_outcome,
+    response_kind,
+    source_unavailable_rate,
+)
 
 
 def principal_hash(principal_id: str) -> str:
@@ -20,6 +33,13 @@ def principal_hash(principal_id: str) -> str:
 
 def print_json(value: Any) -> None:
     print(json.dumps(value, indent=2, sort_keys=True))
+
+
+def load_benchmark_manifest_if_present(store: Path) -> dict[str, Any] | None:
+    manifest_path = store / "benchmark_manifest.json"
+    if not manifest_path.exists():
+        return None
+    return load_json(manifest_path)
 
 
 def cmd_list(args: argparse.Namespace) -> int:
@@ -40,18 +60,39 @@ def cmd_replay(args: argparse.Namespace) -> int:
 
 
 def cmd_scorecards(args: argparse.Namespace) -> int:
-    bundles = load_replay_bundles(Path(args.store), engine_mode=args.engine_mode)
+    store = Path(args.store)
+    bundles = load_replay_bundles(store, engine_mode=args.engine_mode)
     if args.limit is not None:
         bundles = bundles[: args.limit]
-    print_json({"scorecards": compute_scorecards(bundles)})
+    print_json(
+        {
+            "scorecards": compute_scorecards(
+                bundles, load_benchmark_manifest_if_present(store)
+            ),
+            "engine_comparisons": compute_engine_comparisons(
+                bundles, load_benchmark_manifest_if_present(store)
+            ),
+            "planner_scorecards": compute_planner_scorecards(
+                bundles, load_benchmark_manifest_if_present(store)
+            ),
+            "planner_comparisons": compute_planner_comparisons(
+                bundles, load_benchmark_manifest_if_present(store)
+            ),
+        }
+    )
     return 0
 
 
 def cmd_evaluate(args: argparse.Namespace) -> int:
     requested_ids = set(args.run_ids or [])
-    bundles = load_replay_bundles(
-        Path(args.store), engine_mode=args.engine_mode, replay_ids=requested_ids or None
-    )
+    store = Path(args.store)
+    benchmark_manifest = load_benchmark_manifest_if_present(store)
+    benchmark_index = {
+        scenario["run_id"]: scenario
+        for scenario in (benchmark_manifest or {}).get("scenarios", [])
+        if scenario.get("run_id")
+    }
+    bundles = load_replay_bundles(store, engine_mode=args.engine_mode, replay_ids=requested_ids or None)
     if args.limit is not None:
         bundles = bundles[: args.limit]
 
@@ -87,10 +128,27 @@ def cmd_evaluate(args: argparse.Namespace) -> int:
                 "terminal_mode": bundle.get("metadata", {}).get("terminal_mode"),
                 "quality_score": bundle.get("metadata", {}).get("quality_score"),
                 "coverage_observed": bundle.get("claim_map", {}).get("coverage_observed"),
+                "citation_quality": citation_quality(bundle.get("claim_map", {})),
+                "response_kind": response_kind(bundle),
+                "benchmark_scenario_id": benchmark_index.get(
+                    bundle.get("metadata", {}).get("run_id"), {}
+                ).get("scenario_id"),
+                "benchmark_pass": (
+                    None
+                    if bundle.get("metadata", {}).get("run_id") not in benchmark_index
+                    else benchmark_pass(
+                        bundle,
+                        benchmark_index[bundle.get("metadata", {}).get("run_id")],
+                    )
+                ),
             }
             for bundle in bundles
         ],
-        "scorecards": compute_scorecards(bundles),
+        "scorecards": compute_scorecards(bundles, benchmark_manifest),
+        "engine_comparisons": compute_engine_comparisons(bundles, benchmark_manifest),
+        "planner_rows": planner_rows(bundles, benchmark_manifest),
+        "planner_scorecards": compute_planner_scorecards(bundles, benchmark_manifest),
+        "planner_comparisons": compute_planner_comparisons(bundles, benchmark_manifest),
         "overall_pass": overall_pass,
     }
     print_json(evaluation)
@@ -115,7 +173,7 @@ def build_parser() -> argparse.ArgumentParser:
     sub = parser.add_subparsers(dest="command", required=True)
 
     p_list = sub.add_parser("list", help="List replay metadata")
-    p_list.add_argument("--engine-mode", choices=["baseline", "rlm"])
+    p_list.add_argument("--engine-mode", choices=["baseline", "beam_planner", "rlm"])
     p_list.add_argument("--limit", type=int)
     p_list.set_defaults(func=cmd_list)
 
@@ -124,7 +182,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_replay.set_defaults(func=cmd_replay)
 
     p_scorecards = sub.add_parser("scorecards", help="Compute run quality scorecards by engine mode")
-    p_scorecards.add_argument("--engine-mode", choices=["baseline", "rlm"])
+    p_scorecards.add_argument("--engine-mode", choices=["baseline", "beam_planner", "rlm"])
     p_scorecards.add_argument("--limit", type=int)
     p_scorecards.set_defaults(func=cmd_scorecards)
 
@@ -132,7 +190,7 @@ def build_parser() -> argparse.ArgumentParser:
     p_eval.add_argument("--name", required=True, help="Evaluation name")
     p_eval.add_argument("--principal-id", default="dev")
     p_eval.add_argument("--run-id", dest="run_ids", action="append")
-    p_eval.add_argument("--engine-mode", choices=["baseline", "rlm"])
+    p_eval.add_argument("--engine-mode", choices=["baseline", "beam_planner", "rlm"])
     p_eval.add_argument("--limit", type=int)
     p_eval.add_argument("--min-quality-score", type=float, default=0.0)
     p_eval.add_argument("--max-source-unavailable-rate", type=float, default=1.0)

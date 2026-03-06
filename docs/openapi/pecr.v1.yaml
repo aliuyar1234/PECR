@@ -121,6 +121,34 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /v1/policies/capabilities:
+    get:
+      summary: Describe safe and useful ask categories for the current principal
+      operationId: getPolicyCapabilities
+      security:
+        - PecrLocalPrincipal: []
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XPecrRequestId"
+      responses:
+        "200":
+          description: Safe ask catalog derived from current policy narrowing hints
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SafeAskCatalog"
+        "401":
+          description: Missing or invalid principal credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Source unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/policies/simulate:
     post:
       summary: Simulate a policy decision
@@ -212,6 +240,8 @@ paths:
                     $ref: "#/components/schemas/TerminalMode"
                   result:
                     type: object
+                  result_summary:
+                    type: string
                   policy_decision:
                     $ref: "#/components/schemas/PolicyDecision"
         "400":
@@ -356,6 +386,35 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/ErrorResponse"
+  /v1/capabilities:
+    get:
+      summary: Describe safe and useful ask categories through the controller
+      operationId: getCapabilities
+      security:
+        - PecrLocalPrincipal: []
+        - BearerAuth: []
+      parameters:
+        - $ref: "#/components/parameters/XPecrRequestId"
+        - $ref: "#/components/parameters/XPecrTraceId"
+      responses:
+        "200":
+          description: Safe ask catalog for the current principal
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SafeAskCatalog"
+        "401":
+          description: Missing or invalid principal credentials
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+        "503":
+          description: Source unavailable
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
   /v1/run:
     post:
       summary: Controller end-to-end run
@@ -397,6 +456,73 @@ paths:
                     $ref: "#/components/schemas/ClaimMap"
                   response_text:
                     type: string
+                    description: User-displayable grounded answer text.
+                  response_kind:
+                    $ref: "#/components/schemas/ClientResponseKind"
+              examples:
+                supported:
+                  summary: Fully grounded supported answer
+                  value:
+                    terminal_mode: SUPPORTED
+                    trace_id: 01ARZ3NDEKTSV4RRFFQ69G5FAA
+                    response_text: "The customer is active on the starter plan. Source: safe_customer_view_public row cust_public_1."
+                    claim_map:
+                      claim_map_id: claim-map-supported
+                      terminal_mode: SUPPORTED
+                      coverage_threshold: 0.95
+                      coverage_observed: 1.0
+                      claims:
+                        - claim_id: "1111111111111111111111111111111111111111111111111111111111111111"
+                          claim_text: "safe_customer_view_public row cust_public_1: status=active; plan_tier=starter"
+                          status: SUPPORTED
+                          evidence_unit_ids:
+                            - "2222222222222222222222222222222222222222222222222222222222222222"
+                partial_answer:
+                  summary: Supported answer with unresolved remainder
+                  value:
+                    terminal_mode: SUPPORTED
+                    trace_id: 01ARZ3NDEKTSV4RRFFQ69G5FAJ
+                    response_kind: partial_answer
+                    response_text: "SUPPORTED: Annual plans may request refunds within 30 days of purchase. UNKNOWN: The available evidence does not resolve every refund exception or override."
+                    claim_map:
+                      claim_map_id: claim-map-partial
+                      terminal_mode: SUPPORTED
+                      coverage_threshold: 0.95
+                      coverage_observed: 1.0
+                      notes: "Partial answer: supported claims are grounded, but some requested details remain unresolved."
+                      claims:
+                        - claim_id: "3333333333333333333333333333333333333333333333333333333333333333"
+                          claim_text: "Annual plans may request refunds within 30 days of purchase."
+                          status: SUPPORTED
+                          evidence_unit_ids:
+                            - "4444444444444444444444444444444444444444444444444444444444444444"
+                        - claim_id: "5555555555555555555555555555555555555555555555555555555555555555"
+                          claim_text: "The available evidence does not resolve every refund exception or override."
+                          status: UNKNOWN
+                          evidence_unit_ids: []
+                ambiguous:
+                  summary: Narrowing prompt instead of a weak answer
+                  value:
+                    terminal_mode: INSUFFICIENT_EVIDENCE
+                    trace_id: 01ARZ3NDEKTSV4RRFFQ69G5FAH
+                    response_kind: ambiguous
+                    response_text: "UNKNOWN: the structured lookup is underspecified. Which field should I use for the customer lookup?"
+                    claim_map:
+                      claim_map_id: claim-map-ambiguous
+                      terminal_mode: INSUFFICIENT_EVIDENCE
+                      coverage_threshold: 0.95
+                      coverage_observed: 1.0
+                      clarification_prompt:
+                        question: Which field should I use for the customer lookup?
+                        options:
+                          - customer status
+                          - plan tier
+                          - customer counts by plan tier
+                      claims:
+                        - claim_id: "6666666666666666666666666666666666666666666666666666666666666666"
+                          claim_text: "The structured lookup is underspecified and needs a narrower field or filter."
+                          status: UNKNOWN
+                          evidence_unit_ids: []
         "400":
           description: Invalid request
           content:
@@ -721,11 +847,219 @@ components:
         - INSUFFICIENT_EVIDENCE
         - INSUFFICIENT_PERMISSION
         - SOURCE_UNAVAILABLE
+    ClientResponseKind:
+      type: string
+      description: |
+        Optional client UX hint for `/v1/run` and error responses.
+        Absent means the response is a normal supported answer without special handling.
+      enum:
+        - blocked
+        - ambiguous
+        - source_down
+        - partial_answer
     EngineMode:
       type: string
       enum:
         - baseline
+        - beam_planner
         - rlm
+    PlannerIntent:
+      type: string
+      enum:
+        - default
+        - structured_lookup
+        - structured_aggregation
+        - evidence_lookup
+        - version_review
+        - structured_evidence_lookup
+        - structured_aggregation_evidence
+        - structured_version_review
+    PlannerOperatorStep:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - op_name
+        - params
+      properties:
+        kind:
+          type: string
+          enum: [operator]
+        op_name:
+          type: string
+          minLength: 1
+        params:
+          oneOf:
+            - type: object
+            - type: array
+            - type: string
+            - type: number
+            - type: integer
+            - type: boolean
+            - type: null
+    PlannerSearchRefFetchSpanStep:
+      type: object
+      additionalProperties: false
+      required:
+        - kind
+        - max_refs
+      properties:
+        kind:
+          type: string
+          enum: [search_ref_fetch_span]
+        max_refs:
+          type: integer
+          minimum: 1
+    PlannerStep:
+      oneOf:
+        - $ref: "#/components/schemas/PlannerOperatorStep"
+        - $ref: "#/components/schemas/PlannerSearchRefFetchSpanStep"
+    PlannerHints:
+      type: object
+      additionalProperties: false
+      required:
+        - intent
+        - recommended_path
+      properties:
+        intent:
+          $ref: "#/components/schemas/PlannerIntent"
+        recommended_path:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlannerStep"
+    PlannerRecoveryContext:
+      type: object
+      additionalProperties: false
+      required:
+        - failed_step
+        - failure_terminal_mode
+        - attempted_path
+      properties:
+        failed_step:
+          type: string
+          minLength: 1
+        failure_terminal_mode:
+          $ref: "#/components/schemas/TerminalMode"
+        attempted_path:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlannerStep"
+    PlanRequest:
+      type: object
+      additionalProperties: false
+      required:
+        - schema_version
+        - query
+        - budget
+        - planner_hints
+        - available_operator_names
+        - allow_search_ref_fetch_span
+      properties:
+        schema_version:
+          type: integer
+          minimum: 1
+        query:
+          type: string
+          minLength: 1
+        budget:
+          $ref: "#/components/schemas/Budget"
+        planner_hints:
+          $ref: "#/components/schemas/PlannerHints"
+        recovery_context:
+          $ref: "#/components/schemas/PlannerRecoveryContext"
+        available_operator_names:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        allow_search_ref_fetch_span:
+          type: boolean
+    PlanResponse:
+      type: object
+      additionalProperties: false
+      required:
+        - schema_version
+        - steps
+      properties:
+        schema_version:
+          type: integer
+          minimum: 1
+        steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlannerStep"
+        planner_summary:
+          type: string
+          minLength: 1
+    ReplayPlannerDecisionSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - planner_source
+        - stop_reason
+        - selected_for_execution
+        - used_fallback_plan
+      properties:
+        planner_source:
+          type: string
+          minLength: 1
+        stop_reason:
+          type: string
+          minLength: 1
+        selected_for_execution:
+          type: boolean
+        used_fallback_plan:
+          type: boolean
+        fallback_from_step:
+          type: string
+          minLength: 1
+        expected_usefulness_score:
+          type: number
+          minimum: 0
+          maximum: 1
+        expected_usefulness_reasons:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        selection_rationale:
+          type: string
+          minLength: 1
+        planner_summary:
+          type: string
+          minLength: 1
+    ReplayPlannerTrace:
+      type: object
+      additionalProperties: false
+      required:
+        - plan_request
+        - decision_summary
+      properties:
+        plan_request:
+          $ref: "#/components/schemas/PlanRequest"
+        output_steps:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlannerStep"
+        decision_summary:
+          $ref: "#/components/schemas/ReplayPlannerDecisionSummary"
+    ClaimEvidenceSnippet:
+      type: object
+      additionalProperties: false
+      required:
+        - evidence_unit_id
+        - location
+        - snippet
+      properties:
+        evidence_unit_id:
+          type: string
+          pattern: "^[a-f0-9]{64}$"
+        location:
+          type: string
+          minLength: 1
+        snippet:
+          type: string
+          minLength: 1
     Claim:
       type: object
       additionalProperties: false
@@ -752,6 +1086,94 @@ components:
           items:
             type: string
             pattern: "^[a-f0-9]{64}$"
+        evidence_snippets:
+          type: array
+          items:
+            $ref: "#/components/schemas/ClaimEvidenceSnippet"
+    SafeAskCapability:
+      type: object
+      additionalProperties: false
+      required:
+        - capability_id
+        - intent
+        - title
+        - description
+      properties:
+        capability_id:
+          type: string
+          minLength: 1
+        intent:
+          $ref: "#/components/schemas/PlannerIntent"
+        title:
+          type: string
+          minLength: 1
+        description:
+          type: string
+          minLength: 1
+        examples:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        scope_labels:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        view_ids:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        field_labels:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        dimension_labels:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        source_scopes:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        document_hints:
+          type: array
+          items:
+            type: string
+            minLength: 1
+    SafeAskCatalog:
+      type: object
+      additionalProperties: false
+      properties:
+        capabilities:
+          type: array
+          items:
+            $ref: "#/components/schemas/SafeAskCapability"
+        suggested_queries:
+          type: array
+          items:
+            type: string
+            minLength: 1
+    ClarificationPrompt:
+      type: object
+      additionalProperties: false
+      required:
+        - question
+      properties:
+        question:
+          type: string
+          minLength: 1
+          description: Short narrowing question the client can render directly.
+        options:
+          type: array
+          description: Optional suggested follow-up choices for quick-pick UI.
+          items:
+            type: string
+            minLength: 1
     ClaimMap:
       type: object
       additionalProperties: false
@@ -778,8 +1200,11 @@ components:
           type: number
           minimum: 0
           maximum: 1
+        clarification_prompt:
+          $ref: "#/components/schemas/ClarificationPrompt"
         notes:
           type: string
+          description: Additional client-displayable guidance, for example partial-answer context.
     ReplayBundleMetadata:
       type: object
       additionalProperties: false
@@ -877,6 +1302,10 @@ components:
           items:
             type: string
             pattern: "^[a-f0-9]{64}$"
+        planner_traces:
+          type: array
+          items:
+            $ref: "#/components/schemas/ReplayPlannerTrace"
     ReplayEvaluationSubmission:
       type: object
       additionalProperties: false
@@ -911,6 +1340,7 @@ components:
         - terminal_mode
         - quality_score
         - coverage_observed
+        - citation_quality
       properties:
         run_id:
           type: string
@@ -930,6 +1360,12 @@ components:
           type: number
           minimum: 0
           maximum: 1
+        citation_quality:
+          type: number
+          minimum: 0
+          maximum: 1
+        response_kind:
+          $ref: "#/components/schemas/ClientResponseKind"
     RunQualityScorecard:
       type: object
       additionalProperties: false
@@ -941,7 +1377,11 @@ components:
         - maximum_quality_score
         - supported_rate
         - source_unavailable_rate
+        - ambiguity_rate
+        - partial_answer_rate
+        - refusal_friction_rate
         - average_coverage_observed
+        - average_citation_quality
       properties:
         engine_mode:
           $ref: "#/components/schemas/EngineMode"
@@ -968,10 +1408,73 @@ components:
           type: number
           minimum: 0
           maximum: 1
+        ambiguity_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+        partial_answer_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+        refusal_friction_rate:
+          type: number
+          minimum: 0
+          maximum: 1
         average_coverage_observed:
           type: number
           minimum: 0
           maximum: 1
+        average_citation_quality:
+          type: number
+          minimum: 0
+          maximum: 1
+    EngineComparisonSummary:
+      type: object
+      additionalProperties: false
+      required:
+        - primary_engine_mode
+        - secondary_engine_mode
+        - paired_query_count
+        - average_quality_score_delta
+        - supported_rate_delta
+        - source_unavailable_rate_delta
+        - average_coverage_observed_delta
+        - average_citation_quality_delta
+        - primary_win_rate
+        - secondary_win_rate
+        - tie_rate
+      properties:
+        primary_engine_mode:
+          $ref: "#/components/schemas/EngineMode"
+        secondary_engine_mode:
+          $ref: "#/components/schemas/EngineMode"
+        paired_query_count:
+          type: integer
+          minimum: 0
+        average_quality_score_delta:
+          type: number
+        supported_rate_delta:
+          type: number
+        source_unavailable_rate_delta:
+          type: number
+        average_coverage_observed_delta:
+          type: number
+        average_citation_quality_delta:
+          type: number
+        primary_win_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+        secondary_win_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+        tie_rate:
+          type: number
+          minimum: 0
+          maximum: 1
+        more_helpful_engine_mode:
+          $ref: "#/components/schemas/EngineMode"
     ReplayEvaluationResult:
       type: object
       additionalProperties: false
@@ -1015,6 +1518,10 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/RunQualityScorecard"
+        engine_comparisons:
+          type: array
+          items:
+            $ref: "#/components/schemas/EngineComparisonSummary"
         overall_pass:
           type: boolean
     PolicySimulationRequest:
@@ -1056,6 +1563,8 @@ components:
           type: string
         redaction:
           type: object
+        narrowing:
+          type: object
     PolicySimulationResponse:
       $ref: "#/components/schemas/PolicyDecision"
     ErrorResponse:
@@ -1077,6 +1586,16 @@ components:
           $ref: "#/components/schemas/TerminalMode"
         retryable:
           type: boolean
+        response_kind:
+          $ref: "#/components/schemas/ClientResponseKind"
+        what_failed:
+          type: string
+          minLength: 1
+          description: Concrete explanation of the blocked or unavailable step.
+        safe_alternative:
+          type: string
+          minLength: 1
+          description: Suggested safe next step for the caller or user.
         detail:
           oneOf:
             - type: object

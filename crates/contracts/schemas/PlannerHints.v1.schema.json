@@ -1,0 +1,13 @@
+{
+  "$id": "pecr.schemas.PlannerHints.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["intent", "recommended_path"],
+  "properties": {
+    "intent": { "$ref": "pecr.schemas.PlannerIntent.v1" },
+    "recommended_path": {
+      "type": "array",
+      "items": { "$ref": "pecr.schemas.PlannerStep.v1" }
+    }
+  }
+}

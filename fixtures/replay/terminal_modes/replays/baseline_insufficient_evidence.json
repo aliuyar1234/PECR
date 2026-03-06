@@ -1,0 +1,45 @@
+{
+  "budget": {
+    "max_bytes": 2048,
+    "max_operator_calls": 10,
+    "max_parallelism": 1,
+    "max_recursion_depth": 3,
+    "max_wallclock_ms": 1000
+  },
+  "bytes_used": 64,
+  "claim_map": {
+    "claim_map_id": "claim-map-insufficient-evidence",
+    "claims": [
+      {
+        "claim_id": "1111111111111111111111111111111111111111111111111111111111111111",
+        "claim_text": "insufficient evidence",
+        "evidence_unit_ids": [],
+        "status": "UNKNOWN"
+      }
+    ],
+    "coverage_observed": 0.0,
+    "coverage_threshold": 0.95,
+    "terminal_mode": "INSUFFICIENT_EVIDENCE"
+  },
+  "depth_used": 1,
+  "evidence_ref_count": 0,
+  "evidence_unit_ids": [],
+  "loop_terminal_mode": "INSUFFICIENT_EVIDENCE",
+  "metadata": {
+    "bundle_hash": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "engine_mode": "baseline",
+    "principal_id_hash": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+    "quality_score": 55.0,
+    "recorded_at_unix_ms": 1700000000001,
+    "request_id": "req-insufficient-evidence",
+    "run_id": "baseline-insufficient-evidence",
+    "schema_version": 1,
+    "terminal_mode": "INSUFFICIENT_EVIDENCE",
+    "trace_id": "01ARZ3NDEKTSV4RRFFQ69G5FAV"
+  },
+  "operator_calls_used": 1,
+  "policy_snapshot_id": "policy-baseline-ie",
+  "query": "smoke insufficient evidence",
+  "response_text": "UNKNOWN: insufficient evidence to answer the query.",
+  "session_id": "session-baseline-ie"
+}

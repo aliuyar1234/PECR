@@ -26,6 +26,7 @@ impl TerminalMode {
 #[serde(rename_all = "snake_case")]
 pub enum EngineMode {
     Baseline,
+    BeamPlanner,
     Rlm,
 }
 
@@ -33,7 +34,58 @@ impl EngineMode {
     pub fn as_str(self) -> &'static str {
         match self {
             EngineMode::Baseline => "baseline",
+            EngineMode::BeamPlanner => "beam_planner",
             EngineMode::Rlm => "rlm",
+        }
+    }
+}
+
+pub const PLANNER_CONTRACT_SCHEMA_VERSION: u32 = 1;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannerIntent {
+    Default,
+    StructuredLookup,
+    StructuredAggregation,
+    EvidenceLookup,
+    VersionReview,
+    StructuredEvidenceLookup,
+    StructuredAggregationEvidence,
+    StructuredVersionReview,
+}
+
+impl PlannerIntent {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PlannerIntent::Default => "default",
+            PlannerIntent::StructuredLookup => "structured_lookup",
+            PlannerIntent::StructuredAggregation => "structured_aggregation",
+            PlannerIntent::EvidenceLookup => "evidence_lookup",
+            PlannerIntent::VersionReview => "version_review",
+            PlannerIntent::StructuredEvidenceLookup => "structured_evidence_lookup",
+            PlannerIntent::StructuredAggregationEvidence => "structured_aggregation_evidence",
+            PlannerIntent::StructuredVersionReview => "structured_version_review",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ClientResponseKind {
+    Blocked,
+    Ambiguous,
+    SourceDown,
+    PartialAnswer,
+}
+
+impl ClientResponseKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ClientResponseKind::Blocked => "blocked",
+            ClientResponseKind::Ambiguous => "ambiguous",
+            ClientResponseKind::SourceDown => "source_down",
+            ClientResponseKind::PartialAnswer => "partial_answer",
         }
     }
 }
@@ -52,6 +104,18 @@ pub struct EvidenceUnitRef {
     pub source_system: String,
     pub object_id: String,
     pub version_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub start_byte: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end_byte: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_start: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line_end: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_preview: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub match_score: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +142,51 @@ pub struct EvidenceUnit {
     pub policy_snapshot_hash: String,
     pub transform_chain: Vec<TransformStep>,
     pub evidence_unit_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredMetricDescriptor {
+    pub name: String,
+    pub field: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredDimensionValueCount {
+    pub value: String,
+    pub count: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredDimensionDescriptor {
+    pub field: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub top_values: Vec<StructuredDimensionValueCount>,
+    #[serde(default)]
+    pub drilldown_supported: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredDrilldownHint {
+    pub dimension: String,
+    pub filter_spec: serde_json::Value,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StructuredDimensionDiscoveryResult {
+    pub view_id: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub available_dimensions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub metrics: Vec<StructuredMetricDescriptor>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dimensions: Vec<StructuredDimensionDescriptor>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filters_applied: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,11 +228,60 @@ pub enum ClaimStatus {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClaimEvidenceSnippet {
+    pub evidence_unit_id: String,
+    pub location: String,
+    pub snippet: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Claim {
     pub claim_id: String,
     pub claim_text: String,
     pub status: ClaimStatus,
     pub evidence_unit_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub evidence_snippets: Vec<ClaimEvidenceSnippet>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClarificationPrompt {
+    pub question: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeAskCapability {
+    pub capability_id: String,
+    pub intent: PlannerIntent,
+    pub title: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub examples: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub scope_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub view_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub field_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dimension_labels: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub source_scopes: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub document_hints: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SafeAskCatalog {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<SafeAskCapability>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub suggested_queries: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -133,8 +291,103 @@ pub struct ClaimMap {
     pub claims: Vec<Claim>,
     pub coverage_threshold: f64,
     pub coverage_observed: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clarification_prompt: Option<ClarificationPrompt>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub notes: Option<String>,
+}
+
+fn default_planner_step_params() -> serde_json::Value {
+    serde_json::Value::Object(serde_json::Map::new())
+}
+
+fn default_planner_max_refs() -> usize {
+    2
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PlannerStep {
+    Operator {
+        op_name: String,
+        #[serde(default = "default_planner_step_params")]
+        params: serde_json::Value,
+    },
+    SearchRefFetchSpan {
+        #[serde(default = "default_planner_max_refs")]
+        max_refs: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerHints {
+    pub intent: PlannerIntent,
+    #[serde(default)]
+    pub recommended_path: Vec<PlannerStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerRecoveryContext {
+    pub failed_step: String,
+    pub failure_terminal_mode: TerminalMode,
+    #[serde(default)]
+    pub attempted_path: Vec<PlannerStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanRequest {
+    pub schema_version: u32,
+    pub query: String,
+    pub budget: Budget,
+    pub planner_hints: PlannerHints,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub recovery_context: Option<PlannerRecoveryContext>,
+    #[serde(default)]
+    pub available_operator_names: Vec<String>,
+    #[serde(default)]
+    pub allow_search_ref_fetch_span: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanResponse {
+    pub schema_version: u32,
+    #[serde(default)]
+    pub steps: Vec<PlannerStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayPlannerDecisionSummary {
+    pub planner_source: String,
+    pub stop_reason: String,
+    pub selected_for_execution: bool,
+    #[serde(default)]
+    pub used_fallback_plan: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fallback_from_step: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_usefulness_score: Option<f64>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub expected_usefulness_reasons: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_rationale: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub planner_summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReplayPlannerTrace {
+    pub plan_request: PlanRequest,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub output_steps: Vec<PlannerStep>,
+    pub decision_summary: ReplayPlannerDecisionSummary,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -180,6 +433,8 @@ pub struct ReplayBundle {
     pub depth_used: u32,
     pub evidence_ref_count: u32,
     pub evidence_unit_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub planner_traces: Vec<ReplayPlannerTrace>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -205,6 +460,10 @@ pub struct ReplayRunScore {
     pub terminal_mode: TerminalMode,
     pub quality_score: f64,
     pub coverage_observed: f64,
+    #[serde(default)]
+    pub citation_quality: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub response_kind: Option<ClientResponseKind>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -217,7 +476,30 @@ pub struct RunQualityScorecard {
     pub maximum_quality_score: f64,
     pub supported_rate: f64,
     pub source_unavailable_rate: f64,
+    pub ambiguity_rate: f64,
+    pub partial_answer_rate: f64,
+    pub refusal_friction_rate: f64,
     pub average_coverage_observed: f64,
+    #[serde(default)]
+    pub average_citation_quality: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EngineComparisonSummary {
+    pub primary_engine_mode: EngineMode,
+    pub secondary_engine_mode: EngineMode,
+    pub paired_query_count: u64,
+    pub average_quality_score_delta: f64,
+    pub supported_rate_delta: f64,
+    pub source_unavailable_rate_delta: f64,
+    pub average_coverage_observed_delta: f64,
+    pub average_citation_quality_delta: f64,
+    pub primary_win_rate: f64,
+    pub secondary_win_rate: f64,
+    pub tie_rate: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub more_helpful_engine_mode: Option<EngineMode>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -232,6 +514,8 @@ pub struct ReplayEvaluationResult {
     pub missing_replay_ids: Vec<String>,
     pub run_results: Vec<ReplayRunScore>,
     pub scorecards: Vec<RunQualityScorecard>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub engine_comparisons: Vec<EngineComparisonSummary>,
     pub overall_pass: bool,
 }
 
@@ -399,9 +683,150 @@ mod tests {
             "\"baseline\""
         );
         assert_eq!(
+            serde_json::to_string(&EngineMode::BeamPlanner).expect("serialize engine mode"),
+            "\"beam_planner\""
+        );
+        assert_eq!(
             serde_json::to_string(&EngineMode::Rlm).expect("serialize engine mode"),
             "\"rlm\""
         );
+    }
+
+    #[test]
+    fn planner_intent_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&PlannerIntent::StructuredLookup)
+                .expect("serialize planner intent"),
+            "\"structured_lookup\""
+        );
+        assert_eq!(
+            serde_json::to_string(&PlannerIntent::StructuredVersionReview)
+                .expect("serialize planner intent"),
+            "\"structured_version_review\""
+        );
+    }
+
+    #[test]
+    fn planner_contract_round_trip_preserves_steps() {
+        let request = PlanRequest {
+            schema_version: PLANNER_CONTRACT_SCHEMA_VERSION,
+            query: "What is the customer status and plan tier?".to_string(),
+            budget: Budget {
+                max_operator_calls: 10,
+                max_bytes: 2048,
+                max_wallclock_ms: 1000,
+                max_recursion_depth: 3,
+                max_parallelism: Some(2),
+            },
+            planner_hints: PlannerHints {
+                intent: PlannerIntent::StructuredLookup,
+                recommended_path: vec![
+                    PlannerStep::Operator {
+                        op_name: "fetch_rows".to_string(),
+                        params: serde_json::json!({
+                            "view_id": "safe_customer_view_public",
+                            "fields": ["status", "plan_tier"],
+                        }),
+                    },
+                    PlannerStep::SearchRefFetchSpan { max_refs: 2 },
+                ],
+            },
+            recovery_context: Some(PlannerRecoveryContext {
+                failed_step: "fetch_rows".to_string(),
+                failure_terminal_mode: TerminalMode::SourceUnavailable,
+                attempted_path: vec![PlannerStep::Operator {
+                    op_name: "fetch_rows".to_string(),
+                    params: serde_json::json!({
+                        "view_id": "safe_customer_view_public",
+                        "fields": ["status", "plan_tier"],
+                    }),
+                }],
+            }),
+            available_operator_names: vec![
+                "fetch_rows".to_string(),
+                "lookup_evidence".to_string(),
+                "search".to_string(),
+                "fetch_span".to_string(),
+            ],
+            allow_search_ref_fetch_span: true,
+        };
+        let response = PlanResponse {
+            schema_version: PLANNER_CONTRACT_SCHEMA_VERSION,
+            steps: vec![
+                PlannerStep::Operator {
+                    op_name: "fetch_rows".to_string(),
+                    params: serde_json::json!({
+                        "view_id": "safe_customer_view_public",
+                        "fields": ["status", "plan_tier"],
+                    }),
+                },
+                PlannerStep::SearchRefFetchSpan { max_refs: 1 },
+            ],
+            planner_summary: Some("Prefer direct structured lookup.".to_string()),
+        };
+
+        let encoded_request = serde_json::to_vec(&request).expect("encode plan request");
+        let decoded_request =
+            serde_json::from_slice::<PlanRequest>(&encoded_request).expect("decode plan request");
+        let encoded_response = serde_json::to_vec(&response).expect("encode plan response");
+        let decoded_response = serde_json::from_slice::<PlanResponse>(&encoded_response)
+            .expect("decode plan response");
+
+        assert_eq!(decoded_request, request);
+        assert_eq!(decoded_response, response);
+    }
+
+    #[test]
+    fn structured_dimension_discovery_contract_round_trip_preserves_values() {
+        let discovery = StructuredDimensionDiscoveryResult {
+            view_id: "safe_customer_view_public".to_string(),
+            available_dimensions: vec!["plan_tier".to_string(), "status".to_string()],
+            metrics: vec![StructuredMetricDescriptor {
+                name: "count".to_string(),
+                field: "customer_id".to_string(),
+            }],
+            dimensions: vec![
+                StructuredDimensionDescriptor {
+                    field: "plan_tier".to_string(),
+                    top_values: vec![
+                        StructuredDimensionValueCount {
+                            value: "starter".to_string(),
+                            count: 9,
+                        },
+                        StructuredDimensionValueCount {
+                            value: "premium".to_string(),
+                            count: 4,
+                        },
+                    ],
+                    drilldown_supported: true,
+                },
+                StructuredDimensionDescriptor {
+                    field: "status".to_string(),
+                    top_values: vec![StructuredDimensionValueCount {
+                        value: "active".to_string(),
+                        count: 10,
+                    }],
+                    drilldown_supported: true,
+                },
+            ],
+            filters_applied: Some(serde_json::json!({ "status": "active" })),
+        };
+        let drilldown = StructuredDrilldownHint {
+            dimension: "status".to_string(),
+            filter_spec: serde_json::json!({ "plan_tier": "starter" }),
+        };
+
+        let encoded_discovery = serde_json::to_vec(&discovery).expect("encode discovery contract");
+        let decoded_discovery =
+            serde_json::from_slice::<StructuredDimensionDiscoveryResult>(&encoded_discovery)
+                .expect("decode discovery contract");
+        let encoded_drilldown = serde_json::to_vec(&drilldown).expect("encode drilldown contract");
+        let decoded_drilldown =
+            serde_json::from_slice::<StructuredDrilldownHint>(&encoded_drilldown)
+                .expect("decode drilldown contract");
+
+        assert_eq!(decoded_discovery, discovery);
+        assert_eq!(decoded_drilldown, drilldown);
     }
 
     #[test]
@@ -440,6 +865,7 @@ mod tests {
                 claims: Vec::new(),
                 coverage_threshold: 0.95,
                 coverage_observed: 1.0,
+                clarification_prompt: None,
                 notes: None,
             },
             operator_calls_used: 2,
@@ -447,6 +873,59 @@ mod tests {
             depth_used: 2,
             evidence_ref_count: 0,
             evidence_unit_ids: Vec::new(),
+            planner_traces: vec![ReplayPlannerTrace {
+                plan_request: PlanRequest {
+                    schema_version: PLANNER_CONTRACT_SCHEMA_VERSION,
+                    query: "status".to_string(),
+                    budget: Budget {
+                        max_operator_calls: 10,
+                        max_bytes: 2048,
+                        max_wallclock_ms: 1000,
+                        max_recursion_depth: 3,
+                        max_parallelism: Some(1),
+                    },
+                    planner_hints: PlannerHints {
+                        intent: PlannerIntent::StructuredLookup,
+                        recommended_path: vec![PlannerStep::Operator {
+                            op_name: "fetch_rows".to_string(),
+                            params: serde_json::json!({
+                                "view_id": "safe_customer_view_public",
+                                "fields": ["status", "plan_tier"],
+                            }),
+                        }],
+                    },
+                    recovery_context: None,
+                    available_operator_names: vec![
+                        "fetch_rows".to_string(),
+                        "lookup_evidence".to_string(),
+                    ],
+                    allow_search_ref_fetch_span: true,
+                },
+                output_steps: vec![PlannerStep::Operator {
+                    op_name: "fetch_rows".to_string(),
+                    params: serde_json::json!({
+                        "view_id": "safe_customer_view_public",
+                        "fields": ["status", "plan_tier"],
+                    }),
+                }],
+                decision_summary: ReplayPlannerDecisionSummary {
+                    planner_source: "rust_owned".to_string(),
+                    stop_reason: "plan_complete".to_string(),
+                    selected_for_execution: true,
+                    used_fallback_plan: false,
+                    fallback_from_step: None,
+                    expected_usefulness_score: Some(0.91),
+                    expected_usefulness_reasons: vec![
+                        "starts with a direct structured lookup for a row-oriented question"
+                            .to_string(),
+                    ],
+                    selection_rationale: Some(
+                        "rust_owned was preferred because expected usefulness scored 0.9100; starts with a direct structured lookup for a row-oriented question."
+                            .to_string(),
+                    ),
+                    planner_summary: None,
+                },
+            }],
         };
 
         let encoded = serde_json::to_vec(&bundle).expect("encode replay bundle");
@@ -456,5 +935,6 @@ mod tests {
         assert_eq!(decoded.metadata.run_id, "run_01");
         assert_eq!(decoded.metadata.engine_mode, EngineMode::Baseline);
         assert_eq!(decoded.response_text, "UNKNOWN: no evidence");
+        assert_eq!(decoded.planner_traces.len(), 1);
     }
 }

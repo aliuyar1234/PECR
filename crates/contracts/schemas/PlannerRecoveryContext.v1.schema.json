@@ -1,0 +1,14 @@
+{
+  "$id": "pecr.schemas.PlannerRecoveryContext.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["failed_step", "failure_terminal_mode", "attempted_path"],
+  "properties": {
+    "failed_step": { "type": "string", "minLength": 1 },
+    "failure_terminal_mode": { "$ref": "pecr.schemas.TerminalMode.v1" },
+    "attempted_path": {
+      "type": "array",
+      "items": { "$ref": "pecr.schemas.PlannerStep.v1" }
+    }
+  }
+}

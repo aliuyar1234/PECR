@@ -38,7 +38,7 @@ services:
       RUST_LOG: info
       PECR_BIND_ADDR: 0.0.0.0:8080
       PECR_DEV_ALLOW_NONLOCAL_BIND: "${PECR_DEV_ALLOW_NONLOCAL_BIND:-1}"
-      PECR_LOCAL_AUTH_SHARED_SECRET: "${PECR_LOCAL_AUTH_SHARED_SECRET:-}"
+      PECR_LOCAL_AUTH_SHARED_SECRET: "${PECR_LOCAL_AUTH_SHARED_SECRET:-pecr-local-demo-secret}"
       PECR_DB_URL: postgres://pecr:pecr@postgres:5432/pecr
       PECR_OPA_URL: "${PECR_OPA_URL:-http://opa:8181}"
       PECR_OPA_TIMEOUT_MS: "${PECR_OPA_TIMEOUT_MS:-200}"
@@ -74,9 +74,10 @@ services:
       RUST_LOG: info
       PECR_CONTROLLER_BIND_ADDR: 0.0.0.0:8081
       PECR_DEV_ALLOW_NONLOCAL_BIND: "${PECR_DEV_ALLOW_NONLOCAL_BIND:-1}"
-      PECR_LOCAL_AUTH_SHARED_SECRET: "${PECR_LOCAL_AUTH_SHARED_SECRET:-}"
+      PECR_LOCAL_AUTH_SHARED_SECRET: "${PECR_LOCAL_AUTH_SHARED_SECRET:-pecr-local-demo-secret}"
       PECR_GATEWAY_URL: http://gateway:8080
       PECR_MODEL_PROVIDER: mock
+      PECR_CONTROLLER_ENGINE: "${PECR_CONTROLLER_ENGINE:-baseline}"
       PECR_BUDGET_DEFAULTS: '{"max_operator_calls":10,"max_bytes":1048576,"max_wallclock_ms":10000,"max_recursion_depth":5,"max_parallelism":4}'
       PECR_AUTH_MODE: "${PECR_AUTH_MODE:-local}"
       PECR_METRICS_REQUIRE_AUTH: "${PECR_METRICS_REQUIRE_AUTH:-1}"

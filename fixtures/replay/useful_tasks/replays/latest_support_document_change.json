@@ -1,0 +1,49 @@
+{
+  "budget": {
+    "max_bytes": 4096,
+    "max_operator_calls": 10,
+    "max_parallelism": 1,
+    "max_recursion_depth": 3,
+    "max_wallclock_ms": 1000
+  },
+  "bytes_used": 520,
+  "claim_map": {
+    "claim_map_id": "claim-map-latest-support-change",
+    "claims": [
+      {
+        "claim_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "claim_text": "fs_corpus/public/support_policy.txt version 2026-03-01: annual refund window is 30 days",
+        "evidence_unit_ids": [
+          "6666666666666666666666666666666666666666666666666666666666666666"
+        ],
+        "status": "SUPPORTED"
+      }
+    ],
+    "coverage_observed": 1.0,
+    "coverage_threshold": 0.95,
+    "terminal_mode": "SUPPORTED"
+  },
+  "depth_used": 3,
+  "evidence_ref_count": 1,
+  "evidence_unit_ids": [
+    "6666666666666666666666666666666666666666666666666666666666666666"
+  ],
+  "loop_terminal_mode": "SUPPORTED",
+  "metadata": {
+    "bundle_hash": "eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+    "engine_mode": "baseline",
+    "principal_id_hash": "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+    "quality_score": 93.0,
+    "recorded_at_unix_ms": 1700000102000,
+    "request_id": "req-useful-latest-support-change",
+    "run_id": "useful-latest-support-change",
+    "schema_version": 1,
+    "terminal_mode": "SUPPORTED",
+    "trace_id": "01ARZ3NDEKTSV4RRFFQ69G5FAC"
+  },
+  "operator_calls_used": 3,
+  "policy_snapshot_id": "policy-useful-latest-support-change",
+  "query": "What changed in the latest version of the support document?",
+  "response_text": "SUPPORTED: fs_corpus/public/support_policy.txt version 2026-03-01: annual refund window is 30 days",
+  "session_id": "session-useful-latest-support-change"
+}

@@ -10,6 +10,8 @@ pub struct PolicyDecision {
     pub reason: Option<String>,
     #[serde(default)]
     pub redaction: Option<Value>,
+    #[serde(default)]
+    pub narrowing: Option<Value>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

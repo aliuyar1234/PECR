@@ -1,0 +1,25 @@
+{
+  "$id": "pecr.schemas.PlanRequest.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "query",
+    "budget",
+    "planner_hints",
+    "available_operator_names",
+    "allow_search_ref_fetch_span"
+  ],
+  "properties": {
+    "schema_version": { "type": "integer", "minimum": 1 },
+    "query": { "type": "string", "minLength": 1 },
+    "budget": { "$ref": "pecr.schemas.Budget.v1" },
+    "planner_hints": { "$ref": "pecr.schemas.PlannerHints.v1" },
+    "recovery_context": { "$ref": "pecr.schemas.PlannerRecoveryContext.v1" },
+    "available_operator_names": {
+      "type": "array",
+      "items": { "type": "string", "minLength": 1 }
+    },
+    "allow_search_ref_fetch_span": { "type": "boolean" }
+  }
+}

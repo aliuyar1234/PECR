@@ -9,6 +9,7 @@ use ulid::Ulid;
 #[derive(Debug)]
 pub enum LedgerError {
     Timeout,
+    InvalidInput(String),
     Sqlx(sqlx::Error),
 }
 
@@ -16,6 +17,7 @@ impl std::fmt::Display for LedgerError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             LedgerError::Timeout => write!(f, "ledger operation timed out"),
+            LedgerError::InvalidInput(message) => write!(f, "ledger invalid input: {}", message),
             LedgerError::Sqlx(err) => write!(f, "ledger sql error: {}", err),
         }
     }
@@ -381,6 +383,7 @@ impl LedgerWriter {
     ) -> Result<(), LedgerError> {
         let evidence_unit_ids_json = serde_json::to_value(record.evidence_unit_ids)
             .unwrap_or_else(|_| serde_json::json!([]));
+        let bytes_used = checked_bigint_from_u64(record.bytes_used, "bytes_used")?;
 
         tokio::time::timeout(
             self.write_timeout,
@@ -392,7 +395,7 @@ impl LedgerWriter {
             .bind(record.session_token_hash)
             .bind(record.session_token_expires_at_epoch_ms)
             .bind(i64::from(record.operator_calls_used))
-            .bind(record.bytes_used as i64)
+            .bind(bytes_used)
             .bind(evidence_unit_ids_json)
             .bind(record.finalized)
             .execute(&self.pool),
@@ -442,8 +445,8 @@ impl LedgerWriter {
             budget,
             session_token_hash: row.try_get("session_token_hash")?,
             session_token_expires_at_epoch_ms: row.try_get("session_token_expires_at_epoch_ms")?,
-            operator_calls_used: operator_calls_used.max(0) as u32,
-            bytes_used: bytes_used.max(0) as u64,
+            operator_calls_used: checked_u32_from_i64(operator_calls_used, "operator_calls_used")?,
+            bytes_used: checked_u64_from_i64(bytes_used, "bytes_used")?,
             evidence_unit_ids,
             finalized: row.try_get("finalized")?,
         }))
@@ -485,6 +488,29 @@ fn parse_evidence_unit_ids_value(value: serde_json::Value) -> Vec<String> {
     }
 }
 
+fn checked_bigint_from_u64(value: u64, field: &str) -> Result<i64, LedgerError> {
+    i64::try_from(value)
+        .map_err(|_| LedgerError::InvalidInput(format!("{field} exceeds BIGINT range")))
+}
+
+fn checked_u32_from_i64(value: i64, field: &str) -> Result<u32, LedgerError> {
+    u32::try_from(value).map_err(|_| {
+        LedgerError::Sqlx(sqlx::Error::Decode(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid {field}: expected non-negative u32"),
+        ))))
+    })
+}
+
+fn checked_u64_from_i64(value: i64, field: &str) -> Result<u64, LedgerError> {
+    u64::try_from(value).map_err(|_| {
+        LedgerError::Sqlx(sqlx::Error::Decode(Box::new(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("invalid {field}: expected non-negative i64"),
+        ))))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -515,5 +541,24 @@ mod tests {
         let ids = parse_evidence_unit_ids_value(serde_json::json!(["a", 1, null, "b"]));
 
         assert_eq!(ids, vec!["a".to_string(), "b".to_string()]);
+    }
+
+    #[test]
+    fn checked_bigint_from_u64_rejects_values_above_i64_max() {
+        let err = checked_bigint_from_u64(i64::MAX as u64 + 1, "bytes_used").unwrap_err();
+
+        assert!(matches!(err, LedgerError::InvalidInput(_)));
+        assert_eq!(
+            err.to_string(),
+            "ledger invalid input: bytes_used exceeds BIGINT range"
+        );
+    }
+
+    #[test]
+    fn checked_u64_from_i64_rejects_negative_values() {
+        let err = checked_u64_from_i64(-1, "bytes_used").unwrap_err();
+
+        assert!(matches!(err, LedgerError::Sqlx(sqlx::Error::Decode(_))));
+        assert!(err.to_string().contains("invalid bytes_used"));
     }
 }
