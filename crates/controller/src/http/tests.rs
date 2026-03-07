@@ -2049,6 +2049,16 @@ fn run_request_rejects_unknown_fields() {
     assert!(err.to_string().contains("unknown field"));
 }
 
+#[test]
+fn replay_store_errors_map_to_service_unavailable() {
+    let err = map_replay_store_error(std::io::Error::other("disk offline"));
+
+    assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+    assert_eq!(err.1.0.code, "ERR_REPLAY_STORE");
+    assert_eq!(err.1.0.terminal_mode_hint, TerminalMode::SourceUnavailable);
+    assert!(err.1.0.retryable);
+}
+
 #[tokio::test]
 async fn capabilities_endpoint_proxies_gateway_safe_ask_catalog() {
     let (gateway_addr, gateway_shutdown, gateway_task) = spawn_run_gateway().await;

@@ -657,7 +657,7 @@ fn map_replay_store_error(err: std::io::Error) -> ApiError {
             false,
         ),
         _ => json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
+            StatusCode::SERVICE_UNAVAILABLE,
             "ERR_REPLAY_STORE",
             format!("replay store operation failed: {}", err),
             TerminalMode::SourceUnavailable,
