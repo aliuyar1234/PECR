@@ -6,7 +6,6 @@
 [![Latest Release](https://img.shields.io/github/v/release/aliuyar1234/pecr?display_name=tag&label=release&style=flat-square)](https://github.com/aliuyar1234/PECR/releases/latest)
 [![License](https://img.shields.io/github/license/aliuyar1234/PECR?style=flat-square)](LICENSE)
 
-Current stable tag: [`v1.2`](https://github.com/aliuyar1234/PECR/tree/v1.2)
 
 PECR is an RLM-first governed reasoning runtime for AI retrieval and synthesis. It keeps orchestration non-privileged, enforces policy at the data-access boundary, and only returns `SUPPORTED` answers when the gateway can prove claim-to-evidence coverage.
 
