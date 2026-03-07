@@ -4185,18 +4185,15 @@ async fn rlm_loop_default_bridge_short_circuits_synthetic_smoke_probe() {
     let _env_lock = RLM_SCRIPT_ENV_LOCK
         .lock()
         .expect("rlm script env lock should not be poisoned");
-    let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("..")
-        .join("..")
-        .join("scripts")
-        .join("rlm")
-        .join("pecr_rlm_bridge.py");
-    assert!(script_path.exists(), "rlm bridge script must exist");
-
     let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+    let previous_python = std::env::var("PECR_RLM_PYTHON").ok();
     // Safety: this test scopes env var mutation to setup/teardown in the same thread.
     unsafe {
-        std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+        std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+        std::env::set_var(
+            "PECR_RLM_PYTHON",
+            "definitely-missing-python-for-smoke-short-circuit",
+        );
     }
 
     let counter = Arc::new(AtomicUsize::new(0));
@@ -4236,6 +4233,17 @@ async fn rlm_loop_default_bridge_short_circuits_synthetic_smoke_probe() {
         // Safety: restoring the test-local env var mutation.
         unsafe {
             std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+        }
+    }
+    if let Some(previous) = previous_python {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::set_var("PECR_RLM_PYTHON", previous);
+        }
+    } else {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::remove_var("PECR_RLM_PYTHON");
         }
     }
 

@@ -3332,6 +3332,20 @@ fn plan_request_for_query(plan: &[BaselinePlanStep], query: &str, budget: &Budge
     build_plan_request(query, budget, planner_hints_for_query(plan, query), None)
 }
 
+#[cfg(feature = "rlm")]
+fn should_short_circuit_mock_perf_probe(
+    query: &str,
+    plan_request: &PlanRequest,
+    explicit_script_path: Option<&PathBuf>,
+) -> bool {
+    if explicit_script_path.is_some() {
+        return false;
+    }
+
+    query.eq_ignore_ascii_case("smoke")
+        && plan_request.planner_hints.intent == PlannerIntent::Default
+}
+
 fn recovery_plan_request_for_query(
     query: &str,
     budget: &Budget,
@@ -3372,6 +3386,52 @@ pub(super) async fn run_context_loop_rlm(
     let mut evidence_refs = Vec::<EvidenceUnitRef>::new();
     let mut evidence_units = Vec::<EvidenceUnit>::new();
 
+    let plan_request = plan_request_for_query(&state.config.baseline_plan, query_trimmed, budget);
+    let explicit_script_path = std::env::var("PECR_RLM_SCRIPT_PATH")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    if should_short_circuit_mock_perf_probe(
+        query_trimmed,
+        &plan_request,
+        explicit_script_path.as_ref(),
+    ) {
+        tracing::info!(
+            request_id = %ctx.request_id,
+            trace_id = %ctx.trace_id,
+            principal_id = %ctx.principal_id,
+            session_id = %ctx.session_id,
+            terminal_mode = %TerminalMode::InsufficientEvidence.as_str(),
+            stop_reason = "mock_perf_probe_short_circuit",
+            budget_violation = false,
+            operator_calls_used = 0,
+            depth_used = 0,
+            bytes_used = 0,
+            "controller.context_loop_completed"
+        );
+
+        let planner_traces = vec![replay_planner_trace(
+            plan_request,
+            Vec::new(),
+            "rlm_mock_inline",
+            "mock_perf_probe_short_circuit",
+            true,
+            None,
+        )];
+
+        return Ok(ContextLoopResult {
+            terminal_mode: TerminalMode::InsufficientEvidence,
+            response_text: Some("UNKNOWN: insufficient evidence to answer the query.".to_string()),
+            planner_traces,
+            evidence_refs,
+            evidence_units,
+            operator_calls_used: 0,
+            bytes_used: 0,
+            depth_used: 0,
+        });
+    }
+
     let python = std::env::var("PECR_RLM_PYTHON")
         .ok()
         .map(|s| s.trim().to_string())
@@ -3384,11 +3444,7 @@ pub(super) async fn run_context_loop_rlm(
             }
         });
 
-    let script_path = std::env::var("PECR_RLM_SCRIPT_PATH")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from)
+    let script_path = explicit_script_path
         .or_else(|| {
             let candidates = [
                 PathBuf::from("/usr/local/share/pecr/pecr_rlm_bridge.py"),
@@ -3469,7 +3525,6 @@ pub(super) async fn run_context_loop_rlm(
         }
     });
 
-    let plan_request = plan_request_for_query(&state.config.baseline_plan, query_trimmed, budget);
     let planner_hints = plan_request.planner_hints.clone();
     let mut planner_output_steps = Vec::<PlannerStep>::new();
     let start_msg = serde_json::json!({
