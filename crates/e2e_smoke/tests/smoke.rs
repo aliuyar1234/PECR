@@ -4256,7 +4256,12 @@ fn configured_e2e_replay_store_dir() -> Option<PathBuf> {
 fn preserve_configured_e2e_replay_store() -> bool {
     std::env::var("PECR_E2E_PRESERVE_REPLAY_STORE")
         .ok()
-        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+        .is_some_and(|value| {
+            matches!(
+                value.trim().to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
 }
 
 async fn stop_stack_opa(stack: &mut RealStack) {
