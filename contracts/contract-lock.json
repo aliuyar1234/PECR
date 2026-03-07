@@ -31,7 +31,7 @@
     "crates/contracts/schemas/TerminalMode.v1.schema.json": "330c335057f5b4c6e2ce1f8dc61f1583ee2f23cb4828d6be881d4957e7520a1c",
     "crates/contracts/schemas/TraceEvent.v1.schema.json": "beced50b5ae0c2bc5523635db3a1735efd3e75be702f22fff874ce6f793747a7",
     "docs/openapi/contract_manifest.json": "394484336b7024c93a2d29241edfb3ec0bafa3a71580483d0bf4f1cd16584801",
-    "docs/openapi/pecr.v1.yaml": "00d7066c46da4f1d3a55324e1297f335d40a35f8f26dc4a23c2562ab5e119999"
+    "docs/openapi/pecr.v1.yaml": "5c88992ec31dee786981235b1fe287a9eedb0e6640e16c8714dd8c9a3d22a5be"
   },
   "generated_by": "scripts/contracts/update_contract_lock.py",
   "schema_version": 1
