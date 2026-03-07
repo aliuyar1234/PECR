@@ -2565,15 +2565,13 @@ async fn observability_coverage_suite_required_signals_exist() {
         body
     );
 
-    let replay_list = client
-        .get(format!("http://{}/v1/replays", controller_addr))
-        .header("x-pecr-principal-id", "dev")
-        .send()
-        .await
-        .expect("replay list request should succeed")
-        .json::<serde_json::Value>()
-        .await
-        .expect("replay list response should be JSON");
+    let replay_list = wait_for_replay_list_contains_traces(
+        &client,
+        controller_addr,
+        "dev",
+        &[trace_id.to_string()],
+    )
+    .await;
     let replays = replay_list
         .get("replays")
         .and_then(|v| v.as_array())
@@ -3310,17 +3308,9 @@ async fn useful_real_stack_suite_exercises_named_queries() {
         );
     }
 
-    let replay_list = client
-        .get(format!("http://{}/v1/replays", stack.controller_addr))
-        .header("x-pecr-principal-id", "dev")
-        .send()
-        .await
-        .expect("replay list request should succeed");
-    assert!(replay_list.status().is_success());
-    let replay_list_body = replay_list
-        .json::<serde_json::Value>()
-        .await
-        .expect("replay list response should be JSON");
+    let replay_list_body =
+        wait_for_replay_list_contains_traces(&client, stack.controller_addr, "dev", &trace_ids)
+            .await;
     let replays = replay_list_body
         .get("replays")
         .and_then(|value| value.as_array())
@@ -3963,6 +3953,48 @@ async fn wait_for_http_status(client: &reqwest::Client, url: &str, expected: Sta
     }
 
     panic!("server did not reach status {} at {}", expected, url);
+}
+
+async fn wait_for_replay_list_contains_traces(
+    client: &reqwest::Client,
+    controller_addr: SocketAddr,
+    principal_id: &str,
+    trace_ids: &[String],
+) -> serde_json::Value {
+    let url = format!("http://{}/v1/replays", controller_addr);
+
+    for _ in 0..50 {
+        let response = client
+            .get(&url)
+            .header("x-pecr-principal-id", principal_id)
+            .send()
+            .await;
+        if let Ok(response) = response
+            && response.status().is_success()
+        {
+            let body = response
+                .json::<serde_json::Value>()
+                .await
+                .expect("replay list response should be JSON");
+            let replays = body
+                .get("replays")
+                .and_then(|value| value.as_array())
+                .expect("replay list should include replays array");
+            if trace_ids.iter().all(|trace_id| {
+                replays.iter().any(|replay| {
+                    replay.get("trace_id").and_then(|value| value.as_str()) == Some(trace_id)
+                })
+            }) {
+                return body;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!(
+        "replay list did not contain trace ids {:?} at {}",
+        trace_ids, url
+    );
 }
 
 async fn controller_run_query(
