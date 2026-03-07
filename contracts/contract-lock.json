@@ -29,7 +29,7 @@
     "crates/contracts/schemas/TerminalMode.v1.schema.json": "c8d814fcca97d63c70a1577b687a87d9f7f0867a129a75f6f7d31b08125ab87c",
     "crates/contracts/schemas/TraceEvent.v1.schema.json": "cb36d57f55971db09c3f4da68996694380f0fba8c157a6feaf1c1df5a8402cd1",
     "docs/openapi/contract_manifest.json": "3d1eff25fd28813ac0217cf39b32928d37b1bc62d9ac0aeb944aa0f88fe51df4",
-    "docs/openapi/pecr.v1.yaml": "e841891d4ff1377b6afe40b722d91124daafb79f708e63e343b2bd942954a699"
+    "docs/openapi/pecr.v1.yaml": "950d09c1b0e9673cd296a026bc5af23ba6218afae4c66062d09fb5b3a64e4473"
   },
   "generated_by": "scripts/contracts/update_contract_lock.py",
   "schema_version": 1

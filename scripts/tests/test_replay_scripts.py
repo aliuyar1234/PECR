@@ -14,6 +14,27 @@ USEFUL_TASK_FIXTURE_DIR = ROOT / "fixtures" / "replay" / "useful_tasks"
 USEFUL_TASK_MANIFEST = USEFUL_TASK_FIXTURE_DIR / "benchmark_manifest.json"
 
 
+def has_working_mix() -> bool:
+    mix_cmd = shutil.which("mix") or shutil.which("mix.bat") or shutil.which("mix.cmd")
+    if not mix_cmd:
+        return False
+    try:
+        result = subprocess.run(
+            [mix_cmd, "--version"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            check=False,
+            timeout=10,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return result.returncode == 0
+
+
+HAS_WORKING_MIX = has_working_mix()
+
+
 def make_planner_trace(
     *,
     planner_source: str,
@@ -469,10 +490,7 @@ class ReplayScriptTests(unittest.TestCase):
         self.assertEqual(scorecards["beam_planner"]["benchmark_pass_rate"], 1.0)
         self.assertEqual(scorecards["beam_planner"]["fallback_rate"], 1.0)
 
-    @unittest.skipUnless(
-        shutil.which("mix") or shutil.which("mix.bat") or shutil.which("mix.cmd"),
-        "mix not installed",
-    )
+    @unittest.skipUnless(HAS_WORKING_MIX, "mix not installed")
     def test_run_beam_usefulness_job_wrapper_returns_json(self):
         cmd = [
             sys.executable,
@@ -490,6 +508,7 @@ class ReplayScriptTests(unittest.TestCase):
         self.assertEqual(payload["job_status"], "succeeded")
         self.assertIn("useful_answer_benchmark_v1", payload["output"])
 
+    @unittest.skipUnless(HAS_WORKING_MIX, "mix not installed")
     def test_beam_shadow_http_bridge_returns_contract_response(self):
         port = "9199"
         process = subprocess.Popen(
