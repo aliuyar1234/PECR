@@ -29,7 +29,7 @@
     },
     "rlm": {
       "controller_baseline": {
-        "expected_terminal_mode": "SUPPORTED"
+        "expected_terminal_mode": "INSUFFICIENT_EVIDENCE"
       },
       "useful_controller_baseline": {
         "expected_terminal_mode": "SUPPORTED"
