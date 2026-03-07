@@ -348,19 +348,25 @@ async fn run(
             evidence_unit_ids,
             planner_traces,
         };
-        if let Err(err) = run_replay_store_io(&state, move |replay_store| {
-            replay_store.persist_run(persisted_run)
-        })
-        .await
-        {
-            tracing::warn!(
-                request_id = %request_id,
-                trace_id = %run_response.trace_id,
-                principal_id = %principal_id,
-                error = %err,
-                "controller.replay_persist_failed"
-            );
-        }
+        let replay_state = state.clone();
+        let replay_request_id = request_id.clone();
+        let replay_trace_id = run_response.trace_id.clone();
+        let replay_principal_id = principal_id.clone();
+        tokio::spawn(async move {
+            if let Err(err) = run_replay_store_io(&replay_state, move |replay_store| {
+                replay_store.persist_run(persisted_run)
+            })
+            .await
+            {
+                tracing::warn!(
+                    request_id = %replay_request_id,
+                    trace_id = %replay_trace_id,
+                    principal_id = %replay_principal_id,
+                    error = %err,
+                    "controller.replay_persist_failed"
+                );
+            }
+        });
 
         Ok(Json(run_response))
     }

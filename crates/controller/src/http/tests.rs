@@ -9,9 +9,9 @@ use pecr_contracts::{
     Budget, Claim, ClaimEvidenceSnippet, ClaimMap, ClaimStatus, ClarificationPrompt,
     ClientResponseKind, EngineComparisonSummary, EngineMode, PLANNER_CONTRACT_SCHEMA_VERSION,
     PlanRequest, PlanResponse, PlannerHints, PlannerIntent, PlannerRecoveryContext, PlannerStep,
-    ReplayBundle, ReplayEvaluationResult, ReplayEvaluationSubmission, ReplayPlannerDecisionSummary,
-    ReplayPlannerTrace, ReplayRunScore, RunQualityScorecard, SafeAskCapability, SafeAskCatalog,
-    TerminalMode,
+    ReplayBundle, ReplayBundleMetadata, ReplayEvaluationResult, ReplayEvaluationSubmission,
+    ReplayPlannerDecisionSummary, ReplayPlannerTrace, ReplayRunScore, RunQualityScorecard,
+    SafeAskCapability, SafeAskCatalog, TerminalMode,
 };
 use std::collections::BTreeSet;
 #[cfg(feature = "rlm")]
@@ -25,6 +25,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::Duration;
 #[cfg(feature = "rlm")]
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::net::TcpListener;
@@ -1746,6 +1747,28 @@ async fn spawn_run_gateway() -> (SocketAddr, oneshot::Sender<()>, tokio::task::J
     (addr, shutdown_tx, handle)
 }
 
+async fn wait_for_replays(
+    state: &AppState,
+    principal_hash: &str,
+    minimum: usize,
+) -> Vec<ReplayBundleMetadata> {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let replays = state
+            .replay_store
+            .list_replay_metadata(principal_hash, 10, None)
+            .expect("replay list should succeed");
+        if replays.len() >= minimum {
+            return replays;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "timed out waiting for replay persistence"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
 fn controller_state(
     gateway_addr: SocketAddr,
     budget: Budget,
@@ -2068,10 +2091,7 @@ async fn run_returns_supported_claims_and_persists_replay() {
     assert!(response.0.response_text.contains("Source:"));
 
     let principal_hash = hash_principal_id("dev");
-    let replays = state
-        .replay_store
-        .list_replay_metadata(&principal_hash, 10, None)
-        .expect("replay list should succeed");
+    let replays = wait_for_replays(&state, &principal_hash, 1).await;
     assert_eq!(replays.len(), 1);
 
     let replay = state
@@ -2082,6 +2102,111 @@ async fn run_returns_supported_claims_and_persists_replay() {
     assert_eq!(replay.metadata.terminal_mode, TerminalMode::Supported);
     assert!(
         replay
+            .claim_map
+            .claims
+            .iter()
+            .any(|claim| claim.status == ClaimStatus::Supported
+                && !claim.evidence_unit_ids.is_empty())
+    );
+}
+
+#[cfg(feature = "rlm")]
+#[tokio::test]
+async fn run_rlm_unknown_only_loop_text_still_returns_supported_finalize_output() {
+    let _env_lock = RLM_SCRIPT_ENV_LOCK
+        .lock()
+        .expect("rlm script env lock should not be poisoned");
+    let script_path = write_temp_bridge_script(
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+json.loads(sys.stdin.readline())
+sys.stdout.write(json.dumps({"type": "start_ack", "protocol_version": 1}) + "\n")
+sys.stdout.flush()
+
+call_id = "rows_1"
+sys.stdout.write(json.dumps({
+    "type": "call_operator",
+    "id": call_id,
+    "depth": 0,
+    "op_name": "fetch_rows",
+    "params": {"view_id": "safe_customer_view_public"}
+}) + "\n")
+sys.stdout.flush()
+
+resp = json.loads(sys.stdin.readline())
+if resp.get("type") != "operator_result" or resp.get("id") != call_id:
+    raise SystemExit("unexpected operator response")
+
+sys.stdout.write(json.dumps({"type": "done", "final_answer": "UNKNOWN: plan request captured"}) + "\n")
+sys.stdout.flush()
+"#,
+    );
+
+    let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+    // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+    unsafe {
+        std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+    }
+
+    let budget = Budget {
+        max_operator_calls: 10,
+        max_bytes: 1024 * 1024,
+        max_wallclock_ms: 10_000,
+        max_recursion_depth: 10,
+        max_parallelism: Some(2),
+    };
+    let (gateway_addr, shutdown, task) = spawn_run_gateway().await;
+    let mut state = controller_state(
+        gateway_addr,
+        budget.clone(),
+        crate::config::default_baseline_plan(),
+    );
+    state.config.controller_engine = crate::config::ControllerEngine::Rlm;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-pecr-principal-id", HeaderValue::from_static("dev"));
+    headers.insert(
+        "x-pecr-request-id",
+        HeaderValue::from_static("req-rlm-finalize-fix"),
+    );
+    headers.insert(
+        "x-pecr-trace-id",
+        HeaderValue::from_static("trace-rlm-finalize-fix"),
+    );
+
+    let response = run(
+        State(state),
+        headers,
+        Json(RunRequest {
+            query: "What is the customer status and plan tier?".to_string(),
+            budget: None,
+        }),
+    )
+    .await
+    .expect("run should succeed");
+
+    shutdown.send(()).ok();
+    let _ = task.await;
+    if let Some(previous) = previous_script_path {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+        }
+    } else {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+        }
+    }
+    let _ = fs::remove_file(&script_path);
+
+    assert_eq!(response.0.terminal_mode, TerminalMode::Supported);
+    assert!(response.0.response_text.contains("SUPPORTED:"));
+    assert!(
+        response
+            .0
             .claim_map
             .claims
             .iter()
