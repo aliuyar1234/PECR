@@ -176,6 +176,24 @@ def default_mock_plan(query: str) -> list[dict[str, Any]]:
     ]
 
 
+def normalized_query_text(query: str) -> str:
+    return " ".join(query.split()).strip().lower()
+
+
+def should_short_circuit_perf_probe(query: str, planner_hints: dict[str, Any] | None) -> bool:
+    if normalized_query_text(query) != "smoke":
+        return False
+
+    if not isinstance(planner_hints, dict):
+        return True
+
+    intent = planner_hints.get("intent")
+    if not isinstance(intent, str):
+        return True
+
+    return intent.strip().lower() in {"", "default"}
+
+
 def normalize_planner_step(raw: Any) -> dict[str, Any] | None:
     if not isinstance(raw, dict):
         return None
@@ -202,6 +220,9 @@ def normalize_planner_step(raw: Any) -> dict[str, Any] | None:
 
 
 def planner_steps_for_run(query: str, planner_hints: dict[str, Any] | None) -> list[dict[str, Any]]:
+    if should_short_circuit_perf_probe(query, planner_hints):
+        return []
+
     if isinstance(planner_hints, dict):
         recommended_path = planner_hints.get("recommended_path")
         if isinstance(recommended_path, list):

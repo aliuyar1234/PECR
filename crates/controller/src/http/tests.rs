@@ -4179,6 +4179,75 @@ sys.stdout.flush()
     assert_eq!(counter.load(Ordering::Relaxed), 0);
 }
 
+#[cfg(feature = "rlm")]
+#[tokio::test]
+async fn rlm_loop_default_bridge_short_circuits_synthetic_smoke_probe() {
+    let _env_lock = RLM_SCRIPT_ENV_LOCK
+        .lock()
+        .expect("rlm script env lock should not be poisoned");
+    let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("scripts")
+        .join("rlm")
+        .join("pecr_rlm_bridge.py");
+    assert!(script_path.exists(), "rlm bridge script must exist");
+
+    let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+    // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+    unsafe {
+        std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let (gateway_addr, shutdown, task) = spawn_mock_gateway(counter.clone()).await;
+
+    let budget = Budget {
+        max_operator_calls: 10,
+        max_bytes: 1024 * 1024,
+        max_wallclock_ms: 10_000,
+        max_recursion_depth: 10,
+        max_parallelism: Some(2),
+    };
+    let state = controller_state(
+        gateway_addr,
+        budget.clone(),
+        crate::config::default_baseline_plan(),
+    );
+    let ctx = GatewayCallContext {
+        principal_id: "dev",
+        authz_header: None,
+        local_auth_shared_secret: None,
+        request_id: "req_test_rlm_smoke_probe",
+        trace_id: "trace_test_rlm_smoke_probe",
+        session_token: "token",
+        session_id: "session",
+    };
+    let result = run_context_loop_rlm(&state, ctx, "smoke", &budget).await;
+
+    shutdown.send(()).ok();
+    let _ = task.await;
+    if let Some(previous) = previous_script_path {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+        }
+    } else {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+        }
+    }
+
+    let result = result.expect("rlm context loop should succeed");
+    assert_eq!(
+        result.response_text.as_deref(),
+        Some("UNKNOWN: insufficient evidence to answer the query.")
+    );
+    assert_eq!(result.operator_calls_used, 0);
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
 #[tokio::test]
 async fn context_loop_returns_structured_narrowing_guidance_for_broad_query() {
     let counter = Arc::new(AtomicUsize::new(0));

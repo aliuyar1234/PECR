@@ -128,6 +128,81 @@ class RlmBridgeTests(unittest.TestCase):
         self.assertEqual(result["operator_calls_used"], 1)
         self.assertEqual(result["depth_used"], 1)
 
+    def test_run_mock_short_circuits_default_smoke_probe_even_with_recommended_path(self):
+        bridge = FakeBridge()
+        budget = self.mod.Budget(
+            max_operator_calls=10,
+            max_bytes=1024 * 1024,
+            max_wallclock_ms=10_000,
+            max_recursion_depth=5,
+            max_parallelism=2,
+        )
+
+        result = self.mod.run_mock(
+            bridge,
+            "smoke",
+            budget,
+            planner_hints={
+                "intent": "default",
+                "recommended_path": [
+                    {
+                        "kind": "operator",
+                        "op_name": "fetch_rows",
+                        "params": {
+                            "view_id": "safe_customer_view_public",
+                            "fields": ["status", "plan_tier"],
+                        },
+                    },
+                    {
+                        "kind": "operator",
+                        "op_name": "search",
+                        "params": {"query": "smoke", "limit": 5},
+                    },
+                ],
+            },
+        )
+
+        self.assertEqual(bridge.operator_calls, [])
+        self.assertEqual(bridge.batch_calls, [])
+        self.assertEqual(result["operator_calls_used"], 0)
+        self.assertEqual(result["depth_used"], 0)
+
+    def test_run_mock_keeps_non_default_smoke_hint_on_normal_path(self):
+        bridge = FakeBridge()
+        budget = self.mod.Budget(
+            max_operator_calls=10,
+            max_bytes=1024 * 1024,
+            max_wallclock_ms=10_000,
+            max_recursion_depth=5,
+            max_parallelism=1,
+        )
+
+        result = self.mod.run_mock(
+            bridge,
+            "smoke",
+            budget,
+            planner_hints={
+                "intent": "structured_lookup",
+                "recommended_path": [
+                    {
+                        "kind": "operator",
+                        "op_name": "fetch_rows",
+                        "params": {
+                            "view_id": "safe_customer_view_public",
+                            "fields": ["status", "plan_tier"],
+                        },
+                    }
+                ],
+            },
+        )
+
+        self.assertEqual(bridge.operator_calls, [(0, "fetch_rows", {
+            "view_id": "safe_customer_view_public",
+            "fields": ["status", "plan_tier"],
+        })])
+        self.assertEqual(result["operator_calls_used"], 1)
+        self.assertEqual(result["depth_used"], 1)
+
     def test_run_mock_prefers_evidence_lookup_planner_hint(self):
         bridge = FakeBridge()
         budget = self.mod.Budget(
