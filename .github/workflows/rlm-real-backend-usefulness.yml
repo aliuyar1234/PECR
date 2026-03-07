@@ -1,0 +1,113 @@
+name: rlm-real-backend-usefulness
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rlm_real_backend_usefulness:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pecr
+          POSTGRES_PASSWORD: pecr
+          POSTGRES_DB: pecr
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pecr -d pecr"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check RLM real-backend config
+        id: cfg
+        shell: bash
+        env:
+          PECR_RLM_MODEL_NAME: ${{ vars.PECR_RLM_OPENAI_MODEL_NAME }}
+          PECR_RLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [[ -n "${PECR_RLM_MODEL_NAME}" && -n "${PECR_RLM_API_KEY}" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Configured real backend usefulness lane." | tee artifacts/rlm_real_backend_usefulness.log
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping real backend usefulness lane: configure repo variable PECR_RLM_OPENAI_MODEL_NAME and secret OPENAI_API_KEY." | tee artifacts/rlm_real_backend_usefulness.log
+          fi
+
+      - name: Set up Rust toolchain
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.91.1
+
+      - name: Cache cargo
+        if: steps.cfg.outputs.enabled == 'true'
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Install vendored RLM Python dependencies
+        if: steps.cfg.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e ./vendor/rlm
+
+      - name: Run real backend bridge smoke
+        if: steps.cfg.outputs.enabled == 'true'
+        shell: bash
+        env:
+          PECR_RLM_BACKEND: openai
+          PECR_RLM_MODEL_NAME: ${{ vars.PECR_RLM_OPENAI_MODEL_NAME }}
+          PECR_RLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PECR_RLM_BASE_URL: ${{ vars.PECR_RLM_BASE_URL }}
+          PECR_RLM_MAX_ITERATIONS: "4"
+        run: |
+          set -euo pipefail
+          python3 -B scripts/rlm/openai_bridge_smoke.py 2>&1 | tee -a artifacts/rlm_real_backend_usefulness.log
+
+      - name: Run real backend usefulness comparison
+        if: steps.cfg.outputs.enabled == 'true'
+        shell: bash
+        env:
+          PECR_TEST_DB_URL: postgres://pecr:pecr@localhost:5432/pecr
+          PECR_E2E_REQUIRE_DB_URL: "1"
+          PECR_E2E_REPLAY_STORE_DIR: target/rlm-real-backend-usefulness-replay
+          PECR_E2E_PRESERVE_REPLAY_STORE: "1"
+          PECR_RLM_SANDBOX_ACK: "1"
+          PECR_RLM_AUTO_FALLBACK_TO_BASELINE: "0"
+          PECR_BASELINE_SHADOW_PERCENT: "0"
+          PECR_RLM_BACKEND: openai
+          PECR_RLM_MODEL_NAME: ${{ vars.PECR_RLM_OPENAI_MODEL_NAME }}
+          PECR_RLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PECR_RLM_BASE_URL: ${{ vars.PECR_RLM_BASE_URL }}
+          PECR_RLM_MAX_ITERATIONS: "4"
+        run: |
+          set -euo pipefail
+          rm -rf target/rlm-real-backend-usefulness-replay
+          mkdir -p artifacts target/rlm-real-backend-usefulness-replay
+          cargo test -p e2e_smoke --features pecr-controller/rlm useful_rlm_real_stack_matches_or_beats_baseline_named_queries -- --nocapture 2>&1 | tee -a artifacts/rlm_real_backend_usefulness.log
+
+      - name: Generate real backend usefulness report
+        if: steps.cfg.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/replay/nightly_usefulness_report.py \
+            --store target/rlm-real-backend-usefulness-replay \
+            --evaluation-name "rlm-real-backend-usefulness" \
+            --output-json artifacts/rlm_real_backend_usefulness.json \
+            --output-md artifacts/rlm_real_backend_usefulness.md
+
+      - name: Upload usefulness artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rlm-real-backend-usefulness
+          path: artifacts
+          if-no-files-found: error

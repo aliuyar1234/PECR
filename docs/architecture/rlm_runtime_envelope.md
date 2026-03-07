@@ -101,7 +101,11 @@ The first supported backend envelope should behave differently by environment:
 ### CI
 
 - normal PR lanes should stay deterministic unless a dedicated secret-backed RLM lane is intentionally provided
-- once the real backend lane exists, it should run in a dedicated integration or nightly path first
+- dedicated manual secret-backed lanes now exist for bridge smoke and named usefulness validation:
+  - `.github/workflows/rlm-real-backend-smoke.yml`
+  - `.github/workflows/rlm-real-backend-usefulness.yml`
+- the usefulness lane should keep replay artifacts and run with baseline auto-fallback disabled so it proves the real backend path directly
+- once the real backend lane is promoted beyond manual use, it should move into a dedicated integration or nightly path first
 - promotion to blocking CI should happen only after bridge stability, perf stability, and finalize correctness are proven
 
 ### Pre-release and production

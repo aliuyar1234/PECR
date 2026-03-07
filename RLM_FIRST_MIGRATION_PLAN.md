@@ -220,6 +220,30 @@ Gate for completion:
 - [x] Any remaining shadow or reference path is intentional, documented, and low-maintenance.
 - [x] The product story, architecture docs, and runtime defaults all agree.
 
+## Phase 6: Productionize The Real RLM Backend
+
+Goal: graduate from an opt-in real-backend seam to a supported real-backend operating lane.
+
+- [x] Add a secret-backed real-backend usefulness lane that exercises bridge smoke plus named useful RLM scenarios on the actual backend.
+  Files: `.github/workflows/rlm-real-backend-usefulness.yml`, `RUNBOOK.md`, `docs/architecture/rlm_runtime_envelope.md`
+- [ ] Add backend-specific observability and runbook coverage for rate limits, credential expiry, backend timeouts, and provider drift.
+  Files: `docs/observability/`, `RUNBOOK.md`, dashboards and alerts
+- [ ] Define the promotion gate from manual real-backend validation into a scheduled or pre-release required lane.
+  Files: `.github/workflows/`, `RUNBOOK.md`, `docs/architecture/rlm_runtime_envelope.md`
+- [ ] Decide whether the real backend remains opt-in locally or gets a first-class supported development profile beyond mock-default compose.
+  Files: `docker-compose.yml`, `README.md`, `docs/architecture/rlm_runtime_envelope.md`
+
+Gate for completion:
+
+- [ ] The secret-backed real-backend usefulness lane is green on repeated runs with replay-visible artifacts.
+- [ ] Useful-answer and finalize semantics remain correct on the real backend lane without hidden dependence on baseline fallback.
+- [ ] Credential, cost, and backend-incident response guidance are documented for operators.
+- [ ] The promotion criteria for broader release automation are explicit and approved.
+
+Implementation note:
+
+- Phase 6 is started in-repo with a manual secret-backed real-backend usefulness workflow.
+
 ## Cross-Phase Rules
 
 These apply to every phase:

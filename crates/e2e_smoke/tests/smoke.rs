@@ -3237,6 +3237,7 @@ struct RealStack {
     schema_name: String,
     fs_corpus_root: PathBuf,
     replay_store_dir: PathBuf,
+    preserve_replay_store: bool,
     gateway_addr: SocketAddr,
     gateway_shutdown: Option<oneshot::Sender<()>>,
     gateway_task: Option<tokio::task::JoinHandle<()>>,
@@ -3516,11 +3517,13 @@ async fn useful_rlm_real_stack_matches_or_beats_baseline_named_queries() {
     let log_buf = init_test_tracing();
     let log_start = log_snapshot(&log_buf);
     let client = reqwest::Client::new();
-    let shared_replay_store_dir = std::env::temp_dir().join(format!(
-        "pecr_useful_compare_replays_{}_{}",
-        std::process::id(),
-        next_suffix()
-    ));
+    let shared_replay_store_dir = configured_e2e_replay_store_dir().unwrap_or_else(|| {
+        std::env::temp_dir().join(format!(
+            "pecr_useful_compare_replays_{}_{}",
+            std::process::id(),
+            next_suffix()
+        ))
+    });
 
     let mut baseline_stack = spawn_real_stack(&db_url, Some(shared_replay_store_dir.clone())).await;
     run_useful_real_stack_named_queries(
@@ -4094,13 +4097,16 @@ async fn spawn_real_stack_with_controller_overrides(
     let (schema_pool, schema_name, schema_url) = create_test_schema(base_db_url).await;
     apply_pg_fixtures(&schema_url, &pg_fixtures_sql).await;
 
-    let replay_store_dir = replay_store_dir.unwrap_or_else(|| {
-        std::env::temp_dir().join(format!(
-            "pecr_e2e_replays_{}_{}",
-            std::process::id(),
-            next_suffix()
-        ))
-    });
+    let preserve_replay_store = preserve_configured_e2e_replay_store();
+    let replay_store_dir = replay_store_dir
+        .or_else(configured_e2e_replay_store_dir)
+        .unwrap_or_else(|| {
+            std::env::temp_dir().join(format!(
+                "pecr_e2e_replays_{}_{}",
+                std::process::id(),
+                next_suffix()
+            ))
+        });
 
     let opa_app = Router::new()
         .route("/health", get(opa_health))
@@ -4202,6 +4208,7 @@ async fn spawn_real_stack_with_controller_overrides(
         schema_name,
         fs_corpus_root,
         replay_store_dir,
+        preserve_replay_store,
         gateway_addr,
         gateway_shutdown: Some(gateway_shutdown),
         gateway_task: Some(gateway_task),
@@ -4235,9 +4242,21 @@ async fn shutdown_real_stack(mut stack: RealStack) {
     }
 
     remove_test_path(&stack.fs_corpus_root);
-    remove_test_path(&stack.replay_store_dir);
+    if !stack.preserve_replay_store {
+        remove_test_path(&stack.replay_store_dir);
+    }
     drop_test_schema(&stack.schema_pool, &stack.schema_name).await;
     stack.schema_pool.close().await;
+}
+
+fn configured_e2e_replay_store_dir() -> Option<PathBuf> {
+    std::env::var_os("PECR_E2E_REPLAY_STORE_DIR").map(PathBuf::from)
+}
+
+fn preserve_configured_e2e_replay_store() -> bool {
+    std::env::var("PECR_E2E_PRESERVE_REPLAY_STORE")
+        .ok()
+        .is_some_and(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
 }
 
 async fn stop_stack_opa(stack: &mut RealStack) {

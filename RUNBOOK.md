@@ -134,6 +134,14 @@ Manual GitHub Actions lane:
 - configure repo variable `PECR_RLM_OPENAI_MODEL_NAME`
 - configure secret `OPENAI_API_KEY`
 
+Manual real-backend usefulness lane:
+
+- `.github/workflows/rlm-real-backend-usefulness.yml`
+- runs the bridge smoke first, then the named usefulness comparison suite against the real backend with `PECR_RLM_AUTO_FALLBACK_TO_BASELINE=0`
+- writes replay-backed artifacts to `target/rlm-real-backend-usefulness-replay` during the run and uploads a usefulness JSON/Markdown report
+- configure repo variable `PECR_RLM_OPENAI_MODEL_NAME`
+- configure secret `OPENAI_API_KEY`
+
 ## Replay/Eval developer commands
 
 - List replay metadata:
