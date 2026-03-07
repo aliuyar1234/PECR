@@ -10,6 +10,7 @@ use pecr_adapters::{
 };
 use pecr_contracts::canonical;
 use pecr_contracts::{EvidenceContentType, EvidenceUnit, TerminalMode, TransformStep};
+use pecr_ledger::OperatorResultRecord;
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
 
@@ -24,9 +25,7 @@ use super::runtime::{
     discover_dimensions_from_pg_safeview, fetch_rows_from_pg_safeview, fetch_span_from_fs,
     list_versions_from_fs, search_from_fs, sha256_hex,
 };
-use super::session::{
-    acquire_session_lock, load_session_runtime, persist_session_runtime, unix_epoch_ms_now,
-};
+use super::session::{acquire_session_lock, load_session_runtime, unix_epoch_ms_now};
 use super::{ApiError, AppState, json_error, opa_error_response};
 use crate::opa::OpaCacheKey;
 use crate::operator_cache::OperatorCacheKey;
@@ -1417,33 +1416,33 @@ pub(super) async fn call_operator(
             "policy_deny"
         });
 
-        state
-            .ledger
-            .append_event(
-                &session.trace_id,
-                &session.session_id,
-                "POLICY_DECISION",
-                &principal_id,
-                &session.policy_snapshot_id,
-                serde_json::json!({
-                    "decision": if decision.allow { "allow" } else { "deny" },
-                    "reason": reason,
-                    "op_name": op_name.as_str(),
-                    "request_id": request_id.as_str(),
-                }),
-            )
-            .await
-            .map_err(|_| {
-                json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ERR_LEDGER_UNAVAILABLE",
-                    "ledger unavailable".to_string(),
-                    TerminalMode::SourceUnavailable,
-                    true,
-                )
-            })?;
-
         if !decision.allow {
+            state
+                .ledger
+                .append_event(
+                    &session.trace_id,
+                    &session.session_id,
+                    "POLICY_DECISION",
+                    &principal_id,
+                    &session.policy_snapshot_id,
+                    serde_json::json!({
+                        "decision": "deny",
+                        "reason": reason,
+                        "op_name": op_name.as_str(),
+                        "request_id": request_id.as_str(),
+                    }),
+                )
+                .await
+                .map_err(|_| {
+                    json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ERR_LEDGER_UNAVAILABLE",
+                        "ledger unavailable".to_string(),
+                        TerminalMode::SourceUnavailable,
+                        true,
+                    )
+                })?;
+
             state
                 .ledger
                 .append_event(
@@ -2300,61 +2299,16 @@ pub(super) async fn call_operator(
                     state.config.evidence_payload_store_mode,
                     crate::config::EvidencePayloadStoreMode::PayloadEnabled
                 );
+                let mut next_evidence_unit_ids = session
+                    .evidence_unit_ids
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>();
                 for evidence in &evidence_emitted {
-                    state
-                        .ledger
-                        .insert_evidence_unit(
-                            &session.trace_id,
-                            &session.session_id,
-                            evidence,
-                            store_payload,
-                        )
-                        .await
-                        .map_err(|_| {
-                            json_error(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "ERR_LEDGER_UNAVAILABLE",
-                                "ledger unavailable".to_string(),
-                                TerminalMode::SourceUnavailable,
-                                true,
-                            )
-                        })?;
-
-                    state
-                        .ledger
-                        .append_event(
-                            &session.trace_id,
-                            &session.session_id,
-                            "EVIDENCE_EMITTED",
-                            &principal_id,
-                            &session.policy_snapshot_id,
-                            serde_json::json!({
-                                "evidence_unit_id": evidence.evidence_unit_id.as_str(),
-                                "content_hash": evidence.content_hash.as_str(),
-                                "source_system": evidence.source_system.as_str(),
-                                "object_id": evidence.object_id.as_str(),
-                                "version_id": evidence.version_id.as_str(),
-                                "op_name": op_name.as_str(),
-                                "request_id": request_id,
-                            }),
-                        )
-                        .await
-                        .map_err(|_| {
-                            json_error(
-                                StatusCode::SERVICE_UNAVAILABLE,
-                                "ERR_LEDGER_UNAVAILABLE",
-                                "ledger unavailable".to_string(),
-                                TerminalMode::SourceUnavailable,
-                                true,
-                            )
-                        })?;
+                    next_evidence_unit_ids.push(evidence.evidence_unit_id.clone());
                 }
-
-                for evidence in &evidence_emitted {
-                    session
-                        .evidence_unit_ids
-                        .insert(evidence.evidence_unit_id.clone());
-                }
+                next_evidence_unit_ids.sort();
+                next_evidence_unit_ids.dedup();
 
                 let next_operator_calls_used = session.operator_calls_used.saturating_add(1);
                 let next_bytes_used =
@@ -2362,26 +2316,34 @@ pub(super) async fn call_operator(
 
                 state
                     .ledger
-                    .append_event(
-                        &session.trace_id,
-                        &session.session_id,
-                        "OPERATOR_CALL",
-                        &principal_id,
-                        &session.policy_snapshot_id,
-                        serde_json::json!({
-                            "op_name": op_name.as_str(),
-                            "params_hash": params_hash,
-                            "cache_hit": cache_hit,
-                            "params_bytes": params_bytes,
-                            "result_bytes": result_bytes,
-                            "terminal_mode": response.terminal_mode.as_str(),
-                            "outcome": if error_code.is_none() { "success" } else { "error" },
-                            "error_code": error_code,
-                            "operator_calls_used": next_operator_calls_used,
-                            "bytes_used": next_bytes_used,
-                            "request_id": request_id,
-                        }),
-                    )
+                    .record_operator_result(OperatorResultRecord {
+                        trace_id: &session.trace_id,
+                        session_id: &session.session_id,
+                        principal_id: &principal_id,
+                        policy_snapshot_id: &session.policy_snapshot_id,
+                        policy_decision_reason: reason,
+                        op_name: op_name.as_str(),
+                        request_id: request_id.as_str(),
+                        params_hash: &params_hash,
+                        cache_hit,
+                        params_bytes,
+                        result_bytes,
+                        terminal_mode: response.terminal_mode,
+                        error_code,
+                        evidence_units: &evidence_emitted,
+                        store_payload,
+                        session_runtime: pecr_ledger::SessionRuntimeWrite {
+                            session_id: &session.session_id,
+                            tenant_id: &session.tenant_id,
+                            session_token_hash: &session.session_token_hash,
+                            session_token_expires_at_epoch_ms: session
+                                .session_token_expires_at_epoch_ms,
+                            operator_calls_used: next_operator_calls_used,
+                            bytes_used: next_bytes_used,
+                            evidence_unit_ids: &next_evidence_unit_ids,
+                            finalized: session.finalized,
+                        },
+                    })
                     .await
                     .map_err(|_| {
                         json_error(
@@ -2395,17 +2357,7 @@ pub(super) async fn call_operator(
 
                 session.operator_calls_used = next_operator_calls_used;
                 session.bytes_used = next_bytes_used;
-                persist_session_runtime(&state, &session)
-                    .await
-                    .map_err(|_| {
-                        json_error(
-                            StatusCode::SERVICE_UNAVAILABLE,
-                            "ERR_LEDGER_UNAVAILABLE",
-                            "ledger unavailable".to_string(),
-                            TerminalMode::SourceUnavailable,
-                            true,
-                        )
-                    })?;
+                session.evidence_unit_ids = next_evidence_unit_ids.into_iter().collect();
 
                 tracing::Span::current().record(
                     "latency_ms",

@@ -15,6 +15,10 @@ static BUDGET_VIOLATIONS_TOTAL: OnceLock<IntCounter> = OnceLock::new();
 static BUDGET_STOP_REASONS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
 static INFLIGHT_OPS: OnceLock<IntGauge> = OnceLock::new();
 static OPERATOR_QUEUE_WAIT_SECONDS: OnceLock<Histogram> = OnceLock::new();
+static EVIDENCE_PACKS_TOTAL: OnceLock<IntCounterVec> = OnceLock::new();
+static EVIDENCE_PACK_UNITS: OnceLock<Histogram> = OnceLock::new();
+static EVIDENCE_COMPACTION_RATIO: OnceLock<Histogram> = OnceLock::new();
+static CITATION_QUALITY: OnceLock<Histogram> = OnceLock::new();
 
 fn registry() -> &'static Registry {
     REGISTRY.get_or_init(Registry::new)
@@ -144,6 +148,66 @@ fn operator_queue_wait_seconds() -> &'static Histogram {
     })
 }
 
+fn evidence_packs_total() -> &'static IntCounterVec {
+    EVIDENCE_PACKS_TOTAL.get_or_init(|| {
+        register_collector(
+            IntCounterVec::new(
+                Opts::new(
+                    "pecr_controller_evidence_packs_total",
+                    "Controller finalize evidence packs by selected mode.",
+                ),
+                &["mode"],
+            )
+            .expect("create pecr_controller_evidence_packs_total"),
+        )
+    })
+}
+
+fn evidence_pack_units() -> &'static Histogram {
+    EVIDENCE_PACK_UNITS.get_or_init(|| {
+        register_collector(
+            Histogram::with_opts(
+                HistogramOpts::new(
+                    "pecr_controller_evidence_pack_units",
+                    "Selected evidence units per finalize evidence pack.",
+                )
+                .buckets(vec![1.0, 2.0, 3.0, 4.0, 6.0, 8.0, 12.0, 16.0]),
+            )
+            .expect("create pecr_controller_evidence_pack_units"),
+        )
+    })
+}
+
+fn evidence_compaction_ratio() -> &'static Histogram {
+    EVIDENCE_COMPACTION_RATIO.get_or_init(|| {
+        register_collector(
+            Histogram::with_opts(
+                HistogramOpts::new(
+                    "pecr_controller_evidence_compaction_ratio",
+                    "Packed evidence chars divided by raw evidence chars for finalize selection.",
+                )
+                .buckets(vec![0.05, 0.1, 0.2, 0.35, 0.5, 0.75, 1.0]),
+            )
+            .expect("create pecr_controller_evidence_compaction_ratio"),
+        )
+    })
+}
+
+fn citation_quality() -> &'static Histogram {
+    CITATION_QUALITY.get_or_init(|| {
+        register_collector(
+            Histogram::with_opts(
+                HistogramOpts::new(
+                    "pecr_controller_citation_quality",
+                    "Citation quality observed on finalized controller responses.",
+                )
+                .buckets(vec![0.0, 0.25, 0.5, 0.75, 0.9, 0.95, 1.0]),
+            )
+            .expect("create pecr_controller_citation_quality"),
+        )
+    })
+}
+
 pub fn observe_http_request(route: &str, method: &str, status: u16, duration: Duration) {
     let status_str = status.to_string();
     http_requests_total()
@@ -192,11 +256,34 @@ pub fn observe_operator_queue_wait(duration: Duration) {
     operator_queue_wait_seconds().observe(duration.as_secs_f64());
 }
 
+pub fn observe_finalize_evidence_pack(
+    mode: &str,
+    _input_units: usize,
+    packed_units: usize,
+    input_chars: usize,
+    packed_chars: usize,
+) {
+    evidence_packs_total().with_label_values(&[mode]).inc();
+    evidence_pack_units().observe(packed_units as f64);
+    if input_chars > 0 {
+        evidence_compaction_ratio()
+            .observe((packed_chars as f64 / input_chars as f64).clamp(0.0, 1.0));
+    }
+}
+
+pub fn observe_citation_quality(score: f64) {
+    citation_quality().observe(score.clamp(0.0, 1.0));
+}
+
 pub fn render() -> Result<(Vec<u8>, String), prometheus::Error> {
     let _ = budget_violations_total();
     let _ = budget_stop_reasons_total();
     let _ = inflight_ops();
     let _ = operator_queue_wait_seconds();
+    let _ = evidence_packs_total();
+    let _ = evidence_pack_units();
+    let _ = evidence_compaction_ratio();
+    let _ = citation_quality();
 
     let encoder = TextEncoder::new();
     let metric_families = registry().gather();

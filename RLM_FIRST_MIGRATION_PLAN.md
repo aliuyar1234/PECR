@@ -111,7 +111,7 @@ Gate before Phase 2:
 
 Goal: let RLM drive the reasoning path, while Rust remains the enforcement and execution owner.
 
-- [ ] Expand the planner contract so RLM sees the information it actually needs:
+- [x] Expand the planner contract so RLM sees the information it actually needs:
   Files: `crates/contracts/src/lib.rs`, `docs/architecture/planner_contract.md`
   Add:
   - richer tool schema
@@ -119,48 +119,48 @@ Goal: let RLM drive the reasoning path, while Rust remains the enforcement and e
   - prior tool observations
   - clarification opportunities
   - structured failure feedback
-- [ ] Move more path-selection logic out of fixed Rust heuristics and into the RLM plan itself.
+- [x] Move more path-selection logic out of fixed Rust heuristics and into the RLM plan itself.
   Files: `crates/controller/src/http/orchestration.rs`, `crates/controller/src/http/tests.rs`
-- [ ] Teach RLM to handle multi-clause questions without collapsing them to one narrow path.
+- [x] Teach RLM to handle multi-clause questions without collapsing them to one narrow path.
   Files: `crates/controller/src/http/orchestration.rs`, `fixtures/replay/useful_tasks/`, `scripts/replay/`
-- [ ] Teach RLM to recover after a weak or blocked first attempt by selecting a second safe path when one exists.
+- [x] Teach RLM to recover after a weak or blocked first attempt by selecting a second safe path when one exists.
   Files: `crates/controller/src/http/orchestration.rs`, `crates/controller/src/http.rs`, `crates/controller/src/http/tests.rs`
-- [ ] Add explicit clarification behavior for ambiguous asks instead of relying mostly on fallback text generation.
+- [x] Add explicit clarification behavior for ambiguous asks instead of relying mostly on fallback text generation.
   Files: `crates/controller/src/http/orchestration.rs`, `crates/controller/src/http/finalize.rs`, `docs/openapi/pecr.v1.yaml`
-- [ ] Improve batching and parallel tool-call planning where the operator and budget policies allow it.
+- [x] Improve batching and parallel tool-call planning where the operator and budget policies allow it.
   Files: `crates/controller/src/http/orchestration.rs`, `crates/controller/src/config.rs`, `docs/observability/baselines.md`
 
 Gate before Phase 3:
 
-- [ ] RLM beats or matches `baseline` on the named core usefulness benchmark.
-- [ ] Multi-part benchmark scenarios no longer depend on hard-coded Rust-first planner heuristics to pass.
-- [ ] Clarification and recovery behavior are replay-visible and covered by tests.
-- [ ] `bash scripts/perf/suite7.sh` is stable across repeated runs in both local and CI environments.
-- [ ] Finalize correctness stays green for both straightforward and recovery-driven RLM scenarios.
+- [x] RLM beats or matches `baseline` on the named core usefulness benchmark.
+- [x] Multi-part benchmark scenarios no longer depend on hard-coded Rust-first planner heuristics to pass.
+- [x] Clarification and recovery behavior are replay-visible and covered by tests.
+- [x] `bash scripts/perf/suite7.sh` is stable across repeated runs in both local and CI environments.
+- [x] Finalize correctness stays green for both straightforward and recovery-driven RLM scenarios.
 
 ## Phase 3: Build Long-Context Evidence Synthesis That Is Actually Product-Useful
 
 Goal: use larger model context windows to improve synthesis, comparison, and version review without weakening grounding.
 
-- [ ] Add an explicit evidence-packing and compaction layer for large evidence sets.
+- [x] Add an explicit evidence-packing and compaction layer for large evidence sets.
   Files: `crates/controller/src/http/orchestration.rs`, `crates/controller/src/http/finalize.rs`, `crates/contracts/src/lib.rs`
-- [ ] Separate context budget management from operator-call budget management.
+- [x] Separate context budget management from operator-call budget management.
   Files: `crates/contracts/src/lib.rs`, `crates/controller/src/config.rs`, `crates/controller/src/http/orchestration.rs`
-- [ ] Define when the system should pass raw evidence, compacted evidence, summaries, diffs, or a mixed bundle into the RLM context.
+- [x] Define when the system should pass raw evidence, compacted evidence, summaries, diffs, or a mixed bundle into the RLM context.
   Files: `docs/architecture/controller_state_machine.md`, `docs/architecture/`, `crates/controller/src/http/orchestration.rs`
-- [ ] Improve claim and citation synthesis for cross-document, cross-version, and compare-style answers.
+- [x] Improve claim and citation synthesis for cross-document, cross-version, and compare-style answers.
   Files: `crates/controller/src/http/finalize.rs`, `crates/controller/src/http/tests.rs`
-- [ ] Add benchmark scenarios with large evidence fan-out, version-heavy queries, and mixed structured-plus-unstructured asks.
+- [x] Add benchmark scenarios with large evidence fan-out, version-heavy queries, and mixed structured-plus-unstructured asks.
   Files: `fixtures/replay/useful_tasks/`, `scripts/replay/`, `docs/useful_benchmark.md`
-- [ ] Add observability for context pack size, evidence compaction ratio, and citation coverage quality.
+- [x] Add observability for context pack size, evidence compaction ratio, and citation coverage quality.
   Files: `docs/observability/`, `crates/controller/src/metrics.rs`, dashboards and alerts
 
 Gate before Phase 4:
 
-- [ ] RLM can handle large multi-document or version-heavy tasks without losing finalize supportability.
-- [ ] Supported claims still satisfy coverage requirements after compaction or summarization.
-- [ ] Long-context scenarios improve usefulness scores, not just token usage.
-- [ ] Latency, throughput, and cost stay inside the agreed envelope for the benchmark suite.
+- [x] RLM can handle large multi-document or version-heavy tasks without losing finalize supportability.
+- [x] Supported claims still satisfy coverage requirements after compaction or summarization.
+- [x] Long-context scenarios improve usefulness scores, not just token usage.
+- [x] Latency, throughput, and cost stay inside the agreed envelope for the benchmark suite.
 
 ## Phase 4: Roll Out RLM As The Default Runtime
 

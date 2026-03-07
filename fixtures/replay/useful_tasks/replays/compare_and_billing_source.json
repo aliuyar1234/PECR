@@ -1,0 +1,72 @@
+{
+  "budget": {
+    "max_bytes": 4096,
+    "max_operator_calls": 10,
+    "max_parallelism": 1,
+    "max_recursion_depth": 3,
+    "max_wallclock_ms": 1000
+  },
+  "bytes_used": 684,
+  "claim_map": {
+    "claim_map_id": "claim-map-compare-and-billing-source",
+    "claims": [
+      {
+        "claim_id": "2121212121212121212121212121212121212121212121212121212121212121",
+        "claim_text": "pg_safeview/safe_customer_view_public aggregate: plan_tier=starter count(customer_id)=9; plan_tier=premium count(customer_id)=4",
+        "evidence_snippets": [
+          {
+            "evidence_unit_id": "2222222222222222222222222222222222222222222222222222222222222299",
+            "location": "pg_safeview/safe_customer_view_public aggregate",
+            "snippet": "plan_tier=starter count(customer_id)=9; plan_tier=premium count(customer_id)=4"
+          }
+        ],
+        "evidence_unit_ids": [
+          "2222222222222222222222222222222222222222222222222222222222222299"
+        ],
+        "status": "SUPPORTED"
+      },
+      {
+        "claim_id": "2323232323232323232323232323232323232323232323232323232323232323",
+        "claim_text": "fs_corpus/public/billing_terms.txt line 8: Starter plans bill monthly at the published rate",
+        "evidence_snippets": [
+          {
+            "evidence_unit_id": "2424242424242424242424242424242424242424242424242424242424242424",
+            "location": "fs_corpus/public/billing_terms.txt line 8",
+            "snippet": "Starter plans bill monthly at the published rate"
+          }
+        ],
+        "evidence_unit_ids": [
+          "2424242424242424242424242424242424242424242424242424242424242424"
+        ],
+        "status": "SUPPORTED"
+      }
+    ],
+    "coverage_observed": 1.0,
+    "coverage_threshold": 0.95,
+    "terminal_mode": "SUPPORTED"
+  },
+  "depth_used": 2,
+  "evidence_ref_count": 2,
+  "evidence_unit_ids": [
+    "2222222222222222222222222222222222222222222222222222222222222299",
+    "2424242424242424242424242424242424242424242424242424242424242424"
+  ],
+  "loop_terminal_mode": "SUPPORTED",
+  "metadata": {
+    "bundle_hash": "2525252525252525252525252525252525252525252525252525252525252525",
+    "engine_mode": "rlm",
+    "principal_id_hash": "2626262626262626262626262626262626262626262626262626262626262626",
+    "quality_score": 96.0,
+    "recorded_at_unix_ms": 1700000900000,
+    "request_id": "req-useful-compare-and-billing-source",
+    "run_id": "useful-compare-and-billing-source",
+    "schema_version": 1,
+    "terminal_mode": "SUPPORTED",
+    "trace_id": "01ARZ3NDEKTSV4RRFFQ69G5FAK"
+  },
+  "operator_calls_used": 2,
+  "policy_snapshot_id": "policy-useful-compare-and-billing-source",
+  "query": "Compare active customer counts by plan tier and show the source text for the billing terms policy",
+  "response_text": "SUPPORTED: pg_safeview/safe_customer_view_public aggregate: plan_tier=starter count(customer_id)=9; plan_tier=premium count(customer_id)=4\nSUPPORTED: fs_corpus/public/billing_terms.txt line 8: Starter plans bill monthly at the published rate",
+  "session_id": "session-useful-compare-and-billing-source"
+}

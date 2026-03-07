@@ -12,7 +12,7 @@ use tracing::Instrument;
 
 use super::auth::{extract_principal, extract_request_id, extract_session_token};
 use super::session::Session;
-use super::session::{acquire_session_lock, load_session_runtime, persist_session_runtime};
+use super::session::{acquire_session_lock, load_session_runtime};
 use super::{ApiError, AppState, json_error, opa_error_response};
 use crate::opa::OpaCacheKey;
 
@@ -166,7 +166,7 @@ pub(super) async fn finalize(
         })?;
         let _session_lock = acquire_session_lock(&state, &req.session_id).await?;
 
-        let mut session = load_session_runtime(&state, &req.session_id)
+        let session = load_session_runtime(&state, &req.session_id)
             .await?
             .ok_or_else(|| {
                 json_error(
@@ -310,33 +310,33 @@ pub(super) async fn finalize(
             "policy_deny"
         });
 
-        state
-            .ledger
-            .append_event(
-                &session.trace_id,
-                &session.session_id,
-                "POLICY_DECISION",
-                &principal_id,
-                &session.policy_snapshot_id,
-                serde_json::json!({
-                    "decision": if decision.allow { "allow" } else { "deny" },
-                    "reason": reason,
-                    "op_name": "finalize",
-                    "request_id": request_id.as_str(),
-                }),
-            )
-            .await
-            .map_err(|_| {
-                json_error(
-                    StatusCode::SERVICE_UNAVAILABLE,
-                    "ERR_LEDGER_UNAVAILABLE",
-                    "ledger unavailable".to_string(),
-                    TerminalMode::SourceUnavailable,
-                    true,
-                )
-            })?;
-
         if !decision.allow {
+            state
+                .ledger
+                .append_event(
+                    &session.trace_id,
+                    &session.session_id,
+                    "POLICY_DECISION",
+                    &principal_id,
+                    &session.policy_snapshot_id,
+                    serde_json::json!({
+                        "decision": "deny",
+                        "reason": reason,
+                        "op_name": "finalize",
+                        "request_id": request_id.as_str(),
+                    }),
+                )
+                .await
+                .map_err(|_| {
+                    json_error(
+                        StatusCode::SERVICE_UNAVAILABLE,
+                        "ERR_LEDGER_UNAVAILABLE",
+                        "ledger unavailable".to_string(),
+                        TerminalMode::SourceUnavailable,
+                        true,
+                    )
+                })?;
+
             return Err(json_error(
                 StatusCode::FORBIDDEN,
                 "ERR_POLICY_DENIED",
@@ -393,6 +393,13 @@ pub(super) async fn finalize(
                 "max_operator_calls": session.budget.max_operator_calls,
                 "max_bytes": session.budget.max_bytes,
             });
+            let mut session_evidence_unit_ids = session
+                .evidence_unit_ids
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>();
+            session_evidence_unit_ids.sort();
+            session_evidence_unit_ids.dedup();
 
             let ledger_span = tracing::info_span!(
                 "ledger.append",
@@ -413,9 +420,21 @@ pub(super) async fn finalize(
                         session_id: &session.session_id,
                         principal_id: &principal_id,
                         policy_snapshot_id: &session.policy_snapshot_id,
+                        policy_decision_reason: reason,
                         claim_map: &claim_map,
                         budget_counters: &budget_counters,
                         request_id: &request_id,
+                        session_runtime: pecr_ledger::SessionRuntimeWrite {
+                            session_id: &session.session_id,
+                            tenant_id: &session.tenant_id,
+                            session_token_hash: &session.session_token_hash,
+                            session_token_expires_at_epoch_ms: session
+                                .session_token_expires_at_epoch_ms,
+                            operator_calls_used: session.operator_calls_used,
+                            bytes_used: session.bytes_used,
+                            evidence_unit_ids: &session_evidence_unit_ids,
+                            finalized: true,
+                        },
                     })
                     .await
                     .map_err(|_| {
@@ -435,19 +454,6 @@ pub(super) async fn finalize(
             }
             .instrument(ledger_span)
             .await?;
-
-            session.finalized = true;
-            persist_session_runtime(&state_for_finalize, &session)
-                .await
-                .map_err(|_| {
-                    json_error(
-                        StatusCode::SERVICE_UNAVAILABLE,
-                        "ERR_LEDGER_UNAVAILABLE",
-                        "ledger unavailable".to_string(),
-                        TerminalMode::SourceUnavailable,
-                        true,
-                    )
-                })?;
 
             let latency_ms = started.elapsed().as_millis() as u64;
             tracing::Span::current().record("latency_ms", latency_ms);

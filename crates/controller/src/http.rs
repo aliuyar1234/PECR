@@ -11,7 +11,7 @@ use tracing::Instrument;
 
 use crate::config::{AuthMode, ControllerConfig, ControllerEngine, StartupError};
 use crate::rate_limit::RateLimiter;
-use crate::replay::{PersistedRun, ReplayPersistQueue, ReplayStore};
+use crate::replay::{PersistedRun, ReplayPersistQueue, ReplayStore, compute_citation_quality};
 
 mod auth;
 mod budget;
@@ -307,7 +307,18 @@ async fn run(
                 loop_terminal_mode,
                 loop_result.response_text.clone(),
                 &loop_result.evidence_units,
+                &state.config.context_budget,
             );
+            crate::metrics::observe_finalize_evidence_pack(
+                finalized_output.context_stats.pack_mode.as_str(),
+                finalized_output.context_stats.input_evidence_units,
+                finalized_output.context_stats.packed_evidence_units,
+                finalized_output.context_stats.input_chars,
+                finalized_output.context_stats.packed_chars,
+            );
+            crate::metrics::observe_citation_quality(compute_citation_quality(
+                &finalized_output.claim_map,
+            ));
 
             let finalized = finalize_session(
                 &state,
@@ -417,6 +428,8 @@ struct CreatedSession {
     session_token: String,
 }
 
+const GATEWAY_SESSION_CREATE_MAX_RETRIES: u32 = 5;
+
 async fn create_session(
     state: &AppState,
     principal_id: &str,
@@ -441,36 +454,85 @@ async fn create_session(
             "{}/v1/sessions",
             state.config.gateway_url.trim_end_matches('/')
         );
-        let builder = state
-            .http
-            .post(url)
-            .header("x-pecr-request-id", request_id)
-            .header("x-pecr-trace-id", trace_id);
-
-        let response = apply_gateway_auth(
-            builder,
-            principal_id,
-            authz_header,
-            state.config.local_auth_shared_secret.as_deref(),
-        )
-        .json(&CreateSessionRequest {
+        let request_body = CreateSessionRequest {
             budget: budget.clone(),
-        })
-        .send()
-        .await
-        .map_err(|_| {
-            json_error(
-                StatusCode::BAD_GATEWAY,
-                "ERR_SOURCE_UNAVAILABLE",
-                "gateway request failed".to_string(),
-                TerminalMode::SourceUnavailable,
-                true,
-            )
-        })?;
+        };
+        let mut attempt = 0_u32;
+        let response = loop {
+            let builder = state
+                .http
+                .post(&url)
+                .header("x-pecr-request-id", request_id)
+                .header("x-pecr-trace-id", trace_id);
 
-        if !response.status().is_success() {
-            return Err(gateway_non_success_response(response).await);
-        }
+            let response = apply_gateway_auth(
+                builder,
+                principal_id,
+                authz_header,
+                state.config.local_auth_shared_secret.as_deref(),
+            )
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|_| {
+                json_error(
+                    StatusCode::BAD_GATEWAY,
+                    "ERR_SOURCE_UNAVAILABLE",
+                    "gateway request failed".to_string(),
+                    TerminalMode::SourceUnavailable,
+                    true,
+                )
+            })?;
+
+            if response.status().is_success() {
+                break response;
+            }
+
+            let raw_status = response.status();
+            let status =
+                StatusCode::from_u16(raw_status.as_u16()).unwrap_or(StatusCode::BAD_GATEWAY);
+            let parsed_err = response.json::<ErrorResponse>().await.ok();
+            let should_retry = parsed_err.as_ref().is_some_and(|err| {
+                status.is_server_error()
+                    && err.retryable
+                    && err.terminal_mode_hint == TerminalMode::SourceUnavailable
+                    && matches!(
+                        err.code.as_str(),
+                        "ERR_LEDGER_UNAVAILABLE"
+                            | "ERR_SOURCE_UNAVAILABLE"
+                            | "ERR_DB_UNAVAILABLE"
+                            | "ERR_SOURCE_TIMEOUT"
+                    )
+            });
+
+            if should_retry && attempt < GATEWAY_SESSION_CREATE_MAX_RETRIES {
+                attempt += 1;
+                if let Some(err) = parsed_err.as_ref() {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        trace_id = %trace_id,
+                        principal_id = %principal_id,
+                        attempt,
+                        status = status.as_u16(),
+                        code = %err.code,
+                        "controller.gateway_session_retry"
+                    );
+                }
+                tokio::time::sleep(Duration::from_millis(50 * u64::from(attempt))).await;
+                continue;
+            }
+
+            return Err(match parsed_err {
+                Some(err) => (status, Json(with_actionable_guidance(err))),
+                None => json_error(
+                    status,
+                    "ERR_SOURCE_UNAVAILABLE",
+                    "gateway returned non-success status".to_string(),
+                    TerminalMode::SourceUnavailable,
+                    true,
+                ),
+            });
+        };
 
         let session_token = response
             .headers()

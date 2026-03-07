@@ -26,6 +26,7 @@ The benchmark currently covers:
 - version review: latest support document change
 - aggregate compare: active customer counts by plan tier
 - aggregate trend: monthly customer trend over time
+- mixed structured-plus-unstructured synthesis: compare plan-tier counts and cite billing source text in one answer
 - ambiguity guidance: broad customer and policy asks that should narrow safely instead of dead-ending
 - partial answer: grounded billing guidance with explicit unresolved remainder
 
@@ -39,9 +40,22 @@ The current named scenario files are:
 - `latest_support_document_change.json`
 - `customer_counts_by_plan_tier.json`
 - `monthly_customer_trend.json`
+- `compare_and_billing_source.json`
 - `broad_customer_query_narrowing.json`
 - `broad_policy_query_narrowing.json`
 - `partial_billing_answer.json`
+
+## Phase 3 Long-Context Cohort
+
+Phase 3 treats a subset of the named corpus as the long-context synthesis cohort:
+
+- evidence fan-out and corroboration: `support-policy-source`, `annual-refund-source`
+- version-heavy review: `latest-support-change`
+- mixed structured plus unstructured synthesis: `compare-and-billing-source`
+- grounded partial synthesis: `partial-billing-answer`
+
+These are the scenarios we should use when asking whether larger context windows actually improved
+answer synthesis, recombination, and citation quality rather than only increasing prompt size.
 
 ## Commands
 
@@ -103,6 +117,7 @@ During the RLM-first rollout, treat these scenarios as the default answer to:
 - did long-context reasoning improve synthesis instead of just increasing cost?
 - did planner changes improve recovery and clarification behavior?
 - did finalize stay aligned with the higher-capability path?
+- did mixed or compacted evidence still preserve grounded citations after recombination?
 
 When your replay store contains paired `baseline`, `rlm`, and `beam_planner` runs for the same
 queries, local evaluation now emits an `engine_comparisons` section that compares them on matched

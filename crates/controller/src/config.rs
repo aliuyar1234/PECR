@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::time::Duration;
 
 use pecr_auth::OidcConfig;
-use pecr_contracts::Budget;
+use pecr_contracts::{Budget, ContextBudget};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone)]
@@ -12,7 +12,9 @@ pub struct ControllerConfig {
     pub gateway_url: String,
     pub controller_engine: ControllerEngine,
     pub model_provider: ModelProvider,
+    pub rlm_script_path: Option<String>,
     pub budget_defaults: Budget,
+    pub context_budget: ContextBudget,
     pub baseline_plan: Vec<BaselinePlanStep>,
     pub planner_mode: PlannerMode,
     pub planner_client: PlannerClientKind,
@@ -200,6 +202,11 @@ impl ControllerConfig {
                     .to_string(),
             });
         }
+        let rlm_script_path = kv
+            .get("PECR_RLM_SCRIPT_PATH")
+            .map(|v| v.trim())
+            .filter(|v| !v.is_empty())
+            .map(|v| v.to_string());
 
         let budget_defaults_raw = require_nonempty(kv, "PECR_BUDGET_DEFAULTS")?;
         let budget_defaults =
@@ -211,6 +218,32 @@ impl ControllerConfig {
         budget_defaults.validate().map_err(|reason| StartupError {
             code: "ERR_INVALID_BUDGET",
             message: format!("PECR_BUDGET_DEFAULTS invalid: {}", reason),
+        })?;
+        let context_budget = ContextBudget {
+            max_evidence_units: parse_usize(
+                kv.get("PECR_CONTEXT_MAX_EVIDENCE_UNITS"),
+                ContextBudget::default().max_evidence_units,
+                "PECR_CONTEXT_MAX_EVIDENCE_UNITS",
+            )?,
+            max_total_chars: parse_usize(
+                kv.get("PECR_CONTEXT_MAX_TOTAL_CHARS"),
+                ContextBudget::default().max_total_chars,
+                "PECR_CONTEXT_MAX_TOTAL_CHARS",
+            )?,
+            max_structured_rows: parse_usize(
+                kv.get("PECR_CONTEXT_MAX_STRUCTURED_ROWS"),
+                ContextBudget::default().max_structured_rows,
+                "PECR_CONTEXT_MAX_STRUCTURED_ROWS",
+            )?,
+            max_inline_citations: parse_usize(
+                kv.get("PECR_CONTEXT_MAX_INLINE_CITATIONS"),
+                ContextBudget::default().max_inline_citations,
+                "PECR_CONTEXT_MAX_INLINE_CITATIONS",
+            )?,
+        };
+        context_budget.validate().map_err(|reason| StartupError {
+            code: "ERR_INVALID_CONTEXT_BUDGET",
+            message: format!("context budget invalid: {}", reason),
         })?;
         let baseline_plan = parse_baseline_plan(kv.get("PECR_BASELINE_PLAN"))?;
         let planner_mode = parse_planner_mode(kv.get("PECR_CONTROLLER_PLANNER_MODE"))?;
@@ -295,7 +328,9 @@ impl ControllerConfig {
             gateway_url,
             controller_engine,
             model_provider,
+            rlm_script_path,
             budget_defaults,
+            context_budget,
             baseline_plan,
             planner_mode,
             planner_client,
@@ -902,9 +937,42 @@ mod tests {
         assert!(cfg.adaptive_parallelism_enabled);
         assert!(cfg.batch_mode_enabled);
         assert!(cfg.operator_concurrency_policies.is_empty());
+        assert_eq!(cfg.context_budget, ContextBudget::default());
         assert_eq!(cfg.replay_store_dir, "target/replay");
         assert_eq!(cfg.replay_retention_days, 30);
         assert_eq!(cfg.replay_list_limit, 200);
+    }
+
+    #[test]
+    fn context_budget_parses_from_env() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_CONTEXT_MAX_EVIDENCE_UNITS".to_string(),
+            "9".to_string(),
+        );
+        env.insert(
+            "PECR_CONTEXT_MAX_TOTAL_CHARS".to_string(),
+            "8192".to_string(),
+        );
+        env.insert(
+            "PECR_CONTEXT_MAX_STRUCTURED_ROWS".to_string(),
+            "12".to_string(),
+        );
+        env.insert(
+            "PECR_CONTEXT_MAX_INLINE_CITATIONS".to_string(),
+            "7".to_string(),
+        );
+
+        let cfg = ControllerConfig::from_kv(&env).expect("config should load");
+        assert_eq!(
+            cfg.context_budget,
+            ContextBudget {
+                max_evidence_units: 9,
+                max_total_chars: 8192,
+                max_structured_rows: 12,
+                max_inline_citations: 7,
+            }
+        );
     }
 
     #[test]

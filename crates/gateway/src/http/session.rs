@@ -3,7 +3,6 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use axum::http::StatusCode;
 use pecr_contracts::{Budget, TerminalMode};
-use pecr_ledger::SessionRuntimeWrite;
 use sqlx::{Postgres, Transaction};
 
 use super::{ApiError, AppState, json_error};
@@ -86,42 +85,6 @@ pub(super) async fn acquire_session_lock<'a>(
     })?;
 
     Ok(tx)
-}
-
-pub(super) async fn persist_session_runtime(
-    state: &AppState,
-    session: &Session,
-) -> Result<(), ApiError> {
-    let mut evidence_unit_ids = session
-        .evidence_unit_ids
-        .iter()
-        .cloned()
-        .collect::<Vec<_>>();
-    evidence_unit_ids.sort();
-    evidence_unit_ids.dedup();
-
-    state
-        .ledger
-        .upsert_session_runtime(SessionRuntimeWrite {
-            session_id: session.session_id.as_str(),
-            tenant_id: session.tenant_id.as_str(),
-            session_token_hash: session.session_token_hash.as_str(),
-            session_token_expires_at_epoch_ms: session.session_token_expires_at_epoch_ms,
-            operator_calls_used: session.operator_calls_used,
-            bytes_used: session.bytes_used,
-            evidence_unit_ids: &evidence_unit_ids,
-            finalized: session.finalized,
-        })
-        .await
-        .map_err(|_| {
-            json_error(
-                StatusCode::SERVICE_UNAVAILABLE,
-                "ERR_LEDGER_UNAVAILABLE",
-                "ledger unavailable".to_string(),
-                TerminalMode::SourceUnavailable,
-                true,
-            )
-        })
 }
 
 pub(super) async fn load_session_runtime(

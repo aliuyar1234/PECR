@@ -2,22 +2,30 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use pecr_contracts::canonical;
 use pecr_contracts::{
-    Claim, ClaimEvidenceSnippet, ClaimMap, ClaimStatus, ClarificationPrompt, EvidenceUnit,
-    TerminalMode,
+    Claim, ClaimEvidenceSnippet, ClaimMap, ClaimStatus, ClarificationPrompt, ContextBudget,
+    EvidencePackMode, EvidenceUnit, TerminalMode,
 };
 use ulid::Ulid;
 
 use super::orchestration::{
-    ambiguity_guidance_for_query, clarification_prompt_for_query, decompose_query_clauses,
-    semantic_query_tokens,
+    ambiguity_guidance_for_query, clarification_prompt_for_query, classify_query_plan_intent,
+    decompose_query_clauses, evidence_pack_mode_for_query_intent, semantic_query_tokens,
 };
 
 pub(super) struct FinalizeOutput {
     pub(super) response_text: String,
     pub(super) claim_map: ClaimMap,
+    pub(super) context_stats: FinalizeContextStats,
 }
 
-const MAX_FINALIZE_EVIDENCE_UNITS: usize = 4;
+#[derive(Debug, Clone)]
+pub(super) struct FinalizeContextStats {
+    pub(super) pack_mode: EvidencePackMode,
+    pub(super) input_evidence_units: usize,
+    pub(super) packed_evidence_units: usize,
+    pub(super) input_chars: usize,
+    pub(super) packed_chars: usize,
+}
 
 #[derive(Debug, Clone)]
 struct SupportedClaimCandidate {
@@ -33,8 +41,10 @@ pub(super) fn build_finalize_output(
     loop_terminal_mode: TerminalMode,
     loop_response_text: Option<String>,
     evidence_units: &[EvidenceUnit],
+    context_budget: &ContextBudget,
 ) -> FinalizeOutput {
-    let ranked_evidence_units = select_finalize_evidence_units(query, evidence_units);
+    let (ranked_evidence_units, context_stats) =
+        select_finalize_evidence_units(query, evidence_units, context_budget);
     let supported_evidence_unit_ids = supported_evidence_unit_ids(&ranked_evidence_units);
     let supported_evidence_snippets = supported_evidence_snippets(query, &ranked_evidence_units);
     let trimmed_loop_response_text = loop_response_text
@@ -72,6 +82,7 @@ pub(super) fn build_finalize_output(
         loop_terminal_mode,
         trimmed_loop_response_text,
         &ranked_evidence_units,
+        &context_stats,
     ) {
         return partial_output;
     }
@@ -82,6 +93,7 @@ pub(super) fn build_finalize_output(
             TerminalMode::InsufficientEvidence,
             trimmed_loop_response_text,
             &ranked_evidence_units,
+            &context_stats,
         )
     {
         return partial_output;
@@ -133,6 +145,7 @@ pub(super) fn build_finalize_output(
     FinalizeOutput {
         response_text,
         claim_map,
+        context_stats,
     }
 }
 
@@ -152,6 +165,7 @@ fn synthesize_partial_finalize_output(
     loop_terminal_mode: TerminalMode,
     loop_response_text: Option<&str>,
     evidence_units: &[&EvidenceUnit],
+    context_stats: &FinalizeContextStats,
 ) -> Option<FinalizeOutput> {
     if loop_terminal_mode != TerminalMode::InsufficientEvidence
         || !evidence_meaningfully_matches_query(query, evidence_units)
@@ -161,8 +175,7 @@ fn synthesize_partial_finalize_output(
 
     let loop_response_text = loop_response_text?;
     let snippet_by_id = claim_evidence_snippet_by_id(query, evidence_units);
-    let mut supported_claims = synthesize_multi_part_supported_claims(query, evidence_units)
-        .unwrap_or_else(|| synthesize_supported_claims(query, evidence_units));
+    let mut supported_claims = synthesize_contextual_supported_claims(query, evidence_units);
     if supported_claims.is_empty() {
         return None;
     }
@@ -198,6 +211,7 @@ fn synthesize_partial_finalize_output(
                     .to_string(),
             ),
         },
+        context_stats: context_stats.clone(),
     })
 }
 
@@ -354,8 +368,7 @@ fn synthesize_supported_claim_map(
     evidence_units: &[&EvidenceUnit],
 ) -> Option<ClaimMap> {
     let snippet_by_id = claim_evidence_snippet_by_id(query, evidence_units);
-    let claims = synthesize_multi_part_supported_claims(query, evidence_units)
-        .unwrap_or_else(|| synthesize_supported_claims(query, evidence_units));
+    let claims = synthesize_contextual_supported_claims(query, evidence_units);
     if claims.is_empty() {
         return None;
     }
@@ -386,8 +399,7 @@ fn synthesize_supported_response_text(
     evidence_units: &[&EvidenceUnit],
 ) -> Option<String> {
     let snippet_by_id = claim_evidence_snippet_by_id(query, evidence_units);
-    let mut claims = synthesize_multi_part_supported_claims(query, evidence_units)
-        .unwrap_or_else(|| synthesize_supported_claims(query, evidence_units));
+    let mut claims = synthesize_contextual_supported_claims(query, evidence_units);
     if claims.is_empty() {
         return None;
     }
@@ -556,6 +568,142 @@ fn synthesize_multi_part_supported_claims(
     (claims.len() >= 2).then_some(claims)
 }
 
+fn synthesize_contextual_supported_claims(
+    query: &str,
+    evidence_units: &[&EvidenceUnit],
+) -> Vec<Claim> {
+    synthesize_multi_part_supported_claims(query, evidence_units)
+        .or_else(|| synthesize_version_change_claims(query, evidence_units))
+        .or_else(|| synthesize_compare_supported_claims(query, evidence_units))
+        .unwrap_or_else(|| synthesize_supported_claims(query, evidence_units))
+}
+
+fn synthesize_version_change_claims(
+    query: &str,
+    evidence_units: &[&EvidenceUnit],
+) -> Option<Vec<Claim>> {
+    let intent = classify_query_plan_intent(query);
+    if !matches!(
+        intent,
+        super::orchestration::QueryPlanIntent::VersionReview
+            | super::orchestration::QueryPlanIntent::StructuredVersionReview
+    ) {
+        return None;
+    }
+
+    let mut groups = BTreeMap::<(String, String), Vec<&EvidenceUnit>>::new();
+    for unit in evidence_units {
+        groups
+            .entry((unit.source_system.clone(), unit.object_id.clone()))
+            .or_default()
+            .push(*unit);
+    }
+
+    let mut claims = Vec::new();
+    for ((source_system, object_id), mut units) in groups {
+        units.sort_by(|left, right| left.version_id.cmp(&right.version_id));
+        units.dedup_by(|left, right| left.version_id == right.version_id);
+        if units.len() < 2 {
+            continue;
+        }
+        let Some(oldest) = units.first().copied() else {
+            continue;
+        };
+        let Some(newest) = units.last().copied() else {
+            continue;
+        };
+        let Some(old_summary) = oldest
+            .content
+            .as_ref()
+            .and_then(|content| summarize_content_for_query(content, query))
+        else {
+            continue;
+        };
+        let Some(new_summary) = newest
+            .content
+            .as_ref()
+            .and_then(|content| summarize_content_for_query(content, query))
+        else {
+            continue;
+        };
+        if old_summary == new_summary {
+            continue;
+        }
+
+        let evidence_unit_ids = normalize_evidence_unit_ids(&[
+            oldest.evidence_unit_id.clone(),
+            newest.evidence_unit_id.clone(),
+        ]);
+        let claim_text = format!(
+            "{}/{}: changed from {} to {}",
+            source_system,
+            object_id,
+            punctuated_sentence(&old_summary),
+            punctuated_sentence(&new_summary)
+        );
+        claims.push(Claim {
+            claim_id: claim_id_for(&claim_text, ClaimStatus::Supported, &evidence_unit_ids),
+            claim_text,
+            status: ClaimStatus::Supported,
+            evidence_unit_ids,
+            evidence_snippets: Vec::new(),
+        });
+    }
+
+    (!claims.is_empty()).then_some(claims)
+}
+
+fn synthesize_compare_supported_claims(
+    query: &str,
+    evidence_units: &[&EvidenceUnit],
+) -> Option<Vec<Claim>> {
+    let intent = classify_query_plan_intent(query);
+    if !matches!(
+        intent,
+        super::orchestration::QueryPlanIntent::StructuredAggregation
+            | super::orchestration::QueryPlanIntent::StructuredAggregationEvidence
+    ) {
+        return None;
+    }
+
+    let mut claim_parts = Vec::new();
+    let mut evidence_unit_ids = Vec::new();
+    for unit in evidence_units {
+        let Some(summary) = unit
+            .content
+            .as_ref()
+            .and_then(|content| summarize_content_for_query(content, query))
+        else {
+            continue;
+        };
+        if !claim_parts.iter().any(|existing| existing == &summary) {
+            claim_parts.push(summary);
+        }
+        evidence_unit_ids.push(unit.evidence_unit_id.clone());
+    }
+
+    if claim_parts.len() < 2 {
+        return None;
+    }
+
+    let evidence_unit_ids = normalize_evidence_unit_ids(&evidence_unit_ids);
+    let claim_text = format!(
+        "comparison summary: {}",
+        claim_parts
+            .into_iter()
+            .take(3)
+            .collect::<Vec<_>>()
+            .join("; ")
+    );
+    Some(vec![Claim {
+        claim_id: claim_id_for(&claim_text, ClaimStatus::Supported, &evidence_unit_ids),
+        claim_text,
+        status: ClaimStatus::Supported,
+        evidence_unit_ids,
+        evidence_snippets: Vec::new(),
+    }])
+}
+
 fn synthesize_supported_claims(query: &str, evidence_units: &[&EvidenceUnit]) -> Vec<Claim> {
     let mut grouped_candidates = BTreeMap::<String, SupportedClaimCandidate>::new();
 
@@ -710,7 +858,9 @@ fn extract_explicit_non_supported_claims(response_text: &str) -> Vec<(ClaimStatu
 fn select_finalize_evidence_units<'a>(
     query: &str,
     evidence_units: &'a [EvidenceUnit],
-) -> Vec<&'a EvidenceUnit> {
+    context_budget: &ContextBudget,
+) -> (Vec<&'a EvidenceUnit>, FinalizeContextStats) {
+    let pack_mode = evidence_pack_mode_for_query_intent(classify_query_plan_intent(query));
     let corroboration_counts = evidence_corroboration_counts(query, evidence_units.iter());
     let mut ranked = evidence_units
         .iter()
@@ -742,23 +892,119 @@ fn select_finalize_evidence_units<'a>(
 
     let mut seen_keys = BTreeSet::new();
     let mut selected = Vec::new();
+    let input_chars = evidence_units
+        .iter()
+        .map(evidence_unit_input_chars)
+        .sum::<usize>();
+    let mut packed_chars = 0usize;
+    let per_item_budget =
+        (context_budget.max_total_chars / context_budget.max_evidence_units.max(1)).max(96);
     for (_, _, key, unit) in ranked {
         if !seen_keys.insert(key) {
             continue;
         }
-        selected.push(unit);
-        if selected.len() >= MAX_FINALIZE_EVIDENCE_UNITS {
-            break;
+        let summary = evidence_pack_summary(query, unit, pack_mode, per_item_budget);
+        let estimated_chars = summary.chars().count().max(1);
+        if selected.len() >= context_budget.max_evidence_units {
+            continue;
         }
+        if !selected.is_empty()
+            && packed_chars.saturating_add(estimated_chars) > context_budget.max_total_chars
+        {
+            continue;
+        }
+
+        packed_chars = packed_chars.saturating_add(estimated_chars);
+        selected.push(unit);
     }
 
-    selected
+    if selected.is_empty()
+        && let Some(unit) = evidence_units.first()
+    {
+        packed_chars = evidence_pack_summary(query, unit, pack_mode, per_item_budget)
+            .chars()
+            .count()
+            .max(1);
+        selected.push(unit);
+    }
+
+    let packed_evidence_units = selected.len();
+
+    (
+        selected,
+        FinalizeContextStats {
+            pack_mode,
+            input_evidence_units: evidence_units.len(),
+            packed_evidence_units,
+            input_chars,
+            packed_chars,
+        },
+    )
+}
+
+fn evidence_unit_input_chars(unit: &EvidenceUnit) -> usize {
+    let content_chars = unit
+        .content
+        .as_ref()
+        .and_then(|content| serde_json::to_string(content).ok())
+        .map(|content| content.chars().count())
+        .unwrap_or(0);
+    content_chars
+        + unit.source_system.chars().count()
+        + unit.object_id.chars().count()
+        + unit.version_id.chars().count()
+}
+
+fn evidence_pack_summary(
+    query: &str,
+    unit: &EvidenceUnit,
+    pack_mode: EvidencePackMode,
+    max_chars: usize,
+) -> String {
+    let summary = unit
+        .content
+        .as_ref()
+        .and_then(|content| summarize_content_for_query(content, query))
+        .unwrap_or_else(|| describe_evidence_unit(query, unit));
+    let base = match pack_mode {
+        EvidencePackMode::Raw => format!("{}: {}", evidence_location_label(unit), summary),
+        EvidencePackMode::Compact => {
+            format!(
+                "{}: {}",
+                evidence_location_label(unit),
+                abbreviate(&summary, 160)
+            )
+        }
+        EvidencePackMode::Summary => abbreviate(&summary, 120),
+        EvidencePackMode::Diff => format!(
+            "{} @ {}: {}",
+            evidence_location_label(unit),
+            abbreviate(unit.version_id.as_str(), 16),
+            abbreviate(&summary, 140)
+        ),
+        EvidencePackMode::Mixed => {
+            if matches!(
+                unit.content_type,
+                pecr_contracts::EvidenceContentType::ApplicationJson
+            ) {
+                abbreviate(&summary, 140)
+            } else {
+                format!(
+                    "{}: {}",
+                    evidence_location_label(unit),
+                    abbreviate(&summary, 140)
+                )
+            }
+        }
+    };
+    abbreviate(&base, max_chars)
 }
 
 fn select_finalize_evidence_unit_refs<'a>(
     query: &str,
     evidence_units: &[&'a EvidenceUnit],
 ) -> Vec<&'a EvidenceUnit> {
+    const MAX_FINALIZE_CLAUSE_EVIDENCE_UNITS: usize = 4;
     let corroboration_counts = evidence_corroboration_counts(query, evidence_units.iter().copied());
     let mut ranked = evidence_units
         .iter()
@@ -795,7 +1041,7 @@ fn select_finalize_evidence_unit_refs<'a>(
             continue;
         }
         selected.push(unit);
-        if selected.len() >= MAX_FINALIZE_EVIDENCE_UNITS {
+        if selected.len() >= MAX_FINALIZE_CLAUSE_EVIDENCE_UNITS {
             break;
         }
     }
@@ -1451,6 +1697,7 @@ mod tests {
             TerminalMode::InsufficientEvidence,
             None,
             &evidence_units,
+            &ContextBudget::default(),
         );
 
         assert_eq!(out.claim_map.terminal_mode, TerminalMode::Supported);
@@ -1491,6 +1738,7 @@ mod tests {
             TerminalMode::InsufficientEvidence,
             None,
             &evidence_units,
+            &ContextBudget::default(),
         );
 
         assert!(
@@ -1519,6 +1767,7 @@ mod tests {
             TerminalMode::InsufficientEvidence,
             None,
             &[first, duplicate],
+            &ContextBudget::default(),
         );
 
         assert_eq!(out.claim_map.claims.len(), 1);
@@ -1556,6 +1805,7 @@ mod tests {
             TerminalMode::InsufficientEvidence,
             None,
             &[first, second],
+            &ContextBudget::default(),
         );
 
         assert_eq!(out.claim_map.claims.len(), 1);
@@ -1603,6 +1853,12 @@ mod tests {
             TerminalMode::InsufficientEvidence,
             None,
             &evidence_units,
+            &ContextBudget {
+                max_evidence_units: 4,
+                max_total_chars: 320,
+                max_structured_rows: 4,
+                max_inline_citations: 4,
+            },
         );
 
         assert_eq!(out.claim_map.claims.len(), 4);
@@ -1632,6 +1888,7 @@ mod tests {
             TerminalMode::InsufficientEvidence,
             None,
             &evidence_units,
+            &ContextBudget::default(),
         );
 
         assert_eq!(out.claim_map.claims.len(), 1);
@@ -1654,6 +1911,7 @@ mod tests {
             TerminalMode::InsufficientEvidence,
             None,
             &evidence_units,
+            &ContextBudget::default(),
         );
 
         assert_eq!(out.claim_map.claims.len(), 1);
@@ -1693,6 +1951,7 @@ mod tests {
             TerminalMode::InsufficientEvidence,
             None,
             &evidence_units,
+            &ContextBudget::default(),
         );
 
         assert_eq!(out.claim_map.claims.len(), 1);
@@ -1742,6 +2001,7 @@ mod tests {
             TerminalMode::InsufficientEvidence,
             None,
             &evidence_units,
+            &ContextBudget::default(),
         );
 
         assert_eq!(out.claim_map.claims.len(), 2);
@@ -1856,6 +2116,7 @@ mod tests {
                     .to_string(),
             ),
             &evidence_units,
+            &ContextBudget::default(),
         );
 
         assert_eq!(out.claim_map.terminal_mode, TerminalMode::Supported);
@@ -1894,6 +2155,7 @@ mod tests {
             TerminalMode::InsufficientEvidence,
             Some("I could only confirm part of the request.".to_string()),
             &evidence_units,
+            &ContextBudget::default(),
         );
 
         assert_eq!(out.claim_map.terminal_mode, TerminalMode::Supported);
@@ -1927,6 +2189,7 @@ mod tests {
             TerminalMode::Supported,
             Some("UNKNOWN: insufficient evidence to answer the query.".to_string()),
             &evidence_units,
+            &ContextBudget::default(),
         );
 
         assert_eq!(out.claim_map.terminal_mode, TerminalMode::Supported);
@@ -1955,6 +2218,7 @@ mod tests {
             TerminalMode::Supported,
             Some("UNKNOWN: insufficient evidence to answer the query.".to_string()),
             &evidence_units,
+            &ContextBudget::default(),
         );
 
         assert_eq!(
@@ -1975,7 +2239,13 @@ mod tests {
 
     #[test]
     fn build_finalize_output_uses_ambiguity_guidance_for_broad_query_without_evidence() {
-        let out = build_finalize_output("customer", TerminalMode::InsufficientEvidence, None, &[]);
+        let out = build_finalize_output(
+            "customer",
+            TerminalMode::InsufficientEvidence,
+            None,
+            &[],
+            &ContextBudget::default(),
+        );
 
         assert_eq!(
             out.claim_map.terminal_mode,

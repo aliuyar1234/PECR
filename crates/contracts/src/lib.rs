@@ -44,6 +44,28 @@ pub const PLANNER_CONTRACT_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
+pub enum EvidencePackMode {
+    Raw,
+    Compact,
+    Summary,
+    Diff,
+    Mixed,
+}
+
+impl EvidencePackMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            EvidencePackMode::Raw => "raw",
+            EvidencePackMode::Compact => "compact",
+            EvidencePackMode::Summary => "summary",
+            EvidencePackMode::Diff => "diff",
+            EvidencePackMode::Mixed => "mixed",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum PlannerIntent {
     Default,
     StructuredLookup,
@@ -334,6 +356,51 @@ pub struct PlannerRecoveryContext {
     pub failure_terminal_mode: TerminalMode,
     #[serde(default)]
     pub attempted_path: Vec<PlannerStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_step_details: Option<PlannerStep>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerToolSchema {
+    pub name: String,
+    pub description: String,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub required_params: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub optional_params: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params_schema: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlannerObservationOutcome {
+    Succeeded,
+    Failed,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerObservation {
+    pub step: PlannerStep,
+    pub outcome: PlannerObservationOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_mode: Option<TerminalMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlannerFailureFeedback {
+    pub failure_code: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub failed_step: Option<PlannerStep>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal_mode: Option<TerminalMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -342,13 +409,23 @@ pub struct PlanRequest {
     pub schema_version: u32,
     pub query: String,
     pub budget: Budget,
+    pub context_budget: ContextBudget,
     pub planner_hints: PlannerHints,
+    pub preferred_evidence_pack_mode: EvidencePackMode,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub recovery_context: Option<PlannerRecoveryContext>,
     #[serde(default)]
     pub available_operator_names: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub operator_schemas: Vec<PlannerToolSchema>,
     #[serde(default)]
     pub allow_search_ref_fetch_span: bool,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub prior_observations: Vec<PlannerObservation>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub clarification_opportunities: Vec<ClarificationPrompt>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failure_feedback: Vec<PlannerFailureFeedback>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -558,6 +635,55 @@ impl Budget {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ContextBudget {
+    pub max_evidence_units: usize,
+    pub max_total_chars: usize,
+    pub max_structured_rows: usize,
+    pub max_inline_citations: usize,
+}
+
+impl ContextBudget {
+    pub const MAX_EVIDENCE_UNITS_HARD_LIMIT: usize = 128;
+    pub const MAX_TOTAL_CHARS_HARD_LIMIT: usize = 256 * 1024;
+    pub const MAX_STRUCTURED_ROWS_HARD_LIMIT: usize = 256;
+    pub const MAX_INLINE_CITATIONS_HARD_LIMIT: usize = 64;
+
+    pub fn validate(&self) -> Result<(), &'static str> {
+        if self.max_evidence_units == 0
+            || self.max_evidence_units > Self::MAX_EVIDENCE_UNITS_HARD_LIMIT
+        {
+            return Err("max_evidence_units out of range");
+        }
+        if self.max_total_chars == 0 || self.max_total_chars > Self::MAX_TOTAL_CHARS_HARD_LIMIT {
+            return Err("max_total_chars out of range");
+        }
+        if self.max_structured_rows == 0
+            || self.max_structured_rows > Self::MAX_STRUCTURED_ROWS_HARD_LIMIT
+        {
+            return Err("max_structured_rows out of range");
+        }
+        if self.max_inline_citations == 0
+            || self.max_inline_citations > Self::MAX_INLINE_CITATIONS_HARD_LIMIT
+        {
+            return Err("max_inline_citations out of range");
+        }
+        Ok(())
+    }
+}
+
+impl Default for ContextBudget {
+    fn default() -> Self {
+        Self {
+            max_evidence_units: 6,
+            max_total_chars: 2_400,
+            max_structured_rows: 6,
+            max_inline_citations: 4,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -707,6 +833,25 @@ mod tests {
     }
 
     #[test]
+    fn evidence_pack_mode_serializes_as_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&EvidencePackMode::Mixed).expect("serialize evidence pack mode"),
+            "\"mixed\""
+        );
+        assert_eq!(
+            serde_json::to_string(&EvidencePackMode::Diff).expect("serialize evidence pack mode"),
+            "\"diff\""
+        );
+    }
+
+    #[test]
+    fn context_budget_defaults_validate() {
+        ContextBudget::default()
+            .validate()
+            .expect("default context budget should be valid");
+    }
+
+    #[test]
     fn planner_contract_round_trip_preserves_steps() {
         let request = PlanRequest {
             schema_version: PLANNER_CONTRACT_SCHEMA_VERSION,
@@ -717,6 +862,12 @@ mod tests {
                 max_wallclock_ms: 1000,
                 max_recursion_depth: 3,
                 max_parallelism: Some(2),
+            },
+            context_budget: ContextBudget {
+                max_evidence_units: 8,
+                max_total_chars: 4096,
+                max_structured_rows: 8,
+                max_inline_citations: 6,
             },
             planner_hints: PlannerHints {
                 intent: PlannerIntent::StructuredLookup,
@@ -731,6 +882,7 @@ mod tests {
                     PlannerStep::SearchRefFetchSpan { max_refs: 2 },
                 ],
             },
+            preferred_evidence_pack_mode: EvidencePackMode::Mixed,
             recovery_context: Some(PlannerRecoveryContext {
                 failed_step: "fetch_rows".to_string(),
                 failure_terminal_mode: TerminalMode::SourceUnavailable,
@@ -741,6 +893,13 @@ mod tests {
                         "fields": ["status", "plan_tier"],
                     }),
                 }],
+                failed_step_details: Some(PlannerStep::Operator {
+                    op_name: "fetch_rows".to_string(),
+                    params: serde_json::json!({
+                        "view_id": "safe_customer_view_public",
+                        "fields": ["status", "plan_tier"],
+                    }),
+                }),
             }),
             available_operator_names: vec![
                 "fetch_rows".to_string(),
@@ -748,7 +907,49 @@ mod tests {
                 "search".to_string(),
                 "fetch_span".to_string(),
             ],
+            operator_schemas: vec![PlannerToolSchema {
+                name: "fetch_rows".to_string(),
+                description: "Fetch rows from an allowlisted safeview.".to_string(),
+                required_params: vec!["view_id".to_string(), "fields".to_string()],
+                optional_params: vec!["filter_spec".to_string()],
+                params_schema: Some(serde_json::json!({
+                    "type": "object",
+                    "required": ["view_id", "fields"],
+                    "properties": {
+                        "view_id": { "type": "string" },
+                        "fields": { "type": "array", "items": { "type": "string" } },
+                        "filter_spec": { "type": "object" },
+                    }
+                })),
+            }],
             allow_search_ref_fetch_span: true,
+            prior_observations: vec![PlannerObservation {
+                step: PlannerStep::Operator {
+                    op_name: "fetch_rows".to_string(),
+                    params: serde_json::json!({
+                        "view_id": "safe_customer_view_public",
+                        "fields": ["status", "plan_tier"],
+                    }),
+                },
+                outcome: PlannerObservationOutcome::Failed,
+                terminal_mode: Some(TerminalMode::SourceUnavailable),
+                summary: Some("fetch_rows failed and triggered recovery planning".to_string()),
+            }],
+            clarification_opportunities: Vec::new(),
+            failure_feedback: vec![PlannerFailureFeedback {
+                failure_code: "terminal_mode_source_unavailable".to_string(),
+                failed_step: Some(PlannerStep::Operator {
+                    op_name: "fetch_rows".to_string(),
+                    params: serde_json::json!({
+                        "view_id": "safe_customer_view_public",
+                        "fields": ["status", "plan_tier"],
+                    }),
+                }),
+                terminal_mode: Some(TerminalMode::SourceUnavailable),
+                message: Some(
+                    "The previous fetch_rows attempt ended with source_unavailable.".to_string(),
+                ),
+            }],
         };
         let response = PlanResponse {
             schema_version: PLANNER_CONTRACT_SCHEMA_VERSION,
@@ -884,6 +1085,7 @@ mod tests {
                         max_recursion_depth: 3,
                         max_parallelism: Some(1),
                     },
+                    context_budget: ContextBudget::default(),
                     planner_hints: PlannerHints {
                         intent: PlannerIntent::StructuredLookup,
                         recommended_path: vec![PlannerStep::Operator {
@@ -894,12 +1096,23 @@ mod tests {
                             }),
                         }],
                     },
+                    preferred_evidence_pack_mode: EvidencePackMode::Raw,
                     recovery_context: None,
                     available_operator_names: vec![
                         "fetch_rows".to_string(),
                         "lookup_evidence".to_string(),
                     ],
+                    operator_schemas: vec![PlannerToolSchema {
+                        name: "fetch_rows".to_string(),
+                        description: "Fetch rows from an allowlisted safeview.".to_string(),
+                        required_params: vec!["view_id".to_string(), "fields".to_string()],
+                        optional_params: vec!["filter_spec".to_string()],
+                        params_schema: None,
+                    }],
                     allow_search_ref_fetch_span: true,
+                    prior_observations: Vec::new(),
+                    clarification_opportunities: Vec::new(),
+                    failure_feedback: Vec::new(),
                 },
                 output_steps: vec![PlannerStep::Operator {
                     op_name: "fetch_rows".to_string(),

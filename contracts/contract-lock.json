@@ -4,12 +4,14 @@
     "crates/contracts/schemas/Claim.v1.schema.json": "298a362b4d5605fe8742300485d29b4766e2630e0964f2fdfa1f35b097e1b74a",
     "crates/contracts/schemas/ClaimEvidenceSnippet.v1.schema.json": "96862fef525ae77a0dc5b5243d4781a6a31b74b80066d97708d7b2887f6f4d6f",
     "crates/contracts/schemas/ClaimMap.v1.schema.json": "04341798ae3f4a334ad92cc056ea8eb39e0d8abadaa8e8bb4a043f69e4bbbc1e",
+    "crates/contracts/schemas/ContextBudget.v1.schema.json": "414e76c899dde28e4b4934719d52fc61ff610ffa17a3a5e729b7da8570b283fc",
     "crates/contracts/schemas/EngineComparisonSummary.v1.schema.json": "a841cc9107dbf9918e3c63f7f33807a96985f41afe89f748152a597671b4ce63",
     "crates/contracts/schemas/EngineMode.v1.schema.json": "54de6a7e794d4aef236e9b912c388f6246b21900d71692badb7c9b70b26c6758",
     "crates/contracts/schemas/ErrorResponse.v1.schema.json": "2c1dc6ee06b4a03ffea8ffea0e5b4679d44ef063f22280b2f95004266aad6ce7",
+    "crates/contracts/schemas/EvidencePackMode.v1.schema.json": "b85afd9309fc53b3dc7f2faf102d0ae533c9895cf6a9b0dd7f3324e9a6ee5d05",
     "crates/contracts/schemas/EvidenceUnit.v1.schema.json": "d313aaefc76c0552cb05a731ec7603b957f1a7743d96e5eba934944064ad8c11",
     "crates/contracts/schemas/EvidenceUnitRef.v1.schema.json": "cdb47eab8929d7a77d64beb10ef144f795dd0d646d8e16a2d298b7166b87e114",
-    "crates/contracts/schemas/PlanRequest.v1.schema.json": "dcb2bd8cf59d849cc48f9022c5a5a738e14d5baf3407a43dfa9aa10eaccb42b5",
+    "crates/contracts/schemas/PlanRequest.v1.schema.json": "7d2a4907eb7bec87366652714917482b955cfa03e59cdd46e8b96b94d6d0fd66",
     "crates/contracts/schemas/PlanResponse.v1.schema.json": "1f18204e2e7de0e7d1c2fbb5d6367004426e8141b3a78e1c55e70832de6a7e3d",
     "crates/contracts/schemas/PlannerHints.v1.schema.json": "9d634883ff505fded1d172326ba21a11184b657f2aa1eee00449adb48f48dc40",
     "crates/contracts/schemas/PlannerIntent.v1.schema.json": "09e6bcbe4b1cc2c4904dff59d026ae0e48c16e5409b7cca9c8b5f78b6eb86a39",
@@ -28,8 +30,8 @@
     "crates/contracts/schemas/RunQualityScorecard.v1.schema.json": "9b9d9dd608dc3638e4bf9684f3df7039e97a3370d056b2ff1a50eb01e1d71bff",
     "crates/contracts/schemas/TerminalMode.v1.schema.json": "330c335057f5b4c6e2ce1f8dc61f1583ee2f23cb4828d6be881d4957e7520a1c",
     "crates/contracts/schemas/TraceEvent.v1.schema.json": "beced50b5ae0c2bc5523635db3a1735efd3e75be702f22fff874ce6f793747a7",
-    "docs/openapi/contract_manifest.json": "3d1eff25fd28813ac0217cf39b32928d37b1bc62d9ac0aeb944aa0f88fe51df4",
-    "docs/openapi/pecr.v1.yaml": "07aae5b5f52c3c6f6f8d66949116b581aaf390eaf6cb6fe96edfa7772347edc3"
+    "docs/openapi/contract_manifest.json": "394484336b7024c93a2d29241edfb3ec0bafa3a71580483d0bf4f1cd16584801",
+    "docs/openapi/pecr.v1.yaml": "00d7066c46da4f1d3a55324e1297f335d40a35f8f26dc4a23c2562ab5e119999"
   },
   "generated_by": "scripts/contracts/update_contract_lock.py",
   "schema_version": 1

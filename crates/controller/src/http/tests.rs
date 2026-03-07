@@ -9,11 +9,13 @@ use axum::routing::post;
 use axum::{Json, Router};
 use pecr_contracts::{
     Budget, Claim, ClaimEvidenceSnippet, ClaimMap, ClaimStatus, ClarificationPrompt,
-    ClientResponseKind, EngineComparisonSummary, EngineMode, PLANNER_CONTRACT_SCHEMA_VERSION,
-    PlanRequest, PlanResponse, PlannerHints, PlannerIntent, PlannerRecoveryContext, PlannerStep,
-    ReplayBundle, ReplayBundleMetadata, ReplayEvaluationResult, ReplayEvaluationSubmission,
-    ReplayPlannerDecisionSummary, ReplayPlannerTrace, ReplayRunScore, RunQualityScorecard,
-    SafeAskCapability, SafeAskCatalog, TerminalMode,
+    ClientResponseKind, ContextBudget, EngineComparisonSummary, EngineMode, EvidencePackMode,
+    PLANNER_CONTRACT_SCHEMA_VERSION, PlanRequest, PlanResponse, PlannerFailureFeedback,
+    PlannerHints, PlannerIntent, PlannerObservation, PlannerObservationOutcome,
+    PlannerRecoveryContext, PlannerStep, PlannerToolSchema, ReplayBundle, ReplayBundleMetadata,
+    ReplayEvaluationResult, ReplayEvaluationSubmission, ReplayPlannerDecisionSummary,
+    ReplayPlannerTrace, ReplayRunScore, RunQualityScorecard, SafeAskCapability, SafeAskCatalog,
+    TerminalMode,
 };
 use std::collections::BTreeSet;
 #[cfg(feature = "rlm")]
@@ -179,30 +181,66 @@ fn controller_http_shapes_match_contract_manifest() {
             PlannerStep::SearchRefFetchSpan { max_refs: 2 },
         ],
     };
+    let failed_fetch_rows_step = PlannerStep::Operator {
+        op_name: "fetch_rows".to_string(),
+        params: serde_json::json!({
+            "view_id": "safe_customer_view_public",
+            "fields": ["status", "plan_tier"],
+        }),
+    };
+    let planner_recovery_context = PlannerRecoveryContext {
+        failed_step: "fetch_rows".to_string(),
+        failure_terminal_mode: TerminalMode::SourceUnavailable,
+        attempted_path: vec![failed_fetch_rows_step.clone()],
+        failed_step_details: Some(failed_fetch_rows_step.clone()),
+    };
+    let planner_tool_schema = PlannerToolSchema {
+        name: "fetch_rows".to_string(),
+        description: "Fetch rows from an allowlisted safeview.".to_string(),
+        required_params: vec!["view_id".to_string(), "fields".to_string()],
+        optional_params: vec!["filter_spec".to_string()],
+        params_schema: Some(serde_json::json!({
+            "type": "object",
+            "required": ["view_id", "fields"],
+            "properties": {
+                "view_id": { "type": "string" },
+                "fields": { "type": "array", "items": { "type": "string" } },
+                "filter_spec": { "type": "object" }
+            }
+        })),
+    };
+    let planner_observation = PlannerObservation {
+        step: failed_fetch_rows_step.clone(),
+        outcome: PlannerObservationOutcome::Failed,
+        terminal_mode: Some(TerminalMode::SourceUnavailable),
+        summary: Some("fetch_rows failed and triggered recovery planning".to_string()),
+    };
+    let planner_failure_feedback = PlannerFailureFeedback {
+        failure_code: "terminal_mode_source_unavailable".to_string(),
+        failed_step: Some(failed_fetch_rows_step.clone()),
+        terminal_mode: Some(TerminalMode::SourceUnavailable),
+        message: Some("The previous fetch_rows attempt ended with source_unavailable.".to_string()),
+    };
     let planner_trace = ReplayPlannerTrace {
         plan_request: PlanRequest {
             schema_version: PLANNER_CONTRACT_SCHEMA_VERSION,
             query: "What is the customer status and plan tier?".to_string(),
             budget: budget.clone(),
+            context_budget: ContextBudget::default(),
             planner_hints: planner_hints.clone(),
-            recovery_context: Some(PlannerRecoveryContext {
-                failed_step: "fetch_rows".to_string(),
-                failure_terminal_mode: TerminalMode::SourceUnavailable,
-                attempted_path: vec![PlannerStep::Operator {
-                    op_name: "fetch_rows".to_string(),
-                    params: serde_json::json!({
-                        "view_id": "safe_customer_view_public",
-                        "fields": ["status", "plan_tier"],
-                    }),
-                }],
-            }),
+            preferred_evidence_pack_mode: EvidencePackMode::Mixed,
+            recovery_context: Some(planner_recovery_context.clone()),
             available_operator_names: vec![
                 "fetch_rows".to_string(),
                 "lookup_evidence".to_string(),
                 "search".to_string(),
                 "fetch_span".to_string(),
             ],
+            operator_schemas: vec![planner_tool_schema.clone()],
             allow_search_ref_fetch_span: true,
+            prior_observations: vec![planner_observation.clone()],
+            clarification_opportunities: vec![clarification_prompt.clone()],
+            failure_feedback: vec![planner_failure_feedback.clone()],
         },
         output_steps: planner_hints.recommended_path.clone(),
         decision_summary: ReplayPlannerDecisionSummary {
@@ -292,18 +330,23 @@ fn controller_http_shapes_match_contract_manifest() {
     );
     assert_contract_shape(
         "PlannerRecoveryContext",
-        &serde_json::to_value(PlannerRecoveryContext {
-            failed_step: "fetch_rows".to_string(),
-            failure_terminal_mode: TerminalMode::SourceUnavailable,
-            attempted_path: vec![PlannerStep::Operator {
-                op_name: "fetch_rows".to_string(),
-                params: serde_json::json!({
-                    "view_id": "safe_customer_view_public",
-                    "fields": ["status", "plan_tier"],
-                }),
-            }],
-        })
-        .expect("planner recovery context should serialize"),
+        &serde_json::to_value(planner_recovery_context.clone())
+            .expect("planner recovery context should serialize"),
+    );
+    assert_contract_shape(
+        "PlannerToolSchema",
+        &serde_json::to_value(planner_tool_schema.clone())
+            .expect("planner tool schema should serialize"),
+    );
+    assert_contract_shape(
+        "PlannerObservation",
+        &serde_json::to_value(planner_observation.clone())
+            .expect("planner observation should serialize"),
+    );
+    assert_contract_shape(
+        "PlannerFailureFeedback",
+        &serde_json::to_value(planner_failure_feedback.clone())
+            .expect("planner failure feedback should serialize"),
     );
     assert_contract_shape(
         "PlanRequest",
@@ -311,25 +354,21 @@ fn controller_http_shapes_match_contract_manifest() {
             schema_version: PLANNER_CONTRACT_SCHEMA_VERSION,
             query: "What is the customer status and plan tier?".to_string(),
             budget: budget.clone(),
+            context_budget: ContextBudget::default(),
             planner_hints: planner_hints.clone(),
-            recovery_context: Some(PlannerRecoveryContext {
-                failed_step: "fetch_rows".to_string(),
-                failure_terminal_mode: TerminalMode::SourceUnavailable,
-                attempted_path: vec![PlannerStep::Operator {
-                    op_name: "fetch_rows".to_string(),
-                    params: serde_json::json!({
-                        "view_id": "safe_customer_view_public",
-                        "fields": ["status", "plan_tier"],
-                    }),
-                }],
-            }),
+            preferred_evidence_pack_mode: EvidencePackMode::Mixed,
+            recovery_context: Some(planner_recovery_context),
             available_operator_names: vec![
                 "fetch_rows".to_string(),
                 "lookup_evidence".to_string(),
                 "search".to_string(),
                 "fetch_span".to_string(),
             ],
+            operator_schemas: vec![planner_tool_schema],
             allow_search_ref_fetch_span: true,
+            prior_observations: vec![planner_observation],
+            clarification_opportunities: vec![clarification_prompt],
+            failure_feedback: vec![planner_failure_feedback],
         })
         .expect("plan request should serialize"),
     );
@@ -1443,11 +1482,34 @@ async fn spawn_parallel_fetch_gateway(
     (addr, shutdown_tx, handle)
 }
 
-async fn spawn_run_gateway() -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+async fn spawn_run_gateway_with_session_failures(
+    failures_before_success: usize,
+) -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    let remaining_session_failures = Arc::new(AtomicUsize::new(failures_before_success));
+
     async fn create_session(
+        State(remaining_session_failures): State<Arc<AtomicUsize>>,
         headers: HeaderMap,
         Json(req): Json<serde_json::Value>,
-    ) -> (HeaderMap, Json<serde_json::Value>) {
+    ) -> Response {
+        let remaining = remaining_session_failures.load(Ordering::SeqCst);
+        if remaining > 0
+            && remaining_session_failures
+                .compare_exchange(remaining, remaining - 1, Ordering::SeqCst, Ordering::SeqCst)
+                .is_ok()
+        {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(serde_json::json!({
+                    "code": "ERR_LEDGER_UNAVAILABLE",
+                    "message": "ledger unavailable",
+                    "terminal_mode_hint": "SOURCE_UNAVAILABLE",
+                    "retryable": true
+                })),
+            )
+                .into_response();
+        }
+
         let trace_id = headers
             .get("x-pecr-trace-id")
             .and_then(|value| value.to_str().ok())
@@ -1466,6 +1528,7 @@ async fn spawn_run_gateway() -> (SocketAddr, oneshot::Sender<()>, tokio::task::J
                 "budget": req.get("budget").cloned().unwrap_or_else(|| serde_json::json!({}))
             })),
         )
+            .into_response()
     }
 
     async fn finalize(
@@ -1735,7 +1798,8 @@ async fn spawn_run_gateway() -> (SocketAddr, oneshot::Sender<()>, tokio::task::J
         .route("/v1/operators/compare", post(aggregate))
         .route("/v1/operators/search", post(search))
         .route("/v1/operators/fetch_span", post(fetch_span))
-        .route("/v1/operators/lookup_evidence", post(lookup_evidence));
+        .route("/v1/operators/lookup_evidence", post(lookup_evidence))
+        .with_state(remaining_session_failures);
 
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
@@ -1752,6 +1816,10 @@ async fn spawn_run_gateway() -> (SocketAddr, oneshot::Sender<()>, tokio::task::J
     });
 
     (addr, shutdown_tx, handle)
+}
+
+async fn spawn_run_gateway() -> (SocketAddr, oneshot::Sender<()>, tokio::task::JoinHandle<()>) {
+    spawn_run_gateway_with_session_failures(0).await
 }
 
 async fn wait_for_replays(
@@ -1793,7 +1861,9 @@ fn controller_state(
             gateway_url: format!("http://{}", gateway_addr),
             controller_engine: crate::config::ControllerEngine::Baseline,
             model_provider: crate::config::ModelProvider::Mock,
+            rlm_script_path: None,
             budget_defaults: budget,
+            context_budget: pecr_contracts::ContextBudget::default(),
             baseline_plan,
             planner_mode: crate::config::PlannerMode::RustOwned,
             planner_client: crate::config::PlannerClientKind::Disabled,
@@ -2658,6 +2728,60 @@ async fn capabilities_endpoint_proxies_gateway_safe_ask_catalog() {
     assert_eq!(
         payload.suggested_queries,
         vec!["What is the customer status and plan tier?".to_string()]
+    );
+}
+
+#[tokio::test]
+async fn run_retries_retryable_gateway_session_create_failures() {
+    let (gateway_addr, gateway_shutdown, gateway_task) =
+        spawn_run_gateway_with_session_failures(2).await;
+    let budget = Budget {
+        max_operator_calls: 10,
+        max_bytes: 1024 * 1024,
+        max_wallclock_ms: 10_000,
+        max_recursion_depth: 5,
+        max_parallelism: Some(1),
+    };
+    let state = controller_state(
+        gateway_addr,
+        budget.clone(),
+        crate::config::default_baseline_plan(),
+    );
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-pecr-principal-id", HeaderValue::from_static("dev"));
+    headers.insert(
+        "x-pecr-request-id",
+        HeaderValue::from_static("req-gateway-session-retry"),
+    );
+    headers.insert(
+        "x-pecr-trace-id",
+        HeaderValue::from_static("trace-gateway-session-retry"),
+    );
+
+    let response = run(
+        State(state),
+        headers,
+        Json(RunRequest {
+            query: "What is the customer status and plan tier?".to_string(),
+            budget: Some(budget),
+        }),
+    )
+    .await
+    .expect("run should retry transient gateway session failures");
+
+    gateway_shutdown.send(()).ok();
+    let _ = gateway_task.await;
+
+    assert_eq!(response.0.terminal_mode, TerminalMode::Supported);
+    assert!(
+        response
+            .0
+            .claim_map
+            .claims
+            .iter()
+            .any(|claim| claim.status == ClaimStatus::Supported),
+        "supported run should preserve supported claim evidence"
     );
 }
 
@@ -4210,6 +4334,205 @@ async fn rlm_loop_uses_task_aware_operator_paths_for_useful_queries() {
 
 #[cfg(feature = "rlm")]
 #[tokio::test]
+async fn rlm_loop_requests_clarification_before_tool_calls_for_ambiguous_query() {
+    let _env_lock = RLM_SCRIPT_ENV_LOCK
+        .lock()
+        .expect("rlm script env lock should not be poisoned");
+    let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("scripts")
+        .join("rlm")
+        .join("pecr_rlm_bridge.py");
+    assert!(script_path.exists(), "rlm bridge script must exist");
+
+    let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+    let previous_backend = std::env::var("PECR_RLM_BACKEND").ok();
+    // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+    unsafe {
+        std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+        std::env::set_var("PECR_RLM_BACKEND", "mock");
+    }
+
+    let metrics = PlannedGatewayMetrics::default();
+    let (gateway_addr, shutdown, task) = spawn_planned_gateway(metrics.clone()).await;
+
+    let budget = Budget {
+        max_operator_calls: 100,
+        max_bytes: 1024 * 1024,
+        max_wallclock_ms: 10_000,
+        max_recursion_depth: 10,
+        max_parallelism: Some(2),
+    };
+    let state = controller_state(
+        gateway_addr,
+        budget.clone(),
+        crate::config::default_baseline_plan(),
+    );
+    let ctx = GatewayCallContext {
+        principal_id: "dev",
+        authz_header: None,
+        local_auth_shared_secret: None,
+        request_id: "req_rlm_clarification",
+        trace_id: "trace_rlm_clarification",
+        session_token: "token",
+        session_id: "session",
+    };
+    let result = run_context_loop_rlm(&state, ctx, "status", &budget)
+        .await
+        .expect("rlm context loop should return a clarification prompt");
+
+    shutdown.send(()).ok();
+    let _ = task.await;
+
+    if let Some(previous) = previous_script_path {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+        }
+    } else {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+        }
+    }
+    if let Some(previous) = previous_backend {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::set_var("PECR_RLM_BACKEND", previous);
+        }
+    } else {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::remove_var("PECR_RLM_BACKEND");
+        }
+    }
+
+    assert_eq!(metrics.snapshot(), Vec::<String>::new());
+    assert_eq!(result.operator_calls_used, 0);
+    assert_eq!(result.terminal_mode, TerminalMode::InsufficientEvidence);
+    assert!(
+        result
+            .response_text
+            .as_deref()
+            .is_some_and(|text| text.contains("I need one detail first")),
+        "ambiguous RLM query should return clarification guidance"
+    );
+    assert!(
+        result.planner_traces.iter().any(|trace| {
+            trace.decision_summary.planner_source == "rlm_bridge"
+                && trace.decision_summary.stop_reason == "clarification_requested"
+        }),
+        "clarification stop reason should remain replay-visible"
+    );
+}
+
+#[cfg(feature = "rlm")]
+#[tokio::test]
+async fn rlm_loop_recovers_after_fetch_rows_failure_with_evidence_fallback() {
+    let _env_lock = RLM_SCRIPT_ENV_LOCK
+        .lock()
+        .expect("rlm script env lock should not be poisoned");
+    let script_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("..")
+        .join("scripts")
+        .join("rlm")
+        .join("pecr_rlm_bridge.py");
+    assert!(script_path.exists(), "rlm bridge script must exist");
+
+    let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+    let previous_backend = std::env::var("PECR_RLM_BACKEND").ok();
+    // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+    unsafe {
+        std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+        std::env::set_var("PECR_RLM_BACKEND", "mock");
+    }
+
+    let metrics = PlannedGatewayMetrics::default();
+    let (gateway_addr, shutdown, task) = spawn_planned_gateway_with_failures(
+        metrics.clone(),
+        std::collections::HashMap::from([(
+            "fetch_rows".to_string(),
+            TerminalMode::SourceUnavailable,
+        )]),
+    )
+    .await;
+
+    let budget = Budget {
+        max_operator_calls: 100,
+        max_bytes: 1024 * 1024,
+        max_wallclock_ms: 10_000,
+        max_recursion_depth: 10,
+        max_parallelism: Some(2),
+    };
+    let state = controller_state(
+        gateway_addr,
+        budget.clone(),
+        crate::config::default_baseline_plan(),
+    );
+    let ctx = GatewayCallContext {
+        principal_id: "dev",
+        authz_header: None,
+        local_auth_shared_secret: None,
+        request_id: "req_rlm_recovery",
+        trace_id: "trace_rlm_recovery",
+        session_token: "token",
+        session_id: "session",
+    };
+    let result = run_context_loop_rlm(
+        &state,
+        ctx,
+        "What is the customer status and plan tier?",
+        &budget,
+    )
+    .await
+    .expect("rlm context loop should recover through an evidence fallback");
+
+    shutdown.send(()).ok();
+    let _ = task.await;
+
+    if let Some(previous) = previous_script_path {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+        }
+    } else {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+        }
+    }
+    if let Some(previous) = previous_backend {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::set_var("PECR_RLM_BACKEND", previous);
+        }
+    } else {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::remove_var("PECR_RLM_BACKEND");
+        }
+    }
+
+    assert_eq!(
+        metrics.snapshot(),
+        vec!["fetch_rows".to_string(), "lookup_evidence".to_string()]
+    );
+    assert_eq!(result.operator_calls_used, 2);
+    assert_eq!(result.terminal_mode, TerminalMode::Supported);
+    assert!(!result.evidence_units.is_empty());
+    assert!(
+        result.planner_traces.iter().any(|trace| {
+            trace.decision_summary.planner_source == "rlm_bridge"
+                && trace.decision_summary.stop_reason == "recovered_after_fetch_rows"
+        }),
+        "recovery stop reason should remain replay-visible"
+    );
+}
+
+#[cfg(feature = "rlm")]
+#[tokio::test]
 async fn rlm_loop_start_message_includes_typed_plan_request() {
     let _env_lock = RLM_SCRIPT_ENV_LOCK
         .lock()
@@ -4236,6 +4559,15 @@ if plan_request.get("allow_search_ref_fetch_span") is not True:
 operator_names = plan_request.get("available_operator_names")
 if not isinstance(operator_names, list) or "fetch_rows" not in operator_names or "lookup_evidence" not in operator_names:
     raise SystemExit("missing advertised operator names")
+operator_schemas = plan_request.get("operator_schemas")
+if not isinstance(operator_schemas, list) or not operator_schemas:
+    raise SystemExit("missing operator schemas")
+fetch_rows_schema = next((schema for schema in operator_schemas if schema.get("name") == "fetch_rows"), None)
+if not isinstance(fetch_rows_schema, dict):
+    raise SystemExit("missing fetch_rows schema")
+required_params = fetch_rows_schema.get("required_params")
+if not isinstance(required_params, list) or "view_id" not in required_params or "fields" not in required_params:
+    raise SystemExit("missing fetch_rows required params")
 planner_hints = plan_request.get("planner_hints")
 if planner_hints.get("intent") != "structured_lookup":
     raise SystemExit("unexpected planner intent")
@@ -4542,6 +4874,7 @@ async fn rlm_loop_executes_batch_calls_with_parallelism_budget() {
         max_recursion_depth: 10,
         max_parallelism: Some(2),
     };
+    let query = "alpha beta gamma";
     let state = controller_state(
         gateway_addr,
         budget.clone(),
@@ -4556,7 +4889,7 @@ async fn rlm_loop_executes_batch_calls_with_parallelism_budget() {
         session_token: "token",
         session_id: "session",
     };
-    let result = run_context_loop_rlm(&state, ctx, "query", &budget).await;
+    let result = run_context_loop_rlm(&state, ctx, query, &budget).await;
 
     shutdown.send(()).ok();
     let _ = task.await;
@@ -4611,6 +4944,7 @@ async fn rlm_loop_batch_mode_flag_off_falls_back_to_sequential() {
         max_recursion_depth: 10,
         max_parallelism: Some(4),
     };
+    let query = "alpha beta gamma";
     let mut state = controller_state(
         gateway_addr,
         budget.clone(),
@@ -4626,7 +4960,7 @@ async fn rlm_loop_batch_mode_flag_off_falls_back_to_sequential() {
         session_token: "token",
         session_id: "session",
     };
-    let result = run_context_loop_rlm(&state, ctx, "query", &budget).await;
+    let result = run_context_loop_rlm(&state, ctx, query, &budget).await;
 
     shutdown.send(()).ok();
     let _ = task.await;

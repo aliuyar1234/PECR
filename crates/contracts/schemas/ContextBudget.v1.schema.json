@@ -1,0 +1,17 @@
+{
+  "$id": "pecr.schemas.ContextBudget.v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "max_evidence_units",
+    "max_total_chars",
+    "max_structured_rows",
+    "max_inline_citations"
+  ],
+  "properties": {
+    "max_evidence_units": { "type": "integer", "minimum": 1, "maximum": 128 },
+    "max_total_chars": { "type": "integer", "minimum": 1, "maximum": 262144 },
+    "max_structured_rows": { "type": "integer", "minimum": 1, "maximum": 256 },
+    "max_inline_citations": { "type": "integer", "minimum": 1, "maximum": 64 }
+  }
+}

@@ -6,9 +6,11 @@ use std::time::{Duration, Instant};
 use axum::http::StatusCode;
 use futures_util::stream::{FuturesUnordered, StreamExt};
 use pecr_contracts::{
-    Budget, ClarificationPrompt, EvidenceUnit, EvidenceUnitRef, PLANNER_CONTRACT_SCHEMA_VERSION,
-    PlanRequest, PlanResponse, PlannerHints, PlannerIntent, PlannerRecoveryContext, PlannerStep,
-    ReplayPlannerDecisionSummary, ReplayPlannerTrace, TerminalMode,
+    Budget, ClarificationPrompt, ContextBudget, EvidencePackMode, EvidenceUnit, EvidenceUnitRef,
+    PLANNER_CONTRACT_SCHEMA_VERSION, PlanRequest, PlanResponse, PlannerFailureFeedback,
+    PlannerHints, PlannerIntent, PlannerObservation, PlannerObservationOutcome,
+    PlannerRecoveryContext, PlannerStep, PlannerToolSchema, ReplayPlannerDecisionSummary,
+    ReplayPlannerTrace, TerminalMode,
 };
 use serde::{Deserialize, Serialize};
 use tracing::Instrument;
@@ -103,7 +105,7 @@ struct OperatorCallOutcome {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum QueryPlanIntent {
+pub(super) enum QueryPlanIntent {
     Default,
     StructuredLookup,
     StructuredAggregation,
@@ -866,7 +868,7 @@ fn render_policy_narrowing_guidance(
     Some(message)
 }
 
-fn classify_query_plan_intent(query: &str) -> QueryPlanIntent {
+pub(super) fn classify_query_plan_intent(query: &str) -> QueryPlanIntent {
     let tokens = query_tokens(query);
     if tokens.is_empty() {
         return QueryPlanIntent::Default;
@@ -1777,7 +1779,12 @@ async fn select_execution_plan(
 ) -> SelectedExecutionPlan {
     let beam_execution_enabled = state.config.controller_engine == ControllerEngine::BeamPlanner;
     let rust_steps = derive_baseline_plan(&state.config.baseline_plan, query);
-    let plan_request = plan_request_for_query(&state.config.baseline_plan, query, budget);
+    let plan_request = plan_request_for_query(
+        &state.config.baseline_plan,
+        query,
+        budget,
+        &state.config.context_budget,
+    );
     let rust_planner_steps = planner_steps_for_planned_steps(&rust_steps);
     let rust_assessment = assess_expected_usefulness(&plan_request, &rust_planner_steps);
     let mut planner_traces = vec![replay_planner_trace(
@@ -2000,6 +2007,7 @@ async fn attempt_beam_recovery_plan(
     let recovery_request = recovery_plan_request_for_query(
         query,
         budget,
+        &state.config.context_budget,
         fallback_steps,
         recovery_context_for_failure(active_steps, failed_step, failure_terminal_mode),
     );
@@ -2136,6 +2144,10 @@ fn recovery_context_for_failure(
         failed_step: step_name_for_baseline_step(&failed_step.step),
         failure_terminal_mode,
         attempted_path: planner_steps_for_planned_steps(active_steps),
+        failed_step_details: Some(planner_step_for_baseline_step(
+            failed_step.step.clone(),
+            failed_step.query_context.as_str(),
+        )),
     }
 }
 
@@ -3295,6 +3307,19 @@ fn planner_intent(intent: QueryPlanIntent) -> PlannerIntent {
     }
 }
 
+pub(super) fn evidence_pack_mode_for_query_intent(intent: QueryPlanIntent) -> EvidencePackMode {
+    match intent {
+        QueryPlanIntent::StructuredLookup => EvidencePackMode::Raw,
+        QueryPlanIntent::StructuredAggregation => EvidencePackMode::Summary,
+        QueryPlanIntent::EvidenceLookup => EvidencePackMode::Mixed,
+        QueryPlanIntent::VersionReview => EvidencePackMode::Diff,
+        QueryPlanIntent::StructuredEvidenceLookup => EvidencePackMode::Mixed,
+        QueryPlanIntent::StructuredAggregationEvidence => EvidencePackMode::Mixed,
+        QueryPlanIntent::StructuredVersionReview => EvidencePackMode::Diff,
+        QueryPlanIntent::Default => EvidencePackMode::Compact,
+    }
+}
+
 fn planner_step_for_baseline_step(step: BaselinePlanStep, query: &str) -> PlannerStep {
     match step {
         BaselinePlanStep::Operator { op_name, params } => PlannerStep::Operator {
@@ -3341,28 +3366,367 @@ fn planner_hints_for_query(plan: &[BaselinePlanStep], query: &str) -> PlannerHin
     }
 }
 
+fn planner_tool_schemas() -> Vec<PlannerToolSchema> {
+    vec![
+        PlannerToolSchema {
+            name: "aggregate".to_string(),
+            description:
+                "Aggregate rows from an allowlisted safeview for grouped counts or metrics."
+                    .to_string(),
+            required_params: vec!["view_id".to_string()],
+            optional_params: vec![
+                "filter_spec".to_string(),
+                "group_by".to_string(),
+                "include_rank".to_string(),
+                "metric".to_string(),
+                "metrics".to_string(),
+                "rank_direction".to_string(),
+                "time_granularity".to_string(),
+                "top_n".to_string(),
+            ],
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["view_id"],
+                "properties": {
+                    "view_id": { "type": "string" },
+                    "filter_spec": { "type": "object" },
+                    "group_by": { "type": "array", "items": { "type": "string" } },
+                    "metric": { "type": "string" },
+                    "metrics": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["name", "field"],
+                            "properties": {
+                                "name": { "type": "string" },
+                                "field": { "type": "string" }
+                            }
+                        }
+                    },
+                    "time_granularity": { "type": "string", "enum": ["day", "month"] },
+                    "top_n": { "type": "integer", "minimum": 1 },
+                    "include_rank": { "type": "boolean" },
+                    "rank_direction": { "type": "string", "enum": ["asc", "desc"] }
+                }
+            })),
+        },
+        PlannerToolSchema {
+            name: "compare".to_string(),
+            description:
+                "Compare grouped safeview metrics to answer trend or segmentation questions."
+                    .to_string(),
+            required_params: vec!["view_id".to_string()],
+            optional_params: vec![
+                "filter_spec".to_string(),
+                "group_by".to_string(),
+                "include_rank".to_string(),
+                "metric".to_string(),
+                "metrics".to_string(),
+                "rank_direction".to_string(),
+                "time_granularity".to_string(),
+                "top_n".to_string(),
+            ],
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["view_id"],
+                "properties": {
+                    "view_id": { "type": "string" },
+                    "filter_spec": { "type": "object" },
+                    "group_by": { "type": "array", "items": { "type": "string" } },
+                    "metric": { "type": "string" },
+                    "metrics": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "required": ["name", "field"],
+                            "properties": {
+                                "name": { "type": "string" },
+                                "field": { "type": "string" }
+                            }
+                        }
+                    },
+                    "time_granularity": { "type": "string", "enum": ["day", "month"] },
+                    "top_n": { "type": "integer", "minimum": 1 },
+                    "include_rank": { "type": "boolean" },
+                    "rank_direction": { "type": "string", "enum": ["asc", "desc"] }
+                }
+            })),
+        },
+        PlannerToolSchema {
+            name: "discover_dimensions".to_string(),
+            description:
+                "Inspect a safeview to discover available dimensions, values, and drilldowns."
+                    .to_string(),
+            required_params: vec!["view_id".to_string()],
+            optional_params: vec![
+                "filter_spec".to_string(),
+                "max_values_per_dimension".to_string(),
+            ],
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["view_id"],
+                "properties": {
+                    "view_id": { "type": "string" },
+                    "filter_spec": { "type": "object" },
+                    "max_values_per_dimension": { "type": "integer", "minimum": 1 }
+                }
+            })),
+        },
+        PlannerToolSchema {
+            name: "diff".to_string(),
+            description: "Compute a diff between two versions of the same object.".to_string(),
+            required_params: vec!["object_id".to_string(), "v1".to_string(), "v2".to_string()],
+            optional_params: Vec::new(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["object_id", "v1", "v2"],
+                "properties": {
+                    "object_id": { "type": "string" },
+                    "v1": { "type": "string" },
+                    "v2": { "type": "string" }
+                }
+            })),
+        },
+        PlannerToolSchema {
+            name: "fetch_rows".to_string(),
+            description: "Fetch rows from an allowlisted safeview.".to_string(),
+            required_params: vec!["view_id".to_string(), "fields".to_string()],
+            optional_params: vec!["filter_spec".to_string()],
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["view_id", "fields"],
+                "properties": {
+                    "view_id": { "type": "string" },
+                    "fields": { "type": "array", "items": { "type": "string" } },
+                    "filter_spec": { "type": "object" }
+                }
+            })),
+        },
+        PlannerToolSchema {
+            name: "fetch_span".to_string(),
+            description: "Fetch a text span from a policy or document object.".to_string(),
+            required_params: vec!["object_id".to_string()],
+            optional_params: vec!["start_byte".to_string(), "end_byte".to_string()],
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["object_id"],
+                "properties": {
+                    "object_id": { "type": "string" },
+                    "start_byte": { "type": "integer", "minimum": 0 },
+                    "end_byte": { "type": "integer", "minimum": 0 }
+                }
+            })),
+        },
+        PlannerToolSchema {
+            name: "list_versions".to_string(),
+            description: "List the available versions for a document or object.".to_string(),
+            required_params: vec!["object_id".to_string()],
+            optional_params: Vec::new(),
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["object_id"],
+                "properties": {
+                    "object_id": { "type": "string" }
+                }
+            })),
+        },
+        PlannerToolSchema {
+            name: "lookup_evidence".to_string(),
+            description:
+                "Search evidence and fetch a bounded set of supporting spans in one operator."
+                    .to_string(),
+            required_params: vec!["query".to_string()],
+            optional_params: vec![
+                "case_sensitive".to_string(),
+                "limit".to_string(),
+                "match_mode".to_string(),
+                "max_refs".to_string(),
+                "object_prefix".to_string(),
+                "terms".to_string(),
+            ],
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string" },
+                    "terms": { "type": "array", "items": { "type": "string" } },
+                    "limit": { "type": "integer", "minimum": 1 },
+                    "max_refs": { "type": "integer", "minimum": 1 },
+                    "object_prefix": { "type": "string" },
+                    "case_sensitive": { "type": "boolean" },
+                    "match_mode": { "type": "string", "enum": ["all", "any", "phrase"] }
+                }
+            })),
+        },
+        PlannerToolSchema {
+            name: "redact".to_string(),
+            description: "Apply an allowlisted redaction transform to structured evidence."
+                .to_string(),
+            required_params: Vec::new(),
+            optional_params: vec!["field_redaction".to_string()],
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "field_redaction": {
+                        "type": "object",
+                        "description": "Gateway-defined redaction instruction"
+                    }
+                }
+            })),
+        },
+        PlannerToolSchema {
+            name: "search".to_string(),
+            description: "Search policy-scoped documents or files for relevant references."
+                .to_string(),
+            required_params: vec!["query".to_string()],
+            optional_params: vec![
+                "case_sensitive".to_string(),
+                "limit".to_string(),
+                "match_mode".to_string(),
+                "object_prefix".to_string(),
+                "terms".to_string(),
+            ],
+            params_schema: Some(serde_json::json!({
+                "type": "object",
+                "required": ["query"],
+                "properties": {
+                    "query": { "type": "string" },
+                    "terms": { "type": "array", "items": { "type": "string" } },
+                    "limit": { "type": "integer", "minimum": 1 },
+                    "object_prefix": { "type": "string" },
+                    "case_sensitive": { "type": "boolean" },
+                    "match_mode": { "type": "string", "enum": ["all", "any", "phrase"] }
+                }
+            })),
+        },
+    ]
+}
+
+fn planner_clarification_opportunities(query: &str) -> Vec<ClarificationPrompt> {
+    clarification_prompt_for_query(query).into_iter().collect()
+}
+
+fn planner_prior_observations(
+    recovery_context: Option<&PlannerRecoveryContext>,
+) -> Vec<PlannerObservation> {
+    let Some(recovery_context) = recovery_context else {
+        return Vec::new();
+    };
+    let failed_index = recovery_context
+        .failed_step_details
+        .as_ref()
+        .and_then(|failed_step| {
+            recovery_context
+                .attempted_path
+                .iter()
+                .rposition(|attempted_step| attempted_step == failed_step)
+        })
+        .or_else(|| {
+            recovery_context
+                .attempted_path
+                .iter()
+                .rposition(|attempted_step| {
+                    planner_step_name(attempted_step) == recovery_context.failed_step
+                })
+        });
+
+    recovery_context
+        .attempted_path
+        .iter()
+        .enumerate()
+        .map(|(index, step)| {
+            let failed = failed_index == Some(index);
+            PlannerObservation {
+                step: step.clone(),
+                outcome: if failed {
+                    PlannerObservationOutcome::Failed
+                } else {
+                    PlannerObservationOutcome::Succeeded
+                },
+                terminal_mode: failed.then_some(recovery_context.failure_terminal_mode),
+                summary: Some(if failed {
+                    format!(
+                        "{} failed and triggered recovery planning",
+                        planner_step_name(step)
+                    )
+                } else {
+                    format!(
+                        "{} completed before recovery planning",
+                        planner_step_name(step)
+                    )
+                }),
+            }
+        })
+        .collect()
+}
+
+fn planner_failure_feedback(
+    recovery_context: Option<&PlannerRecoveryContext>,
+) -> Vec<PlannerFailureFeedback> {
+    let Some(recovery_context) = recovery_context else {
+        return Vec::new();
+    };
+    vec![PlannerFailureFeedback {
+        failure_code: format!(
+            "terminal_mode_{}",
+            recovery_context.failure_terminal_mode.as_str()
+        ),
+        failed_step: recovery_context.failed_step_details.clone(),
+        terminal_mode: Some(recovery_context.failure_terminal_mode),
+        message: Some(format!(
+            "The previous {} attempt ended with {}.",
+            recovery_context.failed_step,
+            recovery_context.failure_terminal_mode.as_str()
+        )),
+    }]
+}
+
 fn build_plan_request(
     query: &str,
     budget: &Budget,
+    context_budget: &ContextBudget,
     planner_hints: PlannerHints,
     recovery_context: Option<PlannerRecoveryContext>,
 ) -> PlanRequest {
+    let operator_schemas = planner_tool_schemas();
+    let prior_observations = planner_prior_observations(recovery_context.as_ref());
+    let clarification_opportunities = planner_clarification_opportunities(query);
+    let failure_feedback = planner_failure_feedback(recovery_context.as_ref());
     PlanRequest {
         schema_version: PLANNER_CONTRACT_SCHEMA_VERSION,
         query: query.to_string(),
         budget: budget.clone(),
+        context_budget: context_budget.clone(),
         planner_hints,
+        preferred_evidence_pack_mode: evidence_pack_mode_for_query_intent(
+            classify_query_plan_intent(query),
+        ),
         recovery_context,
         available_operator_names: PLANNER_AVAILABLE_OPERATOR_NAMES
             .iter()
             .map(|name| (*name).to_string())
             .collect(),
+        operator_schemas,
         allow_search_ref_fetch_span: true,
+        prior_observations,
+        clarification_opportunities,
+        failure_feedback,
     }
 }
 
-fn plan_request_for_query(plan: &[BaselinePlanStep], query: &str, budget: &Budget) -> PlanRequest {
-    build_plan_request(query, budget, planner_hints_for_query(plan, query), None)
+fn plan_request_for_query(
+    plan: &[BaselinePlanStep],
+    query: &str,
+    budget: &Budget,
+    context_budget: &ContextBudget,
+) -> PlanRequest {
+    build_plan_request(
+        query,
+        budget,
+        context_budget,
+        planner_hints_for_query(plan, query),
+        None,
+    )
 }
 
 #[cfg(feature = "rlm")]
@@ -3568,6 +3932,7 @@ fn bridge_failure_context_loop_result(
 fn recovery_plan_request_for_query(
     query: &str,
     budget: &Budget,
+    context_budget: &ContextBudget,
     fallback_steps: &[BaselinePlanStep],
     recovery_context: PlannerRecoveryContext,
 ) -> PlanRequest {
@@ -3575,6 +3940,7 @@ fn recovery_plan_request_for_query(
     build_plan_request(
         query,
         budget,
+        context_budget,
         PlannerHints {
             intent: PlannerIntent::Default,
             recommended_path: planner_steps_for_planned_steps(&planned_steps),
@@ -3609,12 +3975,26 @@ pub(super) async fn run_context_loop_rlm(
     let mut evidence_refs = Vec::<EvidenceUnitRef>::new();
     let mut evidence_units = Vec::<EvidenceUnit>::new();
 
-    let plan_request = plan_request_for_query(&state.config.baseline_plan, query_trimmed, budget);
-    let explicit_script_path = std::env::var("PECR_RLM_SCRIPT_PATH")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .map(PathBuf::from);
+    let plan_request = plan_request_for_query(
+        &state.config.baseline_plan,
+        query_trimmed,
+        budget,
+        &state.config.context_budget,
+    );
+    let explicit_script_path = state
+        .config
+        .rlm_script_path
+        .as_deref()
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("PECR_RLM_SCRIPT_PATH")
+                .ok()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .map(PathBuf::from)
+        });
     if should_short_circuit_mock_perf_probe(
         query_trimmed,
         &plan_request,
@@ -3991,7 +4371,6 @@ pub(super) async fn run_context_loop_rlm(
                         })?;
                 } else {
                     terminal_mode = outcome.terminal_mode_hint;
-                    stop_reason = Some("operator_error".to_string());
 
                     let resp = serde_json::json!({
                         "type": "operator_result",
@@ -4010,13 +4389,21 @@ pub(super) async fn run_context_loop_rlm(
                             false,
                         )
                     })?;
-                    let _ = bridge_process
+                    bridge_process
                         .as_mut()
                         .expect("cached bridge process should exist")
                         .stdin
                         .write_all(format!("{}\n", resp_line).as_bytes())
-                        .await;
-                    break;
+                        .await
+                        .map_err(|_| {
+                            json_error(
+                                StatusCode::INTERNAL_SERVER_ERROR,
+                                "ERR_RLM_BRIDGE_PROTOCOL",
+                                "failed to write rlm bridge response".to_string(),
+                                TerminalMode::SourceUnavailable,
+                                false,
+                            )
+                        })?;
                 }
 
                 if let Err(reason) = scheduler_span.in_scope(|| scheduler.check_bytes(bytes_used)) {

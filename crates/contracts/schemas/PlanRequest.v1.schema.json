@@ -6,19 +6,40 @@
     "schema_version",
     "query",
     "budget",
+    "context_budget",
     "planner_hints",
+    "preferred_evidence_pack_mode",
     "available_operator_names",
+    "operator_schemas",
     "allow_search_ref_fetch_span"
   ],
   "properties": {
     "schema_version": { "type": "integer", "minimum": 1 },
     "query": { "type": "string", "minLength": 1 },
     "budget": { "$ref": "pecr.schemas.Budget.v1" },
+    "context_budget": { "$ref": "pecr.schemas.ContextBudget.v1" },
     "planner_hints": { "$ref": "pecr.schemas.PlannerHints.v1" },
+    "preferred_evidence_pack_mode": { "$ref": "pecr.schemas.EvidencePackMode.v1" },
     "recovery_context": { "$ref": "pecr.schemas.PlannerRecoveryContext.v1" },
     "available_operator_names": {
       "type": "array",
       "items": { "type": "string", "minLength": 1 }
+    },
+    "operator_schemas": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "prior_observations": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "clarification_opportunities": {
+      "type": "array",
+      "items": { "type": "object" }
+    },
+    "failure_feedback": {
+      "type": "array",
+      "items": { "type": "object" }
     },
     "allow_search_ref_fetch_span": { "type": "boolean" }
   }

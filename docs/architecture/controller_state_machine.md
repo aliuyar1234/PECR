@@ -15,6 +15,7 @@ The controller loop is modeled as transitions over a bounded execution state:
 - `BudgetGate`: enforce depth/operator/wallclock/bytes constraints before any operator call.
 - `DispatchOperator`: call gateway operator with timeout.
 - `CollectResult`: parse response, collect evidence refs/units, update counters.
+- `ContextPack`: compact collected evidence into the planner/finalize envelope using the configured context budget and the query-aware pack mode (`raw`, `compact`, `summary`, `diff`, or `mixed`).
 - `Terminal`: exit with stop reason and terminal mode.
 
 Common stop reasons:
@@ -38,6 +39,16 @@ The scheduler is the single source for budget gates:
 
 These methods map to canonical stop reasons via `BudgetStopReason`.
 
+Phase 3 adds a second envelope that is intentionally separate from the execution scheduler:
+- `context_budget.max_evidence_units`
+- `context_budget.max_total_chars`
+- `context_budget.max_structured_rows`
+- `context_budget.max_inline_citations`
+
+Execution budget still decides how many operators can run and how long the request may spend. The
+context budget decides how much grounded evidence is allowed into planner or finalize synthesis once
+those operators have returned.
+
 ## Protocol Handshake (RLM Bridge)
 
 RLM loop starts by sending:
@@ -45,6 +56,8 @@ RLM loop starts by sending:
 - `protocol: { min_version, max_version }`
 - `query`
 - `budget`
+- `plan_request.context_budget`
+- `plan_request.preferred_evidence_pack_mode`
 
 Bridge should reply with:
 - `type: "start_ack"`
@@ -59,6 +72,10 @@ Controller metrics include:
 - `pecr_controller_inflight_ops`
 - `pecr_controller_operator_queue_wait_seconds`
 - `pecr_controller_budget_stop_reasons_total`
+- `pecr_controller_evidence_packs_total`
+- `pecr_controller_evidence_pack_units`
+- `pecr_controller_evidence_compaction_ratio`
+- `pecr_controller_citation_quality`
 - existing HTTP/terminal/budget counters
 
 These metrics are emitted from the orchestration loop and operator dispatch path.

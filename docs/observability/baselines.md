@@ -10,6 +10,9 @@ For the RLM-first rollout, every nightly lane and release candidate should repor
 - supported-answer rate on the same corpus
 - fallback recovery rate for degraded-path scenarios
 - finalize downgrade rate after a planner path appeared promising
+- context pack size and evidence-pack mode distribution for long-context scenarios
+- evidence compaction ratio for packed planner/finalize context
+- citation quality for supported claims after compaction or summarization
 - p95 latency for `/v1/run`
 - throughput for the standard perf lane
 - shadow delta versus baseline on matched benchmark scenarios
@@ -36,6 +39,8 @@ Before `rlm` becomes the default path, shadow delta versus baseline should be no
 - `SOURCE_UNAVAILABLE` rate spike on `/v1/run`, `/v1/operators`, or `/v1/finalize`.
 - replay-store read/write failures.
 - sustained finalize gate downgrade spikes if they indicate evidence coverage regression.
+- abnormal evidence compaction ratio shifts or evidence-pack mode drift on the long-context cohort.
+- citation-quality regression on supported answers after long-context packing changes.
 - shadow delta regression where RLM drops below baseline on the named benchmark set.
 
 ## Operator Runbook Expectations
@@ -49,6 +54,8 @@ Before `rlm` becomes the default path, shadow delta versus baseline should be no
   - verify Postgres reachability, ledger writes, and safe-view source health
 - Finalize regressions:
   - compare recent replay bundles against canonical fixtures and evaluation scorecards
+- Long-context regressions:
+  - inspect context-budget settings, evidence-pack mode distribution, compaction ratios, and claim-map citation quality before retuning prompts or perf gates
 - RLM shadow delta regressions:
   - compare the latest `rlm` and `baseline` replay scorecards on matched scenarios
   - inspect planner traces, bridge stop reasons, and finalize downgrade causes before tuning perf gates
@@ -60,6 +67,7 @@ Before `rlm` becomes the default path, shadow delta versus baseline should be no
 - `scripts/perf/suite7.sh` plus the perf tests protect latency and semantic regressions.
 - `scripts/run_useful_e2e.sh` proves the named usefulness scenarios and their fault-degradation behavior on the real stack.
 - `scripts/replay/useful_benchmark_cli.py` is the primary RLM-first usefulness scorecard for named scenarios.
+- `/metrics` should surface `pecr_controller_evidence_packs_total`, `pecr_controller_evidence_pack_units`, `pecr_controller_evidence_compaction_ratio`, and `pecr_controller_citation_quality` before treating Phase 3 as operationally complete.
 
 ## Usefulness Degradation Expectations
 

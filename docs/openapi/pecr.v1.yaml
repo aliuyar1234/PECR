@@ -840,6 +840,39 @@ components:
           minimum: 1
           maximum: 256
           description: Maximum concurrent operator calls for controller fan-out steps (baseline `search_ref_fetch_span` and RLM batch bridge calls). Defaults to 1 when omitted.
+    ContextBudget:
+      type: object
+      additionalProperties: false
+      required:
+        - max_evidence_units
+        - max_total_chars
+        - max_structured_rows
+        - max_inline_citations
+      properties:
+        max_evidence_units:
+          type: integer
+          minimum: 1
+          maximum: 128
+        max_total_chars:
+          type: integer
+          minimum: 1
+          maximum: 262144
+        max_structured_rows:
+          type: integer
+          minimum: 1
+          maximum: 256
+        max_inline_citations:
+          type: integer
+          minimum: 1
+          maximum: 64
+    EvidencePackMode:
+      type: string
+      enum:
+        - raw
+        - compact
+        - summary
+        - diff
+        - mixed
     TerminalMode:
       type: string
       enum:
@@ -944,6 +977,68 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/PlannerStep"
+        failed_step_details:
+          $ref: "#/components/schemas/PlannerStep"
+    PlannerToolSchema:
+      type: object
+      additionalProperties: false
+      required:
+        - name
+        - description
+      properties:
+        name:
+          type: string
+          minLength: 1
+        description:
+          type: string
+          minLength: 1
+        required_params:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        optional_params:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        params_schema:
+          type: object
+    PlannerObservationOutcome:
+      type: string
+      enum: [succeeded, failed]
+    PlannerObservation:
+      type: object
+      additionalProperties: false
+      required:
+        - step
+        - outcome
+      properties:
+        step:
+          $ref: "#/components/schemas/PlannerStep"
+        outcome:
+          $ref: "#/components/schemas/PlannerObservationOutcome"
+        terminal_mode:
+          $ref: "#/components/schemas/TerminalMode"
+        summary:
+          type: string
+          minLength: 1
+    PlannerFailureFeedback:
+      type: object
+      additionalProperties: false
+      required:
+        - failure_code
+      properties:
+        failure_code:
+          type: string
+          minLength: 1
+        failed_step:
+          $ref: "#/components/schemas/PlannerStep"
+        terminal_mode:
+          $ref: "#/components/schemas/TerminalMode"
+        message:
+          type: string
+          minLength: 1
     PlanRequest:
       type: object
       additionalProperties: false
@@ -951,8 +1046,11 @@ components:
         - schema_version
         - query
         - budget
+        - context_budget
         - planner_hints
+        - preferred_evidence_pack_mode
         - available_operator_names
+        - operator_schemas
         - allow_search_ref_fetch_span
       properties:
         schema_version:
@@ -963,8 +1061,12 @@ components:
           minLength: 1
         budget:
           $ref: "#/components/schemas/Budget"
+        context_budget:
+          $ref: "#/components/schemas/ContextBudget"
         planner_hints:
           $ref: "#/components/schemas/PlannerHints"
+        preferred_evidence_pack_mode:
+          $ref: "#/components/schemas/EvidencePackMode"
         recovery_context:
           $ref: "#/components/schemas/PlannerRecoveryContext"
         available_operator_names:
@@ -972,8 +1074,24 @@ components:
           items:
             type: string
             minLength: 1
+        operator_schemas:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlannerToolSchema"
         allow_search_ref_fetch_span:
           type: boolean
+        prior_observations:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlannerObservation"
+        clarification_opportunities:
+          type: array
+          items:
+            $ref: "#/components/schemas/ClarificationPrompt"
+        failure_feedback:
+          type: array
+          items:
+            $ref: "#/components/schemas/PlannerFailureFeedback"
     PlanResponse:
       type: object
       additionalProperties: false

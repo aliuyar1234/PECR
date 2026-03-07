@@ -494,7 +494,7 @@ pub fn compute_quality_score(
     )
 }
 
-fn compute_citation_quality(claim_map: &ClaimMap) -> f64 {
+pub(crate) fn compute_citation_quality(claim_map: &ClaimMap) -> f64 {
     let supported_claims = claim_map
         .claims
         .iter()

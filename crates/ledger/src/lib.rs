@@ -42,9 +42,30 @@ pub struct FinalizeResultRecord<'a> {
     pub session_id: &'a str,
     pub principal_id: &'a str,
     pub policy_snapshot_id: &'a str,
+    pub policy_decision_reason: &'a str,
     pub claim_map: &'a ClaimMap,
     pub budget_counters: &'a serde_json::Value,
     pub request_id: &'a str,
+    pub session_runtime: SessionRuntimeWrite<'a>,
+}
+
+pub struct OperatorResultRecord<'a> {
+    pub trace_id: &'a str,
+    pub session_id: &'a str,
+    pub principal_id: &'a str,
+    pub policy_snapshot_id: &'a str,
+    pub policy_decision_reason: &'a str,
+    pub op_name: &'a str,
+    pub request_id: &'a str,
+    pub params_hash: &'a str,
+    pub cache_hit: bool,
+    pub params_bytes: u64,
+    pub result_bytes: u64,
+    pub terminal_mode: TerminalMode,
+    pub error_code: Option<&'a str>,
+    pub evidence_units: &'a [EvidenceUnit],
+    pub store_payload: bool,
+    pub session_runtime: SessionRuntimeWrite<'a>,
 }
 
 pub struct SessionRuntimeWrite<'a> {
@@ -217,7 +238,7 @@ impl LedgerWriter {
         let event_id = Ulid::new().to_string();
         let payload_hash = canonical::hash_canonical_json(&payload_json);
 
-        tokio::time::timeout(
+        let execute_result = tokio::time::timeout(
             self.write_timeout,
             sqlx::query(
                 "INSERT INTO pecr_ledger_events (event_id, trace_id, session_id, event_type, principal_id, policy_snapshot_id, payload_json, payload_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
@@ -232,8 +253,24 @@ impl LedgerWriter {
             .bind(payload_hash)
             .execute(&self.pool),
         )
-        .await
-        .map_err(|_| LedgerError::Timeout)??;
+        .await;
+        let execute_result = match execute_result {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!(
+                    "ledger.append_event_timed_out trace_id={} session_id={} event_type={}",
+                    trace_id, session_id, event_type
+                );
+                return Err(LedgerError::Timeout);
+            }
+        };
+        if let Err(err) = execute_result {
+            eprintln!(
+                "ledger.append_event_failed trace_id={} session_id={} event_type={} error={}",
+                trace_id, session_id, event_type, err
+            );
+            return Err(LedgerError::Sqlx(err));
+        }
 
         Ok(event_id)
     }
@@ -320,6 +357,16 @@ impl LedgerWriter {
     ) -> Result<(), LedgerError> {
         let claim_map_json = serde_json::to_value(record.claim_map)
             .unwrap_or_else(|_| serde_json::json!({"claims": []}));
+        let evidence_unit_ids_json = serde_json::to_value(record.session_runtime.evidence_unit_ids)
+            .unwrap_or_else(|_| serde_json::json!([]));
+        let bytes_used = checked_bigint_from_u64(record.session_runtime.bytes_used, "bytes_used")?;
+        let policy_decision_payload = serde_json::json!({
+            "decision": "allow",
+            "reason": record.policy_decision_reason,
+            "op_name": "finalize",
+            "request_id": record.request_id,
+        });
+        let policy_decision_hash = canonical::hash_canonical_json(&policy_decision_payload);
 
         let payload_json = serde_json::json!({
             "terminal_mode": record.claim_map.terminal_mode.as_str(),
@@ -330,49 +377,293 @@ impl LedgerWriter {
             "request_id": record.request_id,
         });
         let payload_hash = canonical::hash_canonical_json(&payload_json);
-        let event_id = Ulid::new().to_string();
+        let policy_decision_event_id = canonical::hash_canonical_json(&serde_json::json!({
+            "event_type": "POLICY_DECISION",
+            "trace_id": record.trace_id,
+            "session_id": record.session_id,
+            "request_id": record.request_id,
+            "policy_snapshot_id": record.policy_snapshot_id,
+            "reason": record.policy_decision_reason,
+        }));
+        let event_id = canonical::hash_canonical_json(&serde_json::json!({
+            "event_type": "FINALIZE_RESULT",
+            "trace_id": record.trace_id,
+            "session_id": record.session_id,
+            "request_id": record.request_id,
+            "claim_map_id": record.claim_map.claim_map_id,
+        }));
 
-        tokio::time::timeout(self.write_timeout, async {
-            let mut tx = self.pool.begin().await?;
+        let mut last_error = None;
+        for attempt in 0..3 {
+            let policy_decision_event_id = policy_decision_event_id.clone();
+            let policy_decision_payload = policy_decision_payload.clone();
+            let policy_decision_hash = policy_decision_hash.clone();
+            let claim_map_json = claim_map_json.clone();
+            let event_id = event_id.clone();
+            let payload_json = payload_json.clone();
+            let payload_hash = payload_hash.clone();
+            let evidence_unit_ids_json = evidence_unit_ids_json.clone();
+            let execute_result = tokio::time::timeout(self.write_timeout, async {
+                let mut tx = self.pool.begin().await?;
 
-            sqlx::query(
-                "INSERT INTO pecr_claim_maps (claim_map_id, trace_id, session_id, terminal_mode, coverage_threshold, coverage_observed, claim_map_json) VALUES ($1,$2,$3,$4,$5,$6,$7)",
-            )
-            .bind(&record.claim_map.claim_map_id)
-            .bind(record.trace_id)
-            .bind(record.session_id)
-            .bind(record.claim_map.terminal_mode.as_str())
-            .bind(record.claim_map.coverage_threshold)
-            .bind(record.claim_map.coverage_observed)
-            .bind(&claim_map_json)
-            .execute(&mut *tx)
-            .await?;
-
-            sqlx::query("UPDATE pecr_sessions SET finalized_at = now(), terminal_mode = $1 WHERE session_id = $2")
-                .bind(record.claim_map.terminal_mode.as_str())
+                sqlx::query(
+                    "INSERT INTO pecr_ledger_events (event_id, trace_id, session_id, event_type, principal_id, policy_snapshot_id, payload_json, payload_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (event_id) DO NOTHING",
+                )
+                .bind(&policy_decision_event_id)
+                .bind(record.trace_id)
                 .bind(record.session_id)
+                .bind("POLICY_DECISION")
+                .bind(record.principal_id)
+                .bind(record.policy_snapshot_id)
+                .bind(&policy_decision_payload)
+                .bind(policy_decision_hash)
                 .execute(&mut *tx)
                 .await?;
 
+                sqlx::query(
+                    "INSERT INTO pecr_claim_maps (claim_map_id, trace_id, session_id, terminal_mode, coverage_threshold, coverage_observed, claim_map_json) VALUES ($1,$2,$3,$4,$5,$6,$7) ON CONFLICT (claim_map_id) DO UPDATE SET terminal_mode = EXCLUDED.terminal_mode, coverage_threshold = EXCLUDED.coverage_threshold, coverage_observed = EXCLUDED.coverage_observed, claim_map_json = EXCLUDED.claim_map_json",
+                )
+                .bind(&record.claim_map.claim_map_id)
+                .bind(record.trace_id)
+                .bind(record.session_id)
+                .bind(record.claim_map.terminal_mode.as_str())
+                .bind(record.claim_map.coverage_threshold)
+                .bind(record.claim_map.coverage_observed)
+                .bind(&claim_map_json)
+                .execute(&mut *tx)
+                .await?;
+
+                sqlx::query("UPDATE pecr_sessions SET finalized_at = now(), terminal_mode = $1 WHERE session_id = $2")
+                    .bind(record.claim_map.terminal_mode.as_str())
+                    .bind(record.session_id)
+                    .execute(&mut *tx)
+                    .await?;
+
+                sqlx::query(
+                    "INSERT INTO pecr_ledger_events (event_id, trace_id, session_id, event_type, principal_id, policy_snapshot_id, payload_json, payload_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8) ON CONFLICT (event_id) DO NOTHING",
+                )
+                .bind(&event_id)
+                .bind(record.trace_id)
+                .bind(record.session_id)
+                .bind("FINALIZE_RESULT")
+                .bind(record.principal_id)
+                .bind(record.policy_snapshot_id)
+                .bind(&payload_json)
+                .bind(payload_hash)
+                .execute(&mut *tx)
+                .await?;
+
+                sqlx::query(
+                    "INSERT INTO pecr_session_runtime (session_id, tenant_id, session_token_hash, session_token_expires_at_epoch_ms, operator_calls_used, bytes_used, evidence_unit_ids_json, finalized, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now()) ON CONFLICT (session_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id, session_token_hash = EXCLUDED.session_token_hash, session_token_expires_at_epoch_ms = EXCLUDED.session_token_expires_at_epoch_ms, operator_calls_used = EXCLUDED.operator_calls_used, bytes_used = EXCLUDED.bytes_used, evidence_unit_ids_json = EXCLUDED.evidence_unit_ids_json, finalized = EXCLUDED.finalized, updated_at = now()",
+                )
+                .bind(record.session_runtime.session_id)
+                .bind(record.session_runtime.tenant_id)
+                .bind(record.session_runtime.session_token_hash)
+                .bind(record.session_runtime.session_token_expires_at_epoch_ms)
+                .bind(i64::from(record.session_runtime.operator_calls_used))
+                .bind(bytes_used)
+                .bind(evidence_unit_ids_json)
+                .bind(record.session_runtime.finalized)
+                .execute(&mut *tx)
+                .await?;
+
+                tx.commit().await?;
+                Ok::<(), sqlx::Error>(())
+            })
+            .await;
+            match execute_result {
+                Ok(Ok(())) => return Ok(()),
+                Ok(Err(err)) => {
+                    last_error = Some(LedgerError::Sqlx(err));
+                }
+                Err(_) => {
+                    last_error = Some(LedgerError::Timeout);
+                }
+            }
+
+            if attempt < 2 {
+                tokio::time::sleep(Duration::from_millis(100 * (attempt + 1) as u64)).await;
+            }
+        }
+
+        match last_error.unwrap_or(LedgerError::Timeout) {
+            LedgerError::Timeout => {
+                eprintln!(
+                    "ledger.record_finalize_result_timed_out trace_id={} session_id={}",
+                    record.trace_id, record.session_id
+                );
+                Err(LedgerError::Timeout)
+            }
+            LedgerError::Sqlx(err) => {
+                eprintln!(
+                    "ledger.record_finalize_result_failed trace_id={} session_id={} error={}",
+                    record.trace_id, record.session_id, err
+                );
+                Err(LedgerError::Sqlx(err))
+            }
+            other => Err(other),
+        }?;
+
+        Ok(())
+    }
+
+    pub async fn record_operator_result(
+        &self,
+        record: OperatorResultRecord<'_>,
+    ) -> Result<(), LedgerError> {
+        let policy_decision_payload = serde_json::json!({
+            "decision": "allow",
+            "reason": record.policy_decision_reason,
+            "op_name": record.op_name,
+            "request_id": record.request_id,
+        });
+        let policy_decision_hash = canonical::hash_canonical_json(&policy_decision_payload);
+        let evidence_unit_ids_json = serde_json::to_value(record.session_runtime.evidence_unit_ids)
+            .unwrap_or_else(|_| serde_json::json!([]));
+        let bytes_used = checked_bigint_from_u64(record.session_runtime.bytes_used, "bytes_used")?;
+        let operator_event_payload = serde_json::json!({
+            "op_name": record.op_name,
+            "params_hash": record.params_hash,
+            "cache_hit": record.cache_hit,
+            "params_bytes": record.params_bytes,
+            "result_bytes": record.result_bytes,
+            "terminal_mode": record.terminal_mode.as_str(),
+            "outcome": if record.error_code.is_none() { "success" } else { "error" },
+            "error_code": record.error_code,
+            "operator_calls_used": record.session_runtime.operator_calls_used,
+            "bytes_used": record.session_runtime.bytes_used,
+            "request_id": record.request_id,
+        });
+
+        let execute_result = tokio::time::timeout(self.write_timeout, async {
+            let mut tx = self.pool.begin().await?;
+
+            let policy_decision_event_id = Ulid::new().to_string();
             sqlx::query(
                 "INSERT INTO pecr_ledger_events (event_id, trace_id, session_id, event_type, principal_id, policy_snapshot_id, payload_json, payload_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
             )
-            .bind(&event_id)
+            .bind(&policy_decision_event_id)
             .bind(record.trace_id)
             .bind(record.session_id)
-            .bind("FINALIZE_RESULT")
+            .bind("POLICY_DECISION")
             .bind(record.principal_id)
             .bind(record.policy_snapshot_id)
-            .bind(&payload_json)
-            .bind(payload_hash)
+            .bind(&policy_decision_payload)
+            .bind(policy_decision_hash)
+            .execute(&mut *tx)
+            .await?;
+
+            for evidence in record.evidence_units {
+                let transform_chain_json = serde_json::to_value(&evidence.transform_chain)
+                    .unwrap_or_else(|_| serde_json::json!([]));
+                let payload_json = if record.store_payload {
+                    evidence.content.clone()
+                } else {
+                    None
+                };
+
+                sqlx::query(
+                    "INSERT INTO pecr_evidence_units (evidence_unit_id, trace_id, session_id, source_system, object_id, version_id, span_or_row_spec_json, content_type, content_hash, as_of_time, retrieved_at, policy_snapshot_id, policy_snapshot_hash, transform_chain_json, payload_json) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10::timestamptz,$11::timestamptz,$12,$13,$14,$15) ON CONFLICT (evidence_unit_id) DO NOTHING",
+                )
+                .bind(&evidence.evidence_unit_id)
+                .bind(record.trace_id)
+                .bind(record.session_id)
+                .bind(&evidence.source_system)
+                .bind(&evidence.object_id)
+                .bind(&evidence.version_id)
+                .bind(&evidence.span_or_row_spec)
+                .bind(match evidence.content_type {
+                    pecr_contracts::EvidenceContentType::TextPlain => "text/plain",
+                    pecr_contracts::EvidenceContentType::ApplicationJson => "application/json",
+                })
+                .bind(&evidence.content_hash)
+                .bind(&evidence.as_of_time)
+                .bind(&evidence.retrieved_at)
+                .bind(&evidence.policy_snapshot_id)
+                .bind(&evidence.policy_snapshot_hash)
+                .bind(&transform_chain_json)
+                .bind(&payload_json)
+                .execute(&mut *tx)
+                .await?;
+
+                let evidence_event_payload = serde_json::json!({
+                    "evidence_unit_id": evidence.evidence_unit_id.as_str(),
+                    "content_hash": evidence.content_hash.as_str(),
+                    "source_system": evidence.source_system.as_str(),
+                    "object_id": evidence.object_id.as_str(),
+                    "version_id": evidence.version_id.as_str(),
+                    "op_name": record.op_name,
+                    "request_id": record.request_id,
+                });
+                let evidence_event_hash = canonical::hash_canonical_json(&evidence_event_payload);
+                let evidence_event_id = Ulid::new().to_string();
+
+                sqlx::query(
+                    "INSERT INTO pecr_ledger_events (event_id, trace_id, session_id, event_type, principal_id, policy_snapshot_id, payload_json, payload_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                )
+                .bind(&evidence_event_id)
+                .bind(record.trace_id)
+                .bind(record.session_id)
+                .bind("EVIDENCE_EMITTED")
+                .bind(record.principal_id)
+                .bind(record.policy_snapshot_id)
+                .bind(&evidence_event_payload)
+                .bind(evidence_event_hash)
+                .execute(&mut *tx)
+                .await?;
+            }
+
+            let operator_event_hash = canonical::hash_canonical_json(&operator_event_payload);
+            let operator_event_id = Ulid::new().to_string();
+            sqlx::query(
+                "INSERT INTO pecr_ledger_events (event_id, trace_id, session_id, event_type, principal_id, policy_snapshot_id, payload_json, payload_hash) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+            )
+            .bind(&operator_event_id)
+            .bind(record.trace_id)
+            .bind(record.session_id)
+            .bind("OPERATOR_CALL")
+            .bind(record.principal_id)
+            .bind(record.policy_snapshot_id)
+            .bind(&operator_event_payload)
+            .bind(operator_event_hash)
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query(
+                "INSERT INTO pecr_session_runtime (session_id, tenant_id, session_token_hash, session_token_expires_at_epoch_ms, operator_calls_used, bytes_used, evidence_unit_ids_json, finalized, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now()) ON CONFLICT (session_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id, session_token_hash = EXCLUDED.session_token_hash, session_token_expires_at_epoch_ms = EXCLUDED.session_token_expires_at_epoch_ms, operator_calls_used = EXCLUDED.operator_calls_used, bytes_used = EXCLUDED.bytes_used, evidence_unit_ids_json = EXCLUDED.evidence_unit_ids_json, finalized = EXCLUDED.finalized, updated_at = now()",
+            )
+            .bind(record.session_runtime.session_id)
+            .bind(record.session_runtime.tenant_id)
+            .bind(record.session_runtime.session_token_hash)
+            .bind(record.session_runtime.session_token_expires_at_epoch_ms)
+            .bind(i64::from(record.session_runtime.operator_calls_used))
+            .bind(bytes_used)
+            .bind(evidence_unit_ids_json)
+            .bind(record.session_runtime.finalized)
             .execute(&mut *tx)
             .await?;
 
             tx.commit().await?;
             Ok::<(), sqlx::Error>(())
         })
-        .await
-        .map_err(|_| LedgerError::Timeout)??;
+        .await;
+        let execute_result = match execute_result {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!(
+                    "ledger.record_operator_result_timed_out trace_id={} session_id={} op_name={}",
+                    record.trace_id, record.session_id, record.op_name
+                );
+                return Err(LedgerError::Timeout);
+            }
+        };
+        if let Err(err) = execute_result {
+            eprintln!(
+                "ledger.record_operator_result_failed trace_id={} session_id={} op_name={} error={}",
+                record.trace_id, record.session_id, record.op_name, err
+            );
+            return Err(LedgerError::Sqlx(err));
+        }
 
         Ok(())
     }
@@ -385,7 +676,7 @@ impl LedgerWriter {
             .unwrap_or_else(|_| serde_json::json!([]));
         let bytes_used = checked_bigint_from_u64(record.bytes_used, "bytes_used")?;
 
-        tokio::time::timeout(
+        let execute_result = tokio::time::timeout(
             self.write_timeout,
             sqlx::query(
                 "INSERT INTO pecr_session_runtime (session_id, tenant_id, session_token_hash, session_token_expires_at_epoch_ms, operator_calls_used, bytes_used, evidence_unit_ids_json, finalized, updated_at) VALUES ($1,$2,$3,$4,$5,$6,$7,$8, now()) ON CONFLICT (session_id) DO UPDATE SET tenant_id = EXCLUDED.tenant_id, session_token_hash = EXCLUDED.session_token_hash, session_token_expires_at_epoch_ms = EXCLUDED.session_token_expires_at_epoch_ms, operator_calls_used = EXCLUDED.operator_calls_used, bytes_used = EXCLUDED.bytes_used, evidence_unit_ids_json = EXCLUDED.evidence_unit_ids_json, finalized = EXCLUDED.finalized, updated_at = now()",
@@ -400,8 +691,24 @@ impl LedgerWriter {
             .bind(record.finalized)
             .execute(&self.pool),
         )
-        .await
-        .map_err(|_| LedgerError::Timeout)??;
+        .await;
+        let execute_result = match execute_result {
+            Ok(result) => result,
+            Err(_) => {
+                eprintln!(
+                    "ledger.upsert_session_runtime_timed_out session_id={}",
+                    record.session_id
+                );
+                return Err(LedgerError::Timeout);
+            }
+        };
+        if let Err(err) = execute_result {
+            eprintln!(
+                "ledger.upsert_session_runtime_failed session_id={} error={}",
+                record.session_id, err
+            );
+            return Err(LedgerError::Sqlx(err));
+        }
 
         Ok(())
     }

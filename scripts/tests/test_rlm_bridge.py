@@ -61,6 +61,49 @@ class FakeBridge:
         return [{"ok": True, "result": {}} for _ in calls]
 
 
+class FailingBridge(FakeBridge):
+    def __init__(self, failing_ops=None):
+        super().__init__()
+        self.failing_ops = set(failing_ops or [])
+
+    def call_operator(self, *, depth, op_name, params):
+        if op_name in self.failing_ops:
+            self.operator_calls.append((depth, op_name, params))
+            return {
+                "type": "operator_result",
+                "id": op_name,
+                "ok": False,
+                "terminal_mode": "SOURCE_UNAVAILABLE",
+                "result": None,
+            }
+        return super().call_operator(depth=depth, op_name=op_name, params=params)
+
+
+class ManyRowsBridge(FakeBridge):
+    def call_operator(self, *, depth, op_name, params):
+        self.operator_calls.append((depth, op_name, params))
+        if op_name == "fetch_rows":
+            return {
+                "type": "operator_result",
+                "id": op_name,
+                "result": {
+                    "rows": [
+                        {
+                            "customer_id": "cust_public_1",
+                            "status": "active",
+                            "plan_tier": "free",
+                        },
+                        {
+                            "customer_id": "cust_public_2",
+                            "status": "paused",
+                            "plan_tier": "pro",
+                        },
+                    ]
+                },
+            }
+        return super().call_operator(depth=depth, op_name=op_name, params=params)
+
+
 class FakeRLM:
     init_kwargs = None
     last_prompt = None
@@ -122,10 +165,28 @@ def default_start_message(query="smoke"):
                 "max_recursion_depth": 4,
                 "max_parallelism": 1,
             },
+            "context_budget": {
+                "max_evidence_units": 6,
+                "max_total_chars": 2400,
+                "max_structured_rows": 6,
+                "max_inline_citations": 4,
+            },
             "planner_hints": {"intent": "default", "recommended_path": []},
+            "preferred_evidence_pack_mode": "compact",
             "recovery_context": None,
             "available_operator_names": ["fetch_rows", "search", "fetch_span"],
+            "operator_schemas": [
+                {
+                    "name": "fetch_rows",
+                    "description": "Fetch rows from an allowlisted safeview.",
+                    "required_params": ["view_id", "fields"],
+                    "optional_params": ["filter_spec"],
+                }
+            ],
             "allow_search_ref_fetch_span": True,
+            "prior_observations": [],
+            "clarification_opportunities": [],
+            "failure_feedback": [],
         },
     }
 
@@ -273,6 +334,115 @@ class RlmBridgeTests(unittest.TestCase):
         self.assertEqual(bridge.batch_calls, [])
         self.assertEqual(result["operator_calls_used"], 0)
         self.assertEqual(result["depth_used"], 0)
+
+    def test_run_mock_returns_clarification_prompt_before_tool_calls(self):
+        bridge = FakeBridge()
+        budget = self.mod.Budget(
+            max_operator_calls=10,
+            max_bytes=1024 * 1024,
+            max_wallclock_ms=10_000,
+            max_recursion_depth=5,
+            max_parallelism=1,
+        )
+
+        result = self.mod.run_mock(
+            bridge,
+            "status",
+            budget,
+            planner_hints={"intent": "default", "recommended_path": []},
+            plan_request={
+                "clarification_opportunities": [
+                    {
+                        "question": "Which field should I use for the customer lookup",
+                        "options": ["customer status", "plan tier"],
+                    }
+                ]
+            },
+        )
+
+        self.assertEqual(bridge.operator_calls, [])
+        self.assertEqual(result["stop_reason"], "clarification_requested")
+        self.assertEqual(result["operator_calls_used"], 0)
+        self.assertIn("Which field should I use for the customer lookup", result["final_answer"])
+
+    def test_run_mock_augments_narrow_plan_for_multi_clause_evidence_query(self):
+        bridge = FakeBridge()
+        budget = self.mod.Budget(
+            max_operator_calls=10,
+            max_bytes=1024 * 1024,
+            max_wallclock_ms=10_000,
+            max_recursion_depth=5,
+            max_parallelism=1,
+        )
+
+        result = self.mod.run_mock(
+            bridge,
+            "Compare active customer counts by plan tier and cite the policy text",
+            budget,
+            planner_hints={
+                "intent": "structured_aggregation_evidence",
+                "recommended_path": [
+                    {
+                        "kind": "operator",
+                        "op_name": "compare",
+                        "params": {
+                            "view_id": "safe_customer_view_public",
+                            "group_by": ["plan_tier"],
+                            "filter_spec": {"status": "active"},
+                        },
+                    }
+                ],
+            },
+            plan_request={
+                "available_operator_names": ["compare", "lookup_evidence"],
+            },
+        )
+
+        self.assertEqual(
+            [call[1] for call in bridge.operator_calls],
+            ["compare", "lookup_evidence"],
+        )
+        self.assertEqual(result["stop_reason"], "plan_complete")
+        self.assertEqual(result["operator_calls_used"], 2)
+
+    def test_run_mock_recovers_after_fetch_rows_failure_with_lookup_evidence(self):
+        bridge = FailingBridge({"fetch_rows"})
+        budget = self.mod.Budget(
+            max_operator_calls=10,
+            max_bytes=1024 * 1024,
+            max_wallclock_ms=10_000,
+            max_recursion_depth=5,
+            max_parallelism=1,
+        )
+
+        result = self.mod.run_mock(
+            bridge,
+            "What is the customer status and plan tier?",
+            budget,
+            planner_hints={
+                "intent": "structured_lookup",
+                "recommended_path": [
+                    {
+                        "kind": "operator",
+                        "op_name": "fetch_rows",
+                        "params": {
+                            "view_id": "safe_customer_view_public",
+                            "fields": ["status", "plan_tier"],
+                        },
+                    }
+                ],
+            },
+            plan_request={
+                "available_operator_names": ["fetch_rows", "lookup_evidence"],
+            },
+        )
+
+        self.assertEqual(
+            [call[1] for call in bridge.operator_calls],
+            ["fetch_rows", "lookup_evidence"],
+        )
+        self.assertEqual(result["stop_reason"], "recovered_after_fetch_rows")
+        self.assertEqual(result["operator_calls_used"], 2)
 
     def test_run_mock_keeps_non_default_smoke_hint_on_normal_path(self):
         bridge = FakeBridge()
@@ -446,6 +616,46 @@ class RlmBridgeTests(unittest.TestCase):
                 planner_hints={"intent": "structured_lookup"},
                 plan_request={
                     "available_operator_names": ["fetch_rows", "search"],
+                    "operator_schemas": [
+                        {
+                            "name": "fetch_rows",
+                            "description": "Fetch rows from an allowlisted safeview.",
+                            "required_params": ["view_id", "fields"],
+                            "optional_params": ["filter_spec"],
+                        }
+                    ],
+                    "prior_observations": [
+                        {
+                            "step": {
+                                "kind": "operator",
+                                "op_name": "fetch_rows",
+                                "params": {"view_id": "safe_customer_view_public", "fields": ["status"]},
+                            },
+                            "outcome": "failed",
+                            "terminal_mode": "source_unavailable",
+                            "summary": "fetch_rows failed and triggered recovery planning",
+                        }
+                    ],
+                    "clarification_opportunities": [
+                        {
+                            "question": "Which customer should I look up?",
+                            "options": ["customer_id", "status", "plan tier"],
+                        }
+                    ],
+                    "failure_feedback": [
+                        {
+                            "failure_code": "terminal_mode_source_unavailable",
+                            "terminal_mode": "source_unavailable",
+                            "message": "The previous fetch_rows attempt ended with source_unavailable.",
+                        }
+                    ],
+                    "context_budget": {
+                        "max_evidence_units": 6,
+                        "max_total_chars": 2400,
+                        "max_structured_rows": 6,
+                        "max_inline_citations": 4,
+                    },
+                    "preferred_evidence_pack_mode": "mixed",
                 },
             )
         finally:
@@ -477,8 +687,132 @@ class RlmBridgeTests(unittest.TestCase):
         self.assertEqual(result["depth_used"], 1)
         self.assertEqual(FakeRLM.last_root_prompt, "What is the customer status and plan tier?")
         self.assertIn("available_operator_names", FakeRLM.last_prompt)
+        self.assertIn("operator_schemas", FakeRLM.last_prompt)
+        self.assertIn("prior_observations", FakeRLM.last_prompt)
+        self.assertIn("clarification_opportunities", FakeRLM.last_prompt)
+        self.assertIn("failure_feedback", FakeRLM.last_prompt)
         self.assertEqual(FakeRLM.init_kwargs["backend"], "openai")
         self.assertEqual(FakeRLM.init_kwargs["backend_kwargs"]["model_name"], "gpt-test")
+
+    def test_build_pecr_context_includes_phase_two_planner_contract_fields(self):
+        budget = self.mod.Budget(
+            max_operator_calls=10,
+            max_bytes=1024 * 1024,
+            max_wallclock_ms=10_000,
+            max_recursion_depth=5,
+            max_parallelism=1,
+        )
+
+        rendered = self.mod.build_pecr_context(
+            "What is the customer status and plan tier?",
+            budget,
+            {
+                "intent": "structured_lookup",
+                "recommended_path": [
+                    {
+                        "kind": "operator",
+                        "op_name": "fetch_rows",
+                        "params": {"view_id": "safe_customer_view_public", "fields": ["status", "plan_tier"]},
+                    }
+                ],
+            },
+            {
+                "available_operator_names": ["fetch_rows", "search"],
+                "context_budget": {
+                    "max_evidence_units": 6,
+                    "max_total_chars": 2400,
+                    "max_structured_rows": 6,
+                    "max_inline_citations": 4,
+                },
+                "preferred_evidence_pack_mode": "mixed",
+                "operator_schemas": [
+                    {
+                        "name": "fetch_rows",
+                        "description": "Fetch rows from an allowlisted safeview.",
+                        "required_params": ["view_id", "fields"],
+                        "optional_params": ["filter_spec"],
+                    }
+                ],
+                "prior_observations": [
+                    {
+                        "step": {
+                            "kind": "operator",
+                            "op_name": "fetch_rows",
+                            "params": {"view_id": "safe_customer_view_public", "fields": ["status"]},
+                        },
+                        "outcome": "failed",
+                        "terminal_mode": "source_unavailable",
+                    }
+                ],
+                "clarification_opportunities": [
+                    {
+                        "question": "Which customer should I look up?",
+                        "options": ["customer_id", "status", "plan tier"],
+                    }
+                ],
+                "failure_feedback": [
+                    {
+                        "failure_code": "terminal_mode_source_unavailable",
+                        "terminal_mode": "source_unavailable",
+                    }
+                ],
+            },
+        )
+
+        payload = json.loads(rendered)
+        self.assertIn("operator_schemas", payload)
+        self.assertEqual(payload["operator_schemas"][0]["name"], "fetch_rows")
+        self.assertIn("prior_observations", payload)
+        self.assertEqual(payload["prior_observations"][0]["outcome"], "failed")
+        self.assertIn("clarification_opportunities", payload)
+        self.assertEqual(
+            payload["clarification_opportunities"][0]["question"],
+            "Which customer should I look up?",
+        )
+        self.assertIn("context_budget", payload)
+        self.assertEqual(payload["context_budget"]["max_evidence_units"], 6)
+        self.assertEqual(payload["preferred_evidence_pack_mode"], "mixed")
+        self.assertIn("failure_feedback", payload)
+        self.assertEqual(
+            payload["failure_feedback"][0]["failure_code"],
+            "terminal_mode_source_unavailable",
+        )
+
+    def test_build_custom_tools_compacts_rows_for_context_budget(self):
+        bridge = ManyRowsBridge()
+        budget = self.mod.Budget(
+            max_operator_calls=10,
+            max_bytes=1024 * 1024,
+            max_wallclock_ms=10_000,
+            max_recursion_depth=5,
+            max_parallelism=1,
+        )
+
+        custom_tools, _tool_state = self.mod.build_custom_tools(
+            bridge,
+            budget=budget,
+            query="What is the customer status and plan tier?",
+            planner_hints={"intent": "structured_lookup"},
+            plan_request={
+                "available_operator_names": ["fetch_rows"],
+                "context_budget": {
+                    "max_evidence_units": 4,
+                    "max_total_chars": 240,
+                    "max_structured_rows": 1,
+                    "max_inline_citations": 2,
+                },
+                "preferred_evidence_pack_mode": "summary",
+            },
+        )
+
+        result = custom_tools["fetch_rows"]["tool"](
+            view_id="safe_customer_view_public",
+            fields=["status", "plan_tier"],
+        )
+
+        self.assertEqual(len(result["rows"]), 1)
+        self.assertEqual(result["rows"][0]["status"], "active")
+        self.assertEqual(result["_pecr_context_pack"]["mode"], "summary")
 
     def test_run_openai_exercises_actual_vendored_rlm_loop_with_mock_client(self):
         bridge = FakeBridge()

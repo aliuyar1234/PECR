@@ -88,6 +88,24 @@
       "minimum_quality_score": 94.0
     },
     {
+      "scenario_id": "compare-and-billing-source",
+      "title": "Compare counts and cite billing source text",
+      "category": "mixed_structured_evidence",
+      "job": "Answer a mixed structured-plus-unstructured ask by combining aggregate results with directly cited billing source text.",
+      "query": "Compare active customer counts by plan tier and show the source text for the billing terms policy",
+      "run_id": "useful-compare-and-billing-source",
+      "replay_path": "replays/compare_and_billing_source.json",
+      "expected_terminal_mode": "SUPPORTED",
+      "expected_planner_prefixes": [["compare", "lookup_evidence"], ["aggregate", "lookup_evidence"]],
+      "minimum_supported_claim_evidence_units": 1,
+      "expected_response_substrings": [
+        "SUPPORTED:",
+        "plan_tier=starter",
+        "Starter plans bill monthly at the published rate"
+      ],
+      "minimum_quality_score": 95.0
+    },
+    {
       "scenario_id": "broad-customer-query",
       "title": "Broad customer query narrowing",
       "category": "ambiguity_guidance",

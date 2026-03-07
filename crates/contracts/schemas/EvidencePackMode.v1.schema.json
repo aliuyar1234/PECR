@@ -1,0 +1,5 @@
+{
+  "$id": "pecr.schemas.EvidencePackMode.v1",
+  "type": "string",
+  "enum": ["raw", "compact", "summary", "diff", "mixed"]
+}

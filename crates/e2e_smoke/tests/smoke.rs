@@ -10,7 +10,7 @@ use std::time::Duration;
 use axum::Json;
 use axum::Router;
 use axum::http::StatusCode;
-use axum::routing::post;
+use axum::routing::{get, post};
 use hex::ToHex;
 use sha2::Digest;
 use sqlx::PgPool;
@@ -145,13 +145,19 @@ async fn smoke_controller_creates_session_calls_operator_and_finalizes() {
 
     let fs_corpus_path = fs_corpus_root.to_string_lossy().to_string();
 
-    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
 
     let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
         ("PECR_BIND_ADDR".to_string(), "127.0.0.1:0".to_string()),
         ("PECR_DB_URL".to_string(), schema_url.clone()),
         ("PECR_OPA_URL".to_string(), format!("http://{}", opa_addr)),
+        (
+            "PECR_LEDGER_WRITE_TIMEOUT_MS".to_string(),
+            "20000".to_string(),
+        ),
         (
             "PECR_POLICY_BUNDLE_HASH".to_string(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
@@ -658,7 +664,9 @@ async fn leakage_suite_role_matrix_canaries() {
     .expect("postgres fixture SQL should be readable");
     apply_pg_fixtures(&schema_url, &pg_fixtures_sql).await;
 
-    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
 
     let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
@@ -1002,7 +1010,9 @@ async fn injection_suite_context_as_malware_tool_steering() {
 
     let fs_corpus_path = fs_corpus_root.to_string_lossy().to_string();
 
-    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
 
     let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
@@ -1221,7 +1231,9 @@ async fn redaction_policy_suite_denies_fields_in_fetch_rows_results() {
     let (schema_pool, schema_name, schema_url) = create_test_schema(&db_url).await;
     apply_pg_fixtures(&schema_url, &pg_fixtures_sql).await;
 
-    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
 
     let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
@@ -1366,7 +1378,9 @@ async fn staleness_suite_as_of_selects_fs_snapshot() {
 
     let fs_corpus_path = fs_corpus_root.to_string_lossy().to_string();
 
-    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
 
     let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
@@ -1634,7 +1648,9 @@ async fn staleness_suite_as_of_selects_pg_snapshot() {
 
     let fs_corpus_path = fs_corpus_root.to_string_lossy().to_string();
 
-    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
 
     let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
@@ -1863,7 +1879,9 @@ async fn claim_evidence_audit_suite_supported_claims_require_evidence() {
 
     let fs_corpus_path = fs_corpus_root.to_string_lossy().to_string();
 
-    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
 
     let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
@@ -2060,7 +2078,9 @@ async fn cache_bleed_suite_cross_principal_reuse_is_zero() {
 
     let fs_corpus_path = fs_corpus_root.to_string_lossy().to_string();
 
-    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
 
     let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
@@ -2291,7 +2311,9 @@ async fn telemetry_leakage_suite_no_canaries_in_logs_or_metrics() {
 
     let fs_corpus_path = fs_corpus_root.to_string_lossy().to_string();
 
-    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
 
     let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
@@ -2460,7 +2482,9 @@ async fn observability_coverage_suite_required_signals_exist() {
 
     let fs_corpus_path = fs_corpus_root.to_string_lossy().to_string();
 
-    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
 
     let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
@@ -2509,8 +2533,18 @@ async fn observability_coverage_suite_required_signals_exist() {
     .await;
 
     let client = reqwest::Client::new();
-    wait_for_healthz(&client, gateway_addr).await;
-    wait_for_healthz(&client, controller_addr).await;
+    wait_for_http_status(
+        &client,
+        format!("http://{}/readyz", gateway_addr).as_str(),
+        StatusCode::OK,
+    )
+    .await;
+    wait_for_http_status(
+        &client,
+        format!("http://{}/readyz", controller_addr).as_str(),
+        StatusCode::OK,
+    )
+    .await;
 
     let response = client
         .post(format!("http://{}/v1/run", controller_addr))
@@ -2723,7 +2757,9 @@ async fn failure_mode_suite_policy_deny_and_budget_exhaustion() {
     let (schema_pool, schema_name, schema_url) = create_test_schema(&db_url).await;
     apply_pg_fixtures(&schema_url, &pg_fixtures_sql).await;
 
-    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
 
     let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
@@ -2952,7 +2988,9 @@ async fn failure_mode_suite_source_unavailable_and_timeout() {
     let _ = tokio::time::timeout(Duration::from_secs(3), unreachable_task).await;
 
     // OPA timeout path -> gateway timeout.
-    let slow_opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision_slow));
+    let slow_opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision_slow));
     let (slow_opa_addr, slow_opa_shutdown, slow_opa_task) = spawn_server(slow_opa_app).await;
 
     let timeout_gateway = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
@@ -3008,8 +3046,9 @@ async fn failure_mode_suite_source_unavailable_and_timeout() {
     let _ = tokio::time::timeout(Duration::from_secs(3), slow_opa_task).await;
 
     // PG statement-timeout path -> source unavailable.
-    let pg_timeout_opa_app =
-        Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let pg_timeout_opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (pg_timeout_opa_addr, pg_timeout_opa_shutdown, pg_timeout_opa_task) =
         spawn_server(pg_timeout_opa_app).await;
 
@@ -3101,7 +3140,9 @@ async fn failure_mode_suite_source_unavailable_and_timeout() {
     let _ = tokio::time::timeout(Duration::from_secs(3), pg_timeout_opa_task).await;
 
     // DB availability failure path -> source unavailable.
-    let db_outage_opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let db_outage_opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (db_outage_opa_addr, db_outage_opa_shutdown, db_outage_opa_task) =
         spawn_server(db_outage_opa_app).await;
 
@@ -3206,75 +3247,136 @@ struct RealStack {
     opa_task: Option<tokio::task::JoinHandle<()>>,
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn useful_real_stack_suite_exercises_named_queries() {
-    let Some(db_url) = test_db_url() else {
-        eprintln!("skipping useful real-stack suite; set PECR_TEST_DB_URL to enable");
-        return;
-    };
-
-    let request_prefix = format!("req_useful_suite_{}_{}", std::process::id(), next_suffix());
-    let stack = spawn_real_stack(&db_url, None).await;
-    let client = reqwest::Client::new();
+async fn run_useful_real_stack_named_queries(
+    client: &reqwest::Client,
+    stack: &RealStack,
+    request_prefix: &str,
+    log_buf: &Arc<Mutex<Vec<u8>>>,
+    log_start: usize,
+) -> Vec<String> {
+    struct UsefulScenario<'a> {
+        scenario_id: &'a str,
+        query: &'a str,
+        expected_fragments: &'a [&'a str],
+        expected_response_kind: Option<&'a str>,
+        expected_note_substrings: &'a [&'a str],
+    }
 
     let scenarios = [
-        (
-            "customer-status",
-            "What is the customer status and plan tier?",
-            vec!["status=active", "plan_tier=free"],
-        ),
-        (
-            "support-policy-source",
-            "Show the source text and evidence for the support policy",
-            vec!["Support policy", "approved safe-view records"],
-        ),
-        (
-            "annual-refund-source",
-            "Show the source text for annual refund terms",
-            vec!["Annual refund terms", "30 days"],
-        ),
-        (
-            "billing-terms-policy",
-            "Show evidence for the billing terms policy",
-            vec!["Billing terms policy", "15 days"],
-        ),
-        (
-            "customer-counts-by-plan",
-            "Compare customer counts by plan tier",
-            vec![
+        UsefulScenario {
+            scenario_id: "customer-status",
+            query: "What is the customer status and plan tier?",
+            expected_fragments: &["status=active", "plan_tier=free"],
+            expected_response_kind: None,
+            expected_note_substrings: &[],
+        },
+        UsefulScenario {
+            scenario_id: "support-policy-source",
+            query: "Show the source text and evidence for the support policy",
+            expected_fragments: &["Support policy", "approved safe-view records"],
+            expected_response_kind: None,
+            expected_note_substrings: &[],
+        },
+        UsefulScenario {
+            scenario_id: "annual-refund-source",
+            query: "Show the source text for annual refund terms",
+            expected_fragments: &["Annual refund terms", "30 days"],
+            expected_response_kind: None,
+            expected_note_substrings: &[],
+        },
+        UsefulScenario {
+            scenario_id: "billing-terms-policy",
+            query: "Show evidence for the billing terms policy",
+            expected_fragments: &["Billing terms policy", "15 days"],
+            expected_response_kind: None,
+            expected_note_substrings: &[],
+        },
+        UsefulScenario {
+            scenario_id: "customer-counts-by-plan",
+            query: "Compare customer counts by plan tier",
+            expected_fragments: &[
                 "plan_tier=enterprise",
                 "plan_tier=free",
                 "count(customer_id)=1",
             ],
-        ),
-        (
-            "monthly-customer-trend",
-            "Show monthly customer trend over time",
-            vec!["time_bucket=2026-01", "time_bucket=2026-02"],
-        ),
+            expected_response_kind: None,
+            expected_note_substrings: &[],
+        },
+        UsefulScenario {
+            scenario_id: "monthly-customer-trend",
+            query: "Show monthly customer trend over time",
+            expected_fragments: &["time_bucket=2026-01", "time_bucket=2026-02"],
+            expected_response_kind: None,
+            expected_note_substrings: &[],
+        },
+        UsefulScenario {
+            scenario_id: "compare-and-billing-source",
+            query: "Compare active customer counts by plan tier and show the source text for the billing terms policy",
+            expected_fragments: &[
+                "plan_tier=free",
+                "count(customer_id)=1",
+                "Billing terms policy",
+                "15 days",
+            ],
+            expected_response_kind: None,
+            expected_note_substrings: &[],
+        },
     ];
 
     let mut trace_ids = Vec::new();
-    for (scenario_id, query, expected_fragments) in scenarios {
+    for scenario in scenarios {
+        let scenario_id = scenario.scenario_id;
         let request_id = format!("{request_prefix}_{scenario_id}");
-        let body =
-            controller_run_query_ok(&client, stack.controller_addr, "dev", &request_id, query)
-                .await;
+        let body = controller_run_query_ok_with_logs(
+            client,
+            stack.controller_addr,
+            "dev",
+            &request_id,
+            scenario.query,
+            log_buf,
+            log_start,
+        )
+        .await;
         assert_eq!(
             body.get("terminal_mode").and_then(|value| value.as_str()),
             Some("SUPPORTED"),
-            "scenario {} should be supported: {}",
+            "scenario {} should be supported: {}; logs: {}",
             scenario_id,
-            body
+            body,
+            logs_since(log_buf, log_start)
         );
 
+        if let Some(expected_response_kind) = scenario.expected_response_kind {
+            assert_eq!(
+                body.get("response_kind").and_then(|value| value.as_str()),
+                Some(expected_response_kind),
+                "scenario {} should surface response_kind {}: {}",
+                scenario_id,
+                expected_response_kind,
+                body
+            );
+        }
+
         let rendered = serde_json::to_string(&body).expect("response JSON should serialize");
-        for fragment in expected_fragments {
+        for fragment in scenario.expected_fragments {
             assert!(
                 rendered.contains(fragment),
                 "scenario {} missing fragment {:?}: {}",
                 scenario_id,
                 fragment,
+                body
+            );
+        }
+        let notes = body
+            .pointer("/claim_map/notes")
+            .and_then(|value| value.as_str())
+            .unwrap_or_default();
+        for substring in scenario.expected_note_substrings {
+            assert!(
+                notes.contains(substring),
+                "scenario {} missing note fragment {:?}: {}",
+                scenario_id,
+                substring,
                 body
             );
         }
@@ -3309,7 +3411,7 @@ async fn useful_real_stack_suite_exercises_named_queries() {
     }
 
     let replay_list_body =
-        wait_for_replay_list_contains_traces(&client, stack.controller_addr, "dev", &trace_ids)
+        wait_for_replay_list_contains_traces(client, stack.controller_addr, "dev", &trace_ids)
             .await;
     let replays = replay_list_body
         .get("replays")
@@ -3327,22 +3429,63 @@ async fn useful_real_stack_suite_exercises_named_queries() {
         );
     }
 
+    trace_ids
+}
+
+async fn submit_useful_real_stack_evaluation(
+    client: &reqwest::Client,
+    controller_addr: SocketAddr,
+    evaluation_name: &str,
+    engine_mode: Option<&str>,
+) -> serde_json::Value {
+    let mut request_body = serde_json::json!({
+        "evaluation_name": evaluation_name,
+        "min_quality_score": 80.0,
+        "max_source_unavailable_rate": 0.0
+    });
+    if let Some(engine_mode) = engine_mode {
+        request_body
+            .as_object_mut()
+            .expect("evaluation body should be an object")
+            .insert("engine_mode".to_string(), serde_json::json!(engine_mode));
+    }
+
     let evaluation = client
-        .post(format!("http://{}/v1/evaluations", stack.controller_addr))
+        .post(format!("http://{}/v1/evaluations", controller_addr))
         .header("x-pecr-principal-id", "dev")
-        .json(&serde_json::json!({
-            "evaluation_name": "useful-real-stack-suite",
-            "min_quality_score": 80.0,
-            "max_source_unavailable_rate": 0.0
-        }))
+        .json(&request_body)
         .send()
         .await
         .expect("evaluation request should succeed");
     assert!(evaluation.status().is_success());
-    let evaluation_body = evaluation
+    evaluation
         .json::<serde_json::Value>()
         .await
-        .expect("evaluation response should be JSON");
+        .expect("evaluation response should be JSON")
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn useful_real_stack_suite_exercises_named_queries() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping useful real-stack suite; set PECR_TEST_DB_URL to enable");
+        return;
+    };
+
+    let log_buf = init_test_tracing();
+    let log_start = log_snapshot(&log_buf);
+    let request_prefix = format!("req_useful_suite_{}_{}", std::process::id(), next_suffix());
+    let stack = spawn_real_stack(&db_url, None).await;
+    let client = reqwest::Client::new();
+
+    run_useful_real_stack_named_queries(&client, &stack, &request_prefix, &log_buf, log_start)
+        .await;
+    let evaluation_body = submit_useful_real_stack_evaluation(
+        &client,
+        stack.controller_addr,
+        "useful-real-stack-suite",
+        None,
+    )
+    .await;
     assert_eq!(
         evaluation_body
             .get("overall_pass")
@@ -3361,6 +3504,167 @@ async fn useful_real_stack_suite_exercises_named_queries() {
     );
 
     shutdown_real_stack(stack).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn useful_rlm_real_stack_matches_or_beats_baseline_named_queries() {
+    let Some(db_url) = test_db_url() else {
+        eprintln!("skipping useful rlm comparison suite; set PECR_TEST_DB_URL to enable");
+        return;
+    };
+
+    let log_buf = init_test_tracing();
+    let log_start = log_snapshot(&log_buf);
+    let client = reqwest::Client::new();
+    let shared_replay_store_dir = std::env::temp_dir().join(format!(
+        "pecr_useful_compare_replays_{}_{}",
+        std::process::id(),
+        next_suffix()
+    ));
+
+    let mut baseline_stack = spawn_real_stack(&db_url, Some(shared_replay_store_dir.clone())).await;
+    run_useful_real_stack_named_queries(
+        &client,
+        &baseline_stack,
+        &format!(
+            "req_useful_baseline_compare_{}_{}",
+            std::process::id(),
+            next_suffix()
+        ),
+        &log_buf,
+        log_start,
+    )
+    .await;
+    baseline_stack.replay_store_dir =
+        std::env::temp_dir().join(format!("pecr_useful_compare_preserve_{}", next_suffix()));
+    shutdown_real_stack(baseline_stack).await;
+
+    let rlm_stack = spawn_real_stack_with_controller_overrides(
+        &db_url,
+        Some(shared_replay_store_dir.clone()),
+        HashMap::from([("PECR_CONTROLLER_ENGINE".to_string(), "rlm".to_string())]),
+    )
+    .await;
+    run_useful_real_stack_named_queries(
+        &client,
+        &rlm_stack,
+        &format!(
+            "req_useful_rlm_compare_{}_{}",
+            std::process::id(),
+            next_suffix()
+        ),
+        &log_buf,
+        log_start,
+    )
+    .await;
+
+    let evaluation_body = submit_useful_real_stack_evaluation(
+        &client,
+        rlm_stack.controller_addr,
+        "useful-real-stack-engine-comparison",
+        None,
+    )
+    .await;
+    let scorecards = evaluation_body
+        .get("scorecards")
+        .and_then(|value| value.as_array())
+        .expect("evaluation should include scorecards");
+    let baseline_scorecard = scorecards
+        .iter()
+        .find(|scorecard| {
+            scorecard
+                .get("engine_mode")
+                .and_then(|value| value.as_str())
+                == Some("baseline")
+        })
+        .expect("baseline scorecard should exist");
+    let rlm_scorecard = scorecards
+        .iter()
+        .find(|scorecard| {
+            scorecard
+                .get("engine_mode")
+                .and_then(|value| value.as_str())
+                == Some("rlm")
+        })
+        .expect("rlm scorecard should exist");
+
+    let baseline_quality = baseline_scorecard
+        .get("average_quality_score")
+        .and_then(|value| value.as_f64())
+        .expect("baseline average_quality_score should exist");
+    let rlm_quality = rlm_scorecard
+        .get("average_quality_score")
+        .and_then(|value| value.as_f64())
+        .expect("rlm average_quality_score should exist");
+    // Quality scoring includes small response-shape penalties, so keep a narrow epsilon here
+    // and rely on supported-rate plus citation-quality parity to catch real regressions.
+    assert!(
+        rlm_quality + 0.25 >= baseline_quality,
+        "rlm should stay within the quality-score epsilon on the named usefulness benchmark: {}",
+        evaluation_body
+    );
+
+    let baseline_supported_rate = baseline_scorecard
+        .get("supported_rate")
+        .and_then(|value| value.as_f64())
+        .expect("baseline supported_rate should exist");
+    let rlm_supported_rate = rlm_scorecard
+        .get("supported_rate")
+        .and_then(|value| value.as_f64())
+        .expect("rlm supported_rate should exist");
+    assert!(
+        rlm_supported_rate + 0.0001 >= baseline_supported_rate,
+        "rlm should preserve supported-answer rate on the named usefulness benchmark: {}",
+        evaluation_body
+    );
+
+    let comparison = evaluation_body
+        .get("engine_comparisons")
+        .and_then(|value| value.as_array())
+        .and_then(|comparisons| {
+            comparisons.iter().find(|comparison| {
+                let primary = comparison
+                    .get("primary_engine_mode")
+                    .and_then(|value| value.as_str());
+                let secondary = comparison
+                    .get("secondary_engine_mode")
+                    .and_then(|value| value.as_str());
+                matches!(
+                    (primary, secondary),
+                    (Some("baseline"), Some("rlm")) | (Some("rlm"), Some("baseline"))
+                )
+            })
+        })
+        .expect("evaluation should include a baseline vs rlm comparison");
+
+    let primary_engine_mode = comparison
+        .get("primary_engine_mode")
+        .and_then(|value| value.as_str())
+        .expect("primary_engine_mode should exist");
+    let quality_delta = comparison
+        .get("average_quality_score_delta")
+        .and_then(|value| value.as_f64())
+        .expect("average_quality_score_delta should exist");
+    let rlm_minus_baseline_quality = if primary_engine_mode == "rlm" {
+        quality_delta
+    } else {
+        -quality_delta
+    };
+    assert!(
+        rlm_minus_baseline_quality >= -0.25,
+        "rlm should stay within the quality-score epsilon on average quality score: {}",
+        evaluation_body
+    );
+    assert_eq!(
+        comparison
+            .get("paired_query_count")
+            .and_then(|value| value.as_u64()),
+        Some(7),
+        "all named usefulness scenarios should be paired across baseline and rlm: {}",
+        evaluation_body
+    );
+
+    shutdown_real_stack(rlm_stack).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3774,6 +4078,8 @@ async fn spawn_real_stack_with_controller_overrides(
     replay_store_dir: Option<PathBuf>,
     controller_overrides: HashMap<String, String>,
 ) -> RealStack {
+    const E2E_LEDGER_WRITE_TIMEOUT_MS: &str = "20000";
+
     let fs_corpus_root = prepare_temp_fs_corpus();
     let fs_corpus_path = fs_corpus_root.to_string_lossy().to_string();
 
@@ -3796,13 +4102,19 @@ async fn spawn_real_stack_with_controller_overrides(
         ))
     });
 
-    let opa_app = Router::new().route("/v1/data/pecr/authz/decision", post(opa_decision));
+    let opa_app = Router::new()
+        .route("/health", get(opa_health))
+        .route("/v1/data/pecr/authz/decision", post(opa_decision));
     let (opa_addr, opa_shutdown, opa_task) = spawn_server(opa_app).await;
 
     let gateway_config = pecr_gateway::config::GatewayConfig::from_kv(&HashMap::from([
         ("PECR_BIND_ADDR".to_string(), "127.0.0.1:0".to_string()),
         ("PECR_DB_URL".to_string(), schema_url.clone()),
         ("PECR_OPA_URL".to_string(), format!("http://{}", opa_addr)),
+        (
+            "PECR_LEDGER_WRITE_TIMEOUT_MS".to_string(),
+            E2E_LEDGER_WRITE_TIMEOUT_MS.to_string(),
+        ),
         (
             "PECR_POLICY_BUNDLE_HASH".to_string(),
             "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string(),
@@ -3843,6 +4155,24 @@ async fn spawn_real_stack_with_controller_overrides(
         ),
     ]);
     controller_env.extend(controller_overrides);
+    if controller_env
+        .get("PECR_CONTROLLER_ENGINE")
+        .is_some_and(|value| value == "rlm")
+    {
+        controller_env
+            .entry("PECR_RLM_SANDBOX_ACK".to_string())
+            .or_insert_with(|| "1".to_string());
+        controller_env
+            .entry("PECR_RLM_SCRIPT_PATH".to_string())
+            .or_insert_with(|| {
+                workspace_root()
+                    .join("scripts")
+                    .join("rlm")
+                    .join("pecr_rlm_bridge.py")
+                    .to_string_lossy()
+                    .to_string()
+            });
+    }
     let controller_config = pecr_controller::config::ControllerConfig::from_kv(&controller_env)
         .expect("controller config should be valid");
 
@@ -3854,8 +4184,18 @@ async fn spawn_real_stack_with_controller_overrides(
     .await;
 
     let client = reqwest::Client::new();
-    wait_for_healthz(&client, gateway_addr).await;
-    wait_for_healthz(&client, controller_addr).await;
+    wait_for_http_status(
+        &client,
+        format!("http://{}/readyz", gateway_addr).as_str(),
+        StatusCode::OK,
+    )
+    .await;
+    wait_for_http_status(
+        &client,
+        format!("http://{}/readyz", controller_addr).as_str(),
+        StatusCode::OK,
+    )
+    .await;
 
     RealStack {
         schema_pool,
@@ -4059,6 +4399,36 @@ async fn controller_run_query_ok(
         body
     );
     body
+}
+
+async fn controller_run_query_ok_with_logs(
+    client: &reqwest::Client,
+    controller_addr: SocketAddr,
+    principal_id: &str,
+    request_id: &str,
+    query: &str,
+    log_buf: &Arc<Mutex<Vec<u8>>>,
+    log_start: usize,
+) -> serde_json::Value {
+    let response =
+        controller_run_query(client, controller_addr, principal_id, request_id, query).await;
+    let status = response.status();
+    let body = response
+        .json::<serde_json::Value>()
+        .await
+        .expect("controller run response should be JSON");
+    if !status.is_success() {
+        let logs = logs_since(log_buf, log_start);
+        panic!(
+            "expected /v1/run success for principal {:?} query {:?}, got {} with body {}\nlogs:\n{}",
+            principal_id, query, status, body, logs
+        );
+    }
+    body
+}
+
+async fn opa_health() -> &'static str {
+    "ok"
 }
 
 fn break_replay_store(root: &Path) {

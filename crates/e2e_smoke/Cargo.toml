@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 axum = "0.8"
 hex = "0.4"
-pecr-controller = { path = "../controller" }
+pecr-controller = { path = "../controller", features = ["rlm"] }
 pecr-contracts = { path = "../contracts" }
 pecr-gateway = { path = "../gateway" }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }

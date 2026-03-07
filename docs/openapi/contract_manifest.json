@@ -88,12 +88,32 @@
     "PlannerRecoveryContext": {
       "source": { "type": "component", "name": "PlannerRecoveryContext" },
       "required": ["failed_step", "failure_terminal_mode", "attempted_path"],
+      "optional": ["failed_step_details"]
+    },
+    "PlannerToolSchema": {
+      "source": { "type": "component", "name": "PlannerToolSchema" },
+      "required": ["name", "description"],
+      "optional": ["required_params", "optional_params", "params_schema"]
+    },
+    "PlannerObservation": {
+      "source": { "type": "component", "name": "PlannerObservation" },
+      "required": ["step", "outcome"],
+      "optional": ["terminal_mode", "summary"]
+    },
+    "PlannerFailureFeedback": {
+      "source": { "type": "component", "name": "PlannerFailureFeedback" },
+      "required": ["failure_code"],
+      "optional": ["failed_step", "terminal_mode", "message"]
+    },
+    "ContextBudget": {
+      "source": { "type": "component", "name": "ContextBudget" },
+      "required": ["max_evidence_units", "max_total_chars", "max_structured_rows", "max_inline_citations"],
       "optional": []
     },
     "PlanRequest": {
       "source": { "type": "component", "name": "PlanRequest" },
-      "required": ["schema_version", "query", "budget", "planner_hints", "available_operator_names", "allow_search_ref_fetch_span"],
-      "optional": ["recovery_context"]
+      "required": ["schema_version", "query", "budget", "context_budget", "planner_hints", "preferred_evidence_pack_mode", "available_operator_names", "operator_schemas", "allow_search_ref_fetch_span"],
+      "optional": ["recovery_context", "prior_observations", "clarification_opportunities", "failure_feedback"]
     },
     "PlanResponse": {
       "source": { "type": "component", "name": "PlanResponse" },
