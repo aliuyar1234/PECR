@@ -46,6 +46,13 @@ pub(super) fn build_finalize_output(
         }
         _ => loop_terminal_mode,
     };
+    let synthesize_supported_from_evidence = trimmed_loop_response_text.is_some_and(|text| {
+        should_synthesize_supported_from_evidence(
+            effective_terminal_mode,
+            text,
+            &supported_evidence_unit_ids,
+        )
+    });
 
     if let Some(partial_output) = synthesize_partial_finalize_output(
         query,
@@ -56,22 +63,38 @@ pub(super) fn build_finalize_output(
         return partial_output;
     }
 
-    let response_text = trimmed_loop_response_text
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            if effective_terminal_mode == TerminalMode::Supported {
-                synthesize_supported_response_text(query, &ranked_evidence_units)
-                    .unwrap_or_else(|| response_text_for_terminal_mode(effective_terminal_mode))
-            } else if ranked_evidence_units.is_empty() {
-                ambiguity_guidance_for_query(query)
-                    .unwrap_or_else(|| response_text_for_terminal_mode(effective_terminal_mode))
-            } else {
-                response_text_for_terminal_mode(effective_terminal_mode)
-            }
-        });
+    if synthesize_supported_from_evidence {
+        if let Some(partial_output) = synthesize_partial_finalize_output(
+            query,
+            TerminalMode::InsufficientEvidence,
+            trimmed_loop_response_text,
+            &ranked_evidence_units,
+        ) {
+            return partial_output;
+        }
+    }
+
+    let response_text = if synthesize_supported_from_evidence {
+        synthesize_supported_response_text(query, &ranked_evidence_units)
+            .unwrap_or_else(|| response_text_for_terminal_mode(effective_terminal_mode))
+    } else {
+        trimmed_loop_response_text
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                if effective_terminal_mode == TerminalMode::Supported {
+                    synthesize_supported_response_text(query, &ranked_evidence_units)
+                        .unwrap_or_else(|| response_text_for_terminal_mode(effective_terminal_mode))
+                } else if ranked_evidence_units.is_empty() {
+                    ambiguity_guidance_for_query(query)
+                        .unwrap_or_else(|| response_text_for_terminal_mode(effective_terminal_mode))
+                } else {
+                    response_text_for_terminal_mode(effective_terminal_mode)
+                }
+            })
+    };
 
     let claim_map = if effective_terminal_mode == TerminalMode::Supported
-        && trimmed_loop_response_text.is_none()
+        && (trimmed_loop_response_text.is_none() || synthesize_supported_from_evidence)
     {
         synthesize_supported_claim_map(query, &ranked_evidence_units).unwrap_or_else(|| {
             build_claim_map_with_supported_evidence(
@@ -1287,6 +1310,19 @@ fn contains_explicit_claim_labels(text: &str) -> bool {
     })
 }
 
+fn should_synthesize_supported_from_evidence(
+    terminal_mode: TerminalMode,
+    response_text: &str,
+    supported_evidence_unit_ids: &[String],
+) -> bool {
+    terminal_mode == TerminalMode::Supported
+        && !supported_evidence_unit_ids.is_empty()
+        && contains_explicit_claim_labels(response_text)
+        && extract_atomic_claims(response_text)
+            .into_iter()
+            .all(|(status, _)| status != ClaimStatus::Supported)
+}
+
 fn default_partial_unknown_claim(query: &str) -> String {
     let query = normalize_claim_text(query);
     if query.is_empty() {
@@ -1836,6 +1872,34 @@ mod tests {
             out.response_text
                 .contains("UNKNOWN: Additional requested details")
         );
+    }
+
+    #[test]
+    fn build_finalize_output_recovers_supported_claims_from_unknown_loop_text() {
+        let evidence_units = vec![sample_evidence_unit(
+            "efefefefefefefefefefefefefefefefefefefefefefefefefefefefefefefef",
+            serde_json::json!({
+                "status": "active",
+                "plan_tier": "starter"
+            }),
+            EvidenceContentType::ApplicationJson,
+        )];
+
+        let out = build_finalize_output(
+            "What is the customer status and plan tier?",
+            TerminalMode::Supported,
+            Some("UNKNOWN: insufficient evidence to answer the query.".to_string()),
+            &evidence_units,
+        );
+
+        assert_eq!(out.claim_map.terminal_mode, TerminalMode::Supported);
+        assert!(
+            out.claim_map.claims.iter().any(|claim| {
+                claim.status == ClaimStatus::Supported && !claim.evidence_unit_ids.is_empty()
+            }),
+            "supported evidence-backed claims should be synthesized from the retrieved evidence"
+        );
+        assert!(out.response_text.contains("SUPPORTED:"));
     }
 
     #[test]

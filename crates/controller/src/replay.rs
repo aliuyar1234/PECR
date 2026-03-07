@@ -2,6 +2,8 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime};
 
 use pecr_contracts::canonical;
@@ -16,6 +18,7 @@ use ulid::Ulid;
 use crate::config::ControllerEngine;
 
 const REPLAY_SCHEMA_VERSION: u32 = 1;
+const REPLAY_CLEANUP_INTERVAL_MS: u64 = 5 * 60 * 1000;
 
 #[derive(Debug, Clone)]
 pub struct PersistedRun {
@@ -44,6 +47,7 @@ pub struct PersistedRun {
 pub struct ReplayStore {
     root_dir: PathBuf,
     retention_days: u64,
+    last_cleanup_unix_ms: Arc<AtomicU64>,
 }
 
 impl ReplayStore {
@@ -51,6 +55,7 @@ impl ReplayStore {
         let store = Self {
             root_dir,
             retention_days,
+            last_cleanup_unix_ms: Arc::new(AtomicU64::new(0)),
         };
         fs::create_dir_all(store.replays_dir())?;
         fs::create_dir_all(store.evaluations_dir())?;
@@ -58,7 +63,7 @@ impl ReplayStore {
     }
 
     pub fn persist_run(&self, run: PersistedRun) -> io::Result<ReplayBundleMetadata> {
-        self.cleanup_expired()?;
+        self.cleanup_expired_if_due()?;
 
         let run_id = format!("{}-{}", run.trace_id, Ulid::new());
         let principal_id_hash = hash_principal_id(run.principal_id.as_str());
@@ -308,6 +313,35 @@ impl ReplayStore {
         removed += prune_old_json_files(self.replays_dir().as_path(), max_age)?;
         removed += prune_old_json_files(self.evaluations_dir().as_path(), max_age)?;
         Ok(removed)
+    }
+
+    fn cleanup_expired_if_due(&self) -> io::Result<usize> {
+        if self.retention_days == 0 {
+            return Ok(0);
+        }
+
+        let now_ms = now_unix_ms();
+        let last_cleanup = self.last_cleanup_unix_ms.load(Ordering::Relaxed);
+        if !cleanup_due(last_cleanup, now_ms) {
+            return Ok(0);
+        }
+
+        if self
+            .last_cleanup_unix_ms
+            .compare_exchange(last_cleanup, now_ms, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return Ok(0);
+        }
+
+        match self.cleanup_expired() {
+            Ok(removed) => Ok(removed),
+            Err(err) => {
+                self.last_cleanup_unix_ms
+                    .store(last_cleanup, Ordering::SeqCst);
+                Err(err)
+            }
+        }
     }
 
     pub fn readiness_check(&self) -> io::Result<()> {
@@ -891,6 +925,11 @@ fn prune_old_json_files(dir: &Path, max_age: Duration) -> io::Result<usize> {
     Ok(removed)
 }
 
+fn cleanup_due(last_cleanup_unix_ms: u64, now_unix_ms: u64) -> bool {
+    last_cleanup_unix_ms == 0
+        || now_unix_ms.saturating_sub(last_cleanup_unix_ms) >= REPLAY_CLEANUP_INTERVAL_MS
+}
+
 fn is_safe_id(raw: &str) -> bool {
     !raw.is_empty()
         && raw.len() <= 256
@@ -973,6 +1012,15 @@ mod tests {
 
     fn temp_store_dir() -> PathBuf {
         std::env::temp_dir().join(format!("pecr-replay-test-{}", Ulid::new()))
+    }
+
+    #[test]
+    fn cleanup_due_throttles_repeat_directory_scans() {
+        let now = 50_000;
+
+        assert!(cleanup_due(0, now));
+        assert!(!cleanup_due(now, now + REPLAY_CLEANUP_INTERVAL_MS - 1));
+        assert!(cleanup_due(now, now + REPLAY_CLEANUP_INTERVAL_MS));
     }
 
     #[test]

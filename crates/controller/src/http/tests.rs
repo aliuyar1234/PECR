@@ -1473,13 +1473,65 @@ async fn spawn_run_gateway() -> (SocketAddr, oneshot::Sender<()>, tokio::task::J
             .get("x-pecr-trace-id")
             .and_then(|value| value.to_str().ok())
             .unwrap_or("trace");
+        let mut claim_map = req
+            .get("claim_map")
+            .cloned()
+            .unwrap_or_else(|| serde_json::json!({}));
+        let mut supported_claims = 0u64;
+        let mut covered_supported_claims = 0u64;
+        if let Some(claims) = claim_map
+            .get_mut("claims")
+            .and_then(|value| value.as_array_mut())
+        {
+            for claim in claims {
+                let status = claim
+                    .get("status")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("UNKNOWN");
+                if status != "SUPPORTED" {
+                    continue;
+                }
+
+                let evidence_count = claim
+                    .get("evidence_unit_ids")
+                    .and_then(|value| value.as_array())
+                    .map(|ids| ids.iter().filter(|id| id.as_str().is_some()).count())
+                    .unwrap_or(0);
+                if evidence_count == 0 {
+                    if let Some(obj) = claim.as_object_mut() {
+                        obj.insert("status".to_string(), serde_json::json!("UNKNOWN"));
+                    }
+                } else {
+                    supported_claims += 1;
+                    covered_supported_claims += 1;
+                }
+            }
+        }
+        let coverage_observed = if supported_claims == 0 {
+            0.0
+        } else {
+            covered_supported_claims as f64 / supported_claims as f64
+        };
+        let terminal_mode = if supported_claims > 0 && coverage_observed >= 0.95 {
+            "SUPPORTED"
+        } else {
+            "INSUFFICIENT_EVIDENCE"
+        };
+        if let Some(obj) = claim_map.as_object_mut() {
+            obj.insert("coverage_threshold".to_string(), serde_json::json!(0.95));
+            obj.insert(
+                "coverage_observed".to_string(),
+                serde_json::json!(coverage_observed),
+            );
+            obj.insert(
+                "terminal_mode".to_string(),
+                serde_json::json!(terminal_mode),
+            );
+        }
         Json(serde_json::json!({
-            "terminal_mode": req.get("claim_map")
-                .and_then(|claim_map| claim_map.get("terminal_mode"))
-                .cloned()
-                .unwrap_or_else(|| serde_json::json!("INSUFFICIENT_EVIDENCE")),
+            "terminal_mode": terminal_mode,
             "trace_id": trace_id,
-            "claim_map": req.get("claim_map").cloned().unwrap_or_else(|| serde_json::json!({})),
+            "claim_map": claim_map,
             "response_text": req.get("response_text").cloned().unwrap_or_else(|| serde_json::json!(""))
         }))
     }
@@ -2036,6 +2088,116 @@ async fn run_returns_supported_claims_and_persists_replay() {
             .any(|claim| claim.status == ClaimStatus::Supported
                 && !claim.evidence_unit_ids.is_empty())
     );
+}
+
+#[cfg(feature = "rlm")]
+#[tokio::test]
+async fn run_recovers_supported_finalize_output_for_rlm_unknown_placeholder() {
+    let _env_lock = RLM_SCRIPT_ENV_LOCK
+        .lock()
+        .expect("rlm script env lock should not be poisoned");
+    let script_path = write_temp_bridge_script(
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+start = json.loads(sys.stdin.readline())
+if start.get("type") != "start":
+    raise SystemExit("expected start")
+
+sys.stdout.write(json.dumps({"type": "start_ack", "protocol_version": 1}) + "\n")
+sys.stdout.flush()
+
+call_id = "call-fetch-rows"
+sys.stdout.write(json.dumps({
+    "type": "call_operator",
+    "id": call_id,
+    "depth": 0,
+    "op_name": "fetch_rows",
+    "params": {
+        "view_id": "safe_customer_view_public",
+        "filter_spec": {"customer_id": "cust_public_1"},
+        "fields": ["status", "plan_tier"]
+    }
+}) + "\n")
+sys.stdout.flush()
+
+result = json.loads(sys.stdin.readline())
+if result.get("type") != "operator_result" or result.get("id") != call_id:
+    raise SystemExit("expected operator_result for fetch_rows")
+
+sys.stdout.write(json.dumps({
+    "type": "done",
+    "final_answer": "UNKNOWN: insufficient evidence to answer the query."
+}) + "\n")
+sys.stdout.flush()
+"#,
+    );
+
+    let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+    // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+    unsafe {
+        std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+    }
+
+    let budget = Budget {
+        max_operator_calls: 10,
+        max_bytes: 1024 * 1024,
+        max_wallclock_ms: 10_000,
+        max_recursion_depth: 10,
+        max_parallelism: Some(2),
+    };
+    let (gateway_addr, shutdown, task) = spawn_run_gateway().await;
+    let mut state = controller_state(
+        gateway_addr,
+        budget.clone(),
+        crate::config::default_baseline_plan(),
+    );
+    state.config.controller_engine = crate::config::ControllerEngine::Rlm;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-pecr-principal-id", HeaderValue::from_static("dev"));
+    headers.insert("x-pecr-request-id", HeaderValue::from_static("req-rlm-run"));
+    headers.insert("x-pecr-trace-id", HeaderValue::from_static("trace-rlm-run"));
+
+    let response = run(
+        State(state),
+        headers,
+        Json(RunRequest {
+            query: "What is the customer status and plan tier?".to_string(),
+            budget: Some(budget),
+        }),
+    )
+    .await
+    .expect("run should succeed");
+
+    shutdown.send(()).ok();
+    let _ = task.await;
+    if let Some(previous) = previous_script_path {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+        }
+    } else {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+        }
+    }
+    let _ = fs::remove_file(&script_path);
+
+    assert_eq!(response.0.terminal_mode, TerminalMode::Supported);
+    assert!(
+        response
+            .0
+            .claim_map
+            .claims
+            .iter()
+            .any(|claim| claim.status == ClaimStatus::Supported
+                && !claim.evidence_unit_ids.is_empty()),
+        "finalize should convert the placeholder UNKNOWN into supported claims when evidence exists"
+    );
+    assert!(response.0.response_text.contains("SUPPORTED:"));
 }
 
 #[test]
