@@ -37,6 +37,13 @@ Notes:
 
 Use the dedicated sync script to keep `vendor/rlm` aligned with upstream:
 
+- Research upstream of record:
+  - `https://github.com/alexzhang13/rlm`
+- Shipped PECR runtime:
+  - `vendor/rlm` plus the PECR bridge/integration layer in `scripts/rlm/pecr_rlm_bridge.py`
+- Adoption policy:
+  - upstream changes can be proposed automatically or synced manually, but they are not treated as shipped PECR behavior until reviewed, verified, and merged
+
 - Latest upstream `main`:
   - `python3 scripts/rlm/sync_vendor_rlm.py`
 - Specific upstream commit:
@@ -44,7 +51,7 @@ Use the dedicated sync script to keep `vendor/rlm` aligned with upstream:
 - Verification only:
   - `python3 scripts/rlm/verify_vendor_rlm.py`
 
-The sync command updates `vendor/rlm`, rewrites the D-0001 pin in `DECISIONS.md`, and runs verification checks.
+The sync command updates `vendor/rlm`, refreshes `vendor/rlm/UPSTREAM_PIN`, updates the legacy `DECISIONS.md` pin if that file exists, and runs verification checks.
 CI also enforces RLM verification via `scripts/rlm/verify_vendor_rlm.py` inside `scripts/ci.sh`.
 
 ## Performance harness (Suite 7)

@@ -12,6 +12,7 @@ As of March 7, 2026:
 - `PECR_CONTROLLER_ENGINE=rlm` exists.
 - the controller can run the Python bridge in `scripts/rlm/pecr_rlm_bridge.py`.
 - the bridge now supports `PECR_RLM_BACKEND=mock` and an initial opt-in `PECR_RLM_BACKEND=openai` seam.
+- the research upstream for the vendored RLM runtime is `alexzhang13/rlm`, while PECR ships a reviewed vendored integration from `vendor/rlm`.
 - local compose now defaults into the RLM controller path with `PECR_RLM_DEFAULT_ENABLED=1`, `PECR_RLM_SANDBOX_ACK=1`, and baseline auto-fallback enabled.
 - controller startup still refuses `PECR_MODEL_PROVIDER=external`.
 
@@ -31,6 +32,7 @@ In practice, that means:
 
 - RLM remains the reasoning runtime.
 - the real model backend is configured behind the Python RLM bridge.
+- upstream research evolution stays visible, but shipped PECR behavior only changes when the vendored integration is intentionally updated and re-verified.
 - gateway and source adapters never see model credentials.
 - the public `/v1/run` API does not expose provider or model selection.
 - per-request backend switching is out of scope for the first rollout.

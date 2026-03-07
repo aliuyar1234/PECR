@@ -14,6 +14,7 @@ from typing import Sequence
 
 ROOT = Path(__file__).resolve().parents[2]
 VENDOR_RLM_DIR = ROOT / "vendor" / "rlm"
+UPSTREAM_PIN_FILE = VENDOR_RLM_DIR / "UPSTREAM_PIN"
 DECISIONS_FILE = ROOT / "DECISIONS.md"
 DEFAULT_UPSTREAM = "https://github.com/alexzhang13/rlm.git"
 DEFAULT_REF = "refs/heads/main"
@@ -103,10 +104,17 @@ def update_decisions_pin_text(text: str, commit: str) -> str:
 
 
 def update_decisions_pin_file(commit: str) -> None:
+    if not DECISIONS_FILE.exists():
+        return
     current = DECISIONS_FILE.read_text(encoding="utf-8")
     updated = update_decisions_pin_text(current, commit)
     if updated != current:
         DECISIONS_FILE.write_text(updated, encoding="utf-8")
+
+
+def update_upstream_pin_file(commit: str) -> None:
+    UPSTREAM_PIN_FILE.parent.mkdir(parents=True, exist_ok=True)
+    UPSTREAM_PIN_FILE.write_text(f"{commit}\n", encoding="utf-8")
 
 
 def run_verification() -> None:
@@ -116,7 +124,7 @@ def run_verification() -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Sync vendor/rlm from upstream and update DECISIONS pin."
+        description="Sync vendor/rlm from the research upstream and update the vendored upstream pin."
     )
     parser.add_argument("--upstream", default=DEFAULT_UPSTREAM, help="Upstream git repository URL.")
     parser.add_argument(
@@ -153,7 +161,7 @@ def main() -> int:
         commit = resolve_commit(args.upstream, args.ref)
 
     print(f"Resolved upstream commit: {commit}")
-    print(f"Upstream: {args.upstream}")
+    print(f"Research upstream: {args.upstream}")
     print(f"Ref: {args.ref}")
 
     if args.dry_run:
@@ -164,6 +172,7 @@ def main() -> int:
         checkout_commit(upstream=args.upstream, commit=commit, checkout_dir=checkout_dir)
         replace_vendor_tree(source_checkout=checkout_dir, vendor_dir=VENDOR_RLM_DIR)
 
+    update_upstream_pin_file(commit)
     update_decisions_pin_file(commit)
 
     if not args.skip_verify:

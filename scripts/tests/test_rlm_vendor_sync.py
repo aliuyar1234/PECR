@@ -44,6 +44,18 @@ class SyncVendorRlmTests(unittest.TestCase):
         self.assertIn(new_commit, updated)
         self.assertNotIn(old_commit, updated)
 
+    def test_update_upstream_pin_file_writes_commit(self):
+        commit = "76abb9c93ae314db96bae411bf4cd88a17349aad"
+        original = self.sync_mod.UPSTREAM_PIN_FILE.read_text(encoding="utf-8")
+        try:
+            self.sync_mod.update_upstream_pin_file(commit)
+            self.assertEqual(
+                self.sync_mod.UPSTREAM_PIN_FILE.read_text(encoding="utf-8"),
+                f"{commit}\n",
+            )
+        finally:
+            self.sync_mod.UPSTREAM_PIN_FILE.write_text(original, encoding="utf-8")
+
     def test_parse_pinned_commit_extracts_commit(self):
         commit = "76abb9c93ae314db96bae411bf4cd88a17349aad"
         text = (

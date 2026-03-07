@@ -287,6 +287,12 @@ The migration in `RLM_FIRST_MIGRATION_PLAN.md` is about proving that default ope
 The first supported real backend envelope is documented in `docs/architecture/rlm_runtime_envelope.md`.
 Important current truth: the controller still rejects `PECR_MODEL_PROVIDER=external`, so the real RLM backend must land through the bridge/runtime path first rather than through the current Rust model-provider switch. Local compose defaults to the `mock` bridge backend; the initial `openai` seam is real but still opt-in.
 
+RLM upstream/update model:
+
+- research upstream: `alexzhang13/rlm` and its accompanying Recursive Language Models paper
+- shipped PECR runtime: the vendored integration in `vendor/rlm`, adapted behind `scripts/rlm/pecr_rlm_bridge.py`
+- update policy: upstream changes may be proposed automatically or synced manually, but adoption into PECR is explicit and review-gated, not automatic at runtime
+
 Phase 6 local-development decision:
 
 - keep the real backend explicit and opt-in for now
@@ -346,6 +352,8 @@ python3 scripts/rlm/sync_vendor_rlm.py
 python3 scripts/rlm/sync_vendor_rlm.py --commit <40-char-sha>
 python3 scripts/rlm/verify_vendor_rlm.py
 ```
+
+The sync path updates `vendor/rlm` plus `vendor/rlm/UPSTREAM_PIN`; PECR still ships only what is reviewed and merged.
 
 Automation: `.github/workflows/vendor-rlm-sync.yml`
 

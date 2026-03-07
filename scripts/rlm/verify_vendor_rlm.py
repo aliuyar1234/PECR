@@ -31,7 +31,7 @@ def parse_pinned_commit(text: str) -> str:
     match = PIN_LINE_RE.search(text)
     if match is None:
         raise SystemExit(
-            "missing D-0001 vendored commit pin in DECISIONS.md "
+            "missing legacy vendored commit pin in DECISIONS.md "
             "(expected line with `alexzhang13/rlm` commit hash)"
         )
     return match.group(1)
