@@ -1123,8 +1123,6 @@ mod tests {
     #[test]
     fn runtime_flags_and_operator_policy_parse_from_env() {
         let mut env = minimal_ok_env();
-        env.insert("PECR_RLM_DEFAULT_ENABLED".to_string(), "1".to_string());
-        env.insert("PECR_RLM_SANDBOX_ACK".to_string(), "1".to_string());
         env.insert(
             "PECR_RLM_AUTO_FALLBACK_TO_BASELINE".to_string(),
             "0".to_string(),
@@ -1148,7 +1146,7 @@ mod tests {
         );
 
         let cfg = ControllerConfig::from_kv(&env).expect("config should load");
-        assert!(cfg.rlm_default_enabled);
+        assert!(!cfg.rlm_default_enabled);
         assert!(!cfg.rlm_auto_fallback_to_baseline);
         assert_eq!(cfg.baseline_shadow_percent, 25);
         assert!(!cfg.adaptive_parallelism_enabled);

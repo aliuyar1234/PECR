@@ -907,8 +907,8 @@ def run_openai(
     planner_hints: dict[str, Any] | None = None,
     plan_request: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    RLM = load_rlm_class()
     backend_kwargs = build_openai_backend_kwargs()
+    RLM = load_rlm_class()
     custom_tools, tool_state = build_custom_tools(
         bridge,
         budget=budget,

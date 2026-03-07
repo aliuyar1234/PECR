@@ -22,6 +22,15 @@ def load_module(module_name: str, relative_path: str):
     return module
 
 
+def ensure_optional_dotenv_stub():
+    try:
+        import dotenv  # noqa: F401
+    except ModuleNotFoundError:
+        dotenv_stub = type(sys)("dotenv")
+        dotenv_stub.load_dotenv = lambda *args, **kwargs: False
+        sys.modules["dotenv"] = dotenv_stub
+
+
 class FakeBridge:
     def __init__(self):
         self.operator_calls = []
@@ -209,6 +218,7 @@ class RlmBridgeTests(unittest.TestCase):
         warnings.filterwarnings("ignore", category=ResourceWarning)
         cls.mod = load_module("pecr_rlm_bridge", "scripts/rlm/pecr_rlm_bridge.py")
         cls.mod.ensure_vendor_rlm_on_path()
+        ensure_optional_dotenv_stub()
         import rlm.core.rlm as rlm_module
         from rlm.core.types import ModelUsageSummary, UsageSummary
 

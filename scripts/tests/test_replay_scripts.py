@@ -12,6 +12,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 USEFUL_TASK_FIXTURE_DIR = ROOT / "fixtures" / "replay" / "useful_tasks"
 USEFUL_TASK_MANIFEST = USEFUL_TASK_FIXTURE_DIR / "benchmark_manifest.json"
+USEFUL_TASK_MANIFEST_PAYLOAD = json.loads(USEFUL_TASK_MANIFEST.read_text(encoding="utf-8"))
+USEFUL_TASK_SCENARIO_COUNT = len(USEFUL_TASK_MANIFEST_PAYLOAD["scenarios"])
 
 
 def has_working_mix() -> bool:
@@ -306,7 +308,7 @@ class ReplayScriptTests(unittest.TestCase):
         self.assertIn("monthly-customer-trend", scenario_ids)
         self.assertIn("broad-customer-query", scenario_ids)
         self.assertIn("partial-billing-answer", scenario_ids)
-        self.assertEqual(len(payload["scenarios"]), 10)
+        self.assertEqual(len(payload["scenarios"]), USEFUL_TASK_SCENARIO_COUNT)
         rows_by_id = {row["scenario_id"]: row for row in payload["scenarios"]}
         self.assertEqual(
             rows_by_id["broad-customer-query"]["actual_response_kind"], "ambiguous"
@@ -335,7 +337,7 @@ class ReplayScriptTests(unittest.TestCase):
 
         payload = json.loads(result.stdout)
         self.assertTrue(payload["ok"])
-        self.assertEqual(payload["scenario_count"], 10)
+        self.assertEqual(payload["scenario_count"], USEFUL_TASK_SCENARIO_COUNT)
         self.assertEqual(payload["categories"]["aggregate_compare"], 1)
         self.assertEqual(payload["categories"]["aggregate_trend"], 1)
         self.assertEqual(payload["categories"]["ambiguity_guidance"], 2)
@@ -729,7 +731,7 @@ class ReplayScriptTests(unittest.TestCase):
         self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
 
         payload = json.loads(result.stdout)
-        self.assertEqual(payload["scenario_count"], 10)
+        self.assertEqual(payload["scenario_count"], USEFUL_TASK_SCENARIO_COUNT)
         self.assertIn("customer-status", {row["scenario_id"] for row in payload["scenarios"]})
 
     def test_useful_workflows_tour_reports_curated_scenarios(self):
