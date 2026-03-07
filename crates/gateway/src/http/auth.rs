@@ -1,10 +1,9 @@
-use axum::Json;
 use axum::http::{HeaderMap, StatusCode};
 use pecr_auth::Principal;
 use pecr_contracts::{TerminalMode, canonical};
 use ulid::Ulid;
 
-use super::{ApiError, AppState, ErrorResponse, json_error};
+use super::{ApiError, AppState, json_error};
 use crate::config::AuthMode;
 
 pub(super) async fn extract_principal(
@@ -65,9 +64,7 @@ pub(super) async fn extract_principal(
     }
 }
 
-pub(super) fn extract_session_token(
-    headers: &HeaderMap,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+pub(super) fn extract_session_token(headers: &HeaderMap) -> Result<String, ApiError> {
     let token = headers
         .get("x-pecr-session-token")
         .and_then(|v| v.to_str().ok())
@@ -204,7 +201,7 @@ fn validate_local_auth_shared_secret(
     Ok(())
 }
 
-fn extract_principal_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+fn extract_principal_id(headers: &HeaderMap) -> Result<String, ApiError> {
     let principal_id = headers
         .get("x-pecr-principal-id")
         .and_then(|v| v.to_str().ok())

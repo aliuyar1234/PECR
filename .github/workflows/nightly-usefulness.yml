@@ -66,13 +66,12 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
-      - name: Install Elixir for BEAM shadow lane
+      - name: Set up BEAM toolchain
         if: matrix.engine_mode == 'beam_shadow' || matrix.engine_mode == 'beam_planner'
-        shell: bash
-        run: |
-          set -euo pipefail
-          sudo apt-get update
-          sudo apt-get install -y elixir
+        uses: erlef/setup-beam@3559ac3b631a9560f28817e8e7fdde1638664336 # v1
+        with:
+          elixir-version: '1.16'
+          otp-version: '26'
 
       - name: Verify BEAM shadow planner scaffold
         if: matrix.engine_mode == 'beam_shadow' || matrix.engine_mode == 'beam_planner'

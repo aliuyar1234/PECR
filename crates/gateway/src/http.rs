@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use pecr_auth::OidcAuthenticator;
@@ -63,7 +64,35 @@ pub struct AppState {
     pg_versions: Arc<RwLock<FsVersionCache>>,
 }
 
-type ApiError = (StatusCode, Json<ErrorResponse>);
+#[derive(Debug)]
+pub(super) struct ApiError {
+    status: StatusCode,
+    body: Box<ErrorResponse>,
+}
+
+impl ApiError {
+    fn new(status: StatusCode, body: ErrorResponse) -> Self {
+        Self {
+            status,
+            body: Box::new(body),
+        }
+    }
+
+    pub(super) fn status_code(&self) -> StatusCode {
+        self.status
+    }
+
+    pub(super) fn error_response(&self) -> &ErrorResponse {
+        self.body.as_ref()
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (self.status, Json(*self.body)).into_response()
+    }
+}
+
 type FilterEq = (String, String);
 
 pub async fn router(config: GatewayConfig) -> Result<Router, StartupError> {
@@ -259,10 +288,10 @@ pub(super) fn json_error(
     message: impl Into<String>,
     terminal_mode_hint: pecr_contracts::TerminalMode,
     retryable: bool,
-) -> (StatusCode, Json<ErrorResponse>) {
-    (
+) -> ApiError {
+    ApiError::new(
         status,
-        Json(with_actionable_guidance(ErrorResponse {
+        with_actionable_guidance(ErrorResponse {
             code: code.into(),
             message: message.into(),
             terminal_mode_hint,
@@ -271,11 +300,11 @@ pub(super) fn json_error(
             what_failed: None,
             safe_alternative: None,
             detail: None,
-        })),
+        }),
     )
 }
 
-pub(super) fn opa_error_response(err: &crate::opa::OpaError) -> (StatusCode, Json<ErrorResponse>) {
+pub(super) fn opa_error_response(err: &crate::opa::OpaError) -> ApiError {
     match err {
         crate::opa::OpaError::Timeout => json_error(
             StatusCode::GATEWAY_TIMEOUT,

@@ -5,7 +5,6 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::Json;
 use axum::http::StatusCode;
 use hex::ToHex;
 use pecr_adapters::{normalize_resource_prefix, normalize_search_query};
@@ -23,7 +22,7 @@ use tokio::sync::RwLock;
 
 use crate::config::{GatewayConfig, StartupError};
 
-use super::{ApiError, ErrorResponse, FilterEq, json_error};
+use super::{ApiError, FilterEq, json_error};
 
 #[derive(Debug, Serialize)]
 pub(super) struct VersionInfo {
@@ -286,7 +285,7 @@ impl FsVersionCache {
 async fn read_object_bytes_from_fs(
     fs_corpus_path: &str,
     object_id: &str,
-) -> Result<Vec<u8>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Vec<u8>, ApiError> {
     let object_rel = std::path::Path::new(object_id);
     if object_rel.is_absolute() || !is_safe_rel_path(object_rel) {
         return Err(json_error(
@@ -593,7 +592,7 @@ pub(super) async fn fetch_span_from_fs(
     policy_snapshot_id: &str,
     policy_snapshot_hash: &str,
     params: &serde_json::Value,
-) -> Result<pecr_contracts::EvidenceUnit, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<pecr_contracts::EvidenceUnit, ApiError> {
     let object_id = params
         .get("object_id")
         .and_then(|v| v.as_str())
@@ -748,7 +747,7 @@ pub(super) async fn search_from_fs(
     as_of_time_default: &str,
     policy_snapshot_hash: &str,
     params: &serde_json::Value,
-) -> Result<Vec<EvidenceUnitRef>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Vec<EvidenceUnitRef>, ApiError> {
     let request = parse_fs_search_request(params)?;
     let base = std::path::Path::new(fs_corpus_path);
     let base_canon = tokio::fs::canonicalize(base).await.map_err(|_| {
@@ -927,7 +926,7 @@ fn parse_fs_search_request(params: &serde_json::Value) -> Result<FsSearchRequest
             .collect::<Result<Vec<_>, _>>()?,
         Some(serde_json::Value::String(value)) => value
             .split(',')
-            .map(|term| normalize_search_query(term))
+            .map(normalize_search_query)
             .collect::<Result<Vec<_>, _>>()
             .map_err(|err| {
                 json_error(
@@ -1528,7 +1527,7 @@ pub(super) fn missing_safeview_columns(
 fn parse_safeview_string(
     value: Option<&serde_json::Value>,
     key: &'static str,
-) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<String, ApiError> {
     value
         .and_then(|v| v.as_str())
         .map(|v| v.trim())
@@ -1549,7 +1548,7 @@ fn parse_safeview_fields(
     params: &serde_json::Value,
     spec: SafeViewSpec,
     max_fields: usize,
-) -> Result<Vec<String>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Vec<String>, ApiError> {
     let mut fields = params
         .get("fields")
         .and_then(|v| v.as_array())
@@ -1676,7 +1675,7 @@ pub(super) struct PgSafeviewContext<'a> {
 pub(super) async fn fetch_rows_from_pg_safeview(
     ctx: PgSafeviewContext<'_>,
     params: &serde_json::Value,
-) -> Result<Vec<pecr_contracts::EvidenceUnit>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Vec<pecr_contracts::EvidenceUnit>, ApiError> {
     let PgSafeviewContext {
         pool,
         config,
@@ -2002,7 +2001,7 @@ pub(super) async fn aggregate_from_pg_safeview(
     policy_snapshot_hash: &str,
     as_of_time: &str,
     params: &serde_json::Value,
-) -> Result<pecr_contracts::EvidenceUnit, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<pecr_contracts::EvidenceUnit, ApiError> {
     let view_id = parse_safeview_string(params.get("view_id"), "view_id")?;
     let spec = safeview_spec(&view_id).ok_or_else(|| {
         json_error(
@@ -2505,7 +2504,7 @@ pub(super) async fn compare_from_pg_safeview(
     policy_snapshot_hash: &str,
     as_of_time: &str,
     params: &serde_json::Value,
-) -> Result<pecr_contracts::EvidenceUnit, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<pecr_contracts::EvidenceUnit, ApiError> {
     let mut evidence = aggregate_from_pg_safeview(
         pool,
         config,
@@ -2568,7 +2567,7 @@ pub(super) async fn discover_dimensions_from_pg_safeview(
     policy_snapshot_hash: &str,
     as_of_time: &str,
     params: &serde_json::Value,
-) -> Result<pecr_contracts::EvidenceUnit, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<pecr_contracts::EvidenceUnit, ApiError> {
     let view_id = parse_safeview_string(params.get("view_id"), "view_id")?;
     let spec = safeview_spec(&view_id).ok_or_else(|| {
         json_error(

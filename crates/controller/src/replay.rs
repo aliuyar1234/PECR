@@ -587,6 +587,7 @@ fn normalized_query_key(query: &str) -> String {
         .to_ascii_lowercase()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn comparison_winner(
     primary: EngineMode,
     secondary: EngineMode,

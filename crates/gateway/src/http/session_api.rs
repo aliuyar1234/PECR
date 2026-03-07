@@ -13,7 +13,7 @@ use ulid::Ulid;
 use super::auth::{extract_principal, extract_request_id, extract_trace_id, sanitize_as_of_time};
 use super::runtime::sha256_hex;
 use super::session::unix_epoch_ms_now;
-use super::{AppState, ErrorResponse, json_error};
+use super::{ApiError, AppState, json_error};
 use crate::opa::OpaCacheKey;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -36,7 +36,7 @@ pub(super) async fn create_session(
     State(state): State<AppState>,
     headers: HeaderMap,
     req: Result<Json<CreateSessionRequest>, JsonRejection>,
-) -> Result<(HeaderMap, Json<CreateSessionResponse>), (StatusCode, Json<ErrorResponse>)> {
+) -> Result<(HeaderMap, Json<CreateSessionResponse>), ApiError> {
     let principal = extract_principal(&state, &headers).await?;
     let principal_id = principal.principal_id.clone();
 
@@ -245,7 +245,7 @@ pub(super) async fn create_session(
             let latency_ms = started.elapsed().as_millis() as u64;
             tracing::Span::current().record("latency_ms", latency_ms);
             tracing::Span::current().record("outcome", "ok");
-            Ok::<_, (StatusCode, Json<ErrorResponse>)>(())
+            Ok::<_, ApiError>(())
         }
         .instrument(ledger_span)
         .await?;
@@ -281,7 +281,7 @@ pub(super) async fn create_session(
 
     let status = match &result {
         Ok(_) => StatusCode::OK,
-        Err((status, _)) => *status,
+        Err(err) => err.status_code(),
     };
     crate::metrics::observe_http_request(
         "/v1/sessions",

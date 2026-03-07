@@ -13,7 +13,7 @@ use tracing::Instrument;
 use super::auth::{extract_principal, extract_request_id, extract_session_token};
 use super::session::Session;
 use super::session::{acquire_session_lock, load_session_runtime, persist_session_runtime};
-use super::{ApiError, AppState, ErrorResponse, json_error, opa_error_response};
+use super::{ApiError, AppState, json_error, opa_error_response};
 use crate::opa::OpaCacheKey;
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -130,7 +130,7 @@ pub(super) async fn finalize(
     State(state): State<AppState>,
     headers: HeaderMap,
     req: Result<Json<FinalizeRequest>, JsonRejection>,
-) -> Result<Json<FinalizeResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<FinalizeResponse>, ApiError> {
     let request_started = Instant::now();
 
     let handler_result = (async move {
@@ -465,7 +465,7 @@ pub(super) async fn finalize(
 
     let status = match &handler_result {
         Ok(_) => StatusCode::OK,
-        Err((status, _)) => *status,
+        Err(err) => err.status_code(),
     };
     crate::metrics::observe_http_request(
         "/v1/finalize",
@@ -478,9 +478,10 @@ pub(super) async fn finalize(
         Ok(Json(body)) => {
             crate::metrics::observe_terminal_mode("/v1/finalize", body.terminal_mode.as_str())
         }
-        Err((_, Json(err))) => {
-            crate::metrics::observe_terminal_mode("/v1/finalize", err.terminal_mode_hint.as_str())
-        }
+        Err(err) => crate::metrics::observe_terminal_mode(
+            "/v1/finalize",
+            err.error_response().terminal_mode_hint.as_str(),
+        ),
     }
 
     handler_result

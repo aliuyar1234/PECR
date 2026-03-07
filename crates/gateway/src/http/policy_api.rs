@@ -40,6 +40,16 @@ pub(super) struct PolicySimulateResponse {
     pub(super) narrowing: Option<serde_json::Value>,
 }
 
+struct PolicyRequestInput {
+    principal_id: String,
+    request_id: String,
+    action: String,
+    request_params: serde_json::Map<String, serde_json::Value>,
+    policy_snapshot_hash: Option<String>,
+    policy_bundle_hash: Option<String>,
+    as_of_time: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SafeAskCapabilitySpec {
     capability_id: &'static str,
@@ -258,14 +268,17 @@ fn safe_ask_catalog(capabilities: Vec<SafeAskCapability>) -> SafeAskCatalog {
 
 async fn evaluate_policy_request(
     state: &AppState,
-    principal_id: &str,
-    request_id: &str,
-    action: &str,
-    request_params: serde_json::Map<String, serde_json::Value>,
-    policy_snapshot_hash: Option<String>,
-    policy_bundle_hash: Option<String>,
-    as_of_time: Option<String>,
+    request: PolicyRequestInput,
 ) -> Result<PolicySimulateResponse, ApiError> {
+    let PolicyRequestInput {
+        principal_id,
+        request_id,
+        action,
+        request_params,
+        policy_snapshot_hash,
+        policy_bundle_hash,
+        as_of_time,
+    } = request;
     let params_value = serde_json::Value::Object(request_params.clone());
     let params_hash = canonical::hash_canonical_json(&params_value);
 
@@ -311,8 +324,8 @@ async fn evaluate_policy_request(
     }
 
     let cache_key = OpaCacheKey::policy_simulation(
-        principal_id,
-        action,
+        principal_id.as_str(),
+        action.as_str(),
         params_hash.as_str(),
         policy_snapshot_hash.as_deref(),
         policy_bundle_hash.as_deref(),
@@ -394,13 +407,15 @@ pub(super) async fn simulate_policy(
         Ok(Json(
             evaluate_policy_request(
                 &state,
-                principal_id.as_str(),
-                &request_id,
-                action,
-                request_params,
-                policy_snapshot_hash,
-                policy_bundle_hash,
-                as_of_time,
+                PolicyRequestInput {
+                    principal_id,
+                    request_id,
+                    action: action.to_string(),
+                    request_params,
+                    policy_snapshot_hash,
+                    policy_bundle_hash,
+                    as_of_time,
+                },
             )
             .await?,
         ))
@@ -409,7 +424,7 @@ pub(super) async fn simulate_policy(
 
     let status = match &result {
         Ok(_) => StatusCode::OK,
-        Err((status, _)) => *status,
+        Err(err) => err.status_code(),
     };
     crate::metrics::observe_http_request(
         "/v1/policies/simulate",
@@ -426,7 +441,7 @@ pub(super) async fn policy_capabilities(
     headers: HeaderMap,
 ) -> Result<Json<SafeAskCatalog>, ApiError> {
     let started = Instant::now();
-    let result = async move {
+    let result: Result<Json<SafeAskCatalog>, ApiError> = async move {
         let principal = extract_principal(&state, &headers).await?;
         let principal_id = principal.principal_id;
         let request_id = extract_request_id(&headers);
@@ -439,13 +454,15 @@ pub(super) async fn policy_capabilities(
             )]);
             let response = evaluate_policy_request(
                 &state,
-                principal_id.as_str(),
-                &request_id,
-                "narrow_query",
-                params,
-                None,
-                Some(state.config.policy_bundle_hash.clone()),
-                Some(state.config.as_of_time_default.clone()),
+                PolicyRequestInput {
+                    principal_id: principal_id.clone(),
+                    request_id: request_id.clone(),
+                    action: "narrow_query".to_string(),
+                    request_params: params,
+                    policy_snapshot_hash: None,
+                    policy_bundle_hash: Some(state.config.policy_bundle_hash.clone()),
+                    as_of_time: Some(state.config.as_of_time_default.clone()),
+                },
             )
             .await?;
 
@@ -463,7 +480,7 @@ pub(super) async fn policy_capabilities(
 
     let status = match &result {
         Ok(_) => StatusCode::OK,
-        Err((status, _)) => *status,
+        Err(err) => err.status_code(),
     };
     crate::metrics::observe_http_request(
         "/v1/policies/capabilities",

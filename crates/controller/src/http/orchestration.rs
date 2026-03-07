@@ -1417,7 +1417,7 @@ fn assess_expected_usefulness(
         }
     }
 
-    let contains = |name: &str| step_names.iter().any(|step_name| *step_name == name);
+    let contains = |name: &str| step_names.contains(&name);
     let contains_any = |names: &[&str]| names.iter().any(|name| contains(name));
 
     match request.planner_hints.intent {
@@ -1779,12 +1779,12 @@ async fn select_execution_plan(
                 },
                 "planner.client_disabled_rust_owned_execution"
             );
-            return SelectedExecutionPlan {
+            SelectedExecutionPlan {
                 steps: rust_steps,
                 planner_source: "rust_owned",
                 planner_summary: None,
                 planner_traces,
-            };
+            }
         }
         PlannerClientKind::Beam => {
             let client = BeamPlannerClient { state };
@@ -2220,6 +2220,65 @@ fn version_review_params_for_query(params: &serde_json::Value, query: &str) -> s
         .is_some_and(|value| value.trim() == "public/public_1.txt");
     if should_override && let Some(object_id) = version_review_object_id_for_query(query) {
         map.insert("object_id".to_string(), serde_json::json!(object_id));
+    }
+
+    rendered
+}
+
+fn evidence_lookup_terms_for_query(query: &str) -> Vec<String> {
+    let mut terms = semantic_query_tokens(query)
+        .into_iter()
+        .filter(|token| !is_generic_evidence_token(token) && !is_generic_version_token(token))
+        .collect::<Vec<_>>();
+
+    if !terms.is_empty() {
+        let raw_tokens = query_tokens(query);
+        for token in [
+            "policy",
+            "policies",
+            "term",
+            "terms",
+            "document",
+            "documents",
+        ] {
+            if raw_tokens.iter().any(|raw| raw == token) && !terms.iter().any(|term| term == token)
+            {
+                terms.push(token.to_string());
+            }
+        }
+    }
+
+    terms
+}
+
+fn evidence_lookup_params_for_query(params: &serde_json::Value, query: &str) -> serde_json::Value {
+    let mut rendered = params.clone();
+    let Some(map) = rendered.as_object_mut() else {
+        return rendered;
+    };
+
+    let terms = evidence_lookup_terms_for_query(query);
+    if terms.is_empty() {
+        return rendered;
+    }
+
+    map.insert(
+        "terms".to_string(),
+        serde_json::Value::Array(
+            terms
+                .iter()
+                .cloned()
+                .map(serde_json::Value::String)
+                .collect(),
+        ),
+    );
+    map.entry("match_mode".to_string())
+        .or_insert_with(|| serde_json::json!("all"));
+
+    if !map.contains_key("object_prefix")
+        && query_has_any_token(&terms, &["support", "billing", "refund", "policy", "terms"])
+    {
+        map.insert("object_prefix".to_string(), serde_json::json!("public/"));
     }
 
     rendered
@@ -3170,6 +3229,7 @@ fn render_plan_params(op_name: &str, params: &serde_json::Value, query: &str) ->
         "list_versions" | "diff" => version_review_params_for_query(&rendered, query),
         "fetch_rows" => fetch_rows_params_for_query(&rendered, query),
         "aggregate" | "compare" => aggregate_params_for_query(&rendered, query),
+        "lookup_evidence" => evidence_lookup_params_for_query(&rendered, query),
         _ => rendered,
     }
 }
@@ -4143,8 +4203,9 @@ pub(super) async fn run_context_loop_rlm(
 #[cfg(test)]
 mod tests {
     use super::{
-        clarification_prompt_for_query, extract_version_pair_from_list_versions_result,
-        render_policy_narrowing_guidance, version_review_object_id_for_query,
+        clarification_prompt_for_query, evidence_lookup_params_for_query,
+        extract_version_pair_from_list_versions_result, render_policy_narrowing_guidance,
+        version_review_object_id_for_query,
     };
 
     #[test]
@@ -4213,6 +4274,24 @@ mod tests {
             version_review_object_id_for_query("What changed in annual refund terms?"),
             Some("public/annual_refund_terms.txt")
         );
+    }
+
+    #[test]
+    fn evidence_lookup_query_uses_subject_terms_instead_of_full_sentence() {
+        let params = serde_json::json!({
+            "query": "{{query}}",
+            "limit": 3
+        });
+
+        let rendered = evidence_lookup_params_for_query(
+            &params,
+            "Show the source text and evidence for the support policy",
+        );
+
+        assert_eq!(rendered["query"], serde_json::json!("{{query}}"));
+        assert_eq!(rendered["terms"], serde_json::json!(["support", "policy"]));
+        assert_eq!(rendered["match_mode"], serde_json::json!("all"));
+        assert_eq!(rendered["object_prefix"], serde_json::json!("public/"));
     }
 
     #[test]

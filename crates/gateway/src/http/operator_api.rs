@@ -27,7 +27,7 @@ use super::runtime::{
 use super::session::{
     acquire_session_lock, load_session_runtime, persist_session_runtime, unix_epoch_ms_now,
 };
-use super::{ApiError, AppState, ErrorResponse, json_error, opa_error_response};
+use super::{ApiError, AppState, json_error, opa_error_response};
 use crate::opa::OpaCacheKey;
 use crate::operator_cache::OperatorCacheKey;
 
@@ -273,7 +273,7 @@ fn normalize_aggregate_params(
                 }))
             })
             .collect::<Result<Vec<_>, _>>()?;
-        normalized_metrics.sort_by(|left, right| left.to_string().cmp(&right.to_string()));
+        normalized_metrics.sort_by_key(|left| left.to_string());
         normalized_metrics.dedup();
         params.insert("metrics".to_string(), serde_json::json!(normalized_metrics));
     }
@@ -535,7 +535,9 @@ async fn lookup_evidence_from_fs_sources(
         .await
         {
             Ok(unit) => evidence.push(unit),
-            Err(err) if err.1.0.terminal_mode_hint == TerminalMode::SourceUnavailable => {
+            Err(err)
+                if err.error_response().terminal_mode_hint == TerminalMode::SourceUnavailable =>
+            {
                 last_source_error = Some(err);
             }
             Err(err) => return Err(err),
@@ -635,7 +637,6 @@ fn summarize_diff_result(evidence_units: &[EvidenceUnit]) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty());
     let patch_summary = patch
-        .as_deref()
         .and_then(summarize_diff_patch)
         .filter(|value| !value.is_empty());
 
@@ -866,7 +867,7 @@ fn summarize_object_content(map: &serde_json::Map<String, serde_json::Value>) ->
         let row_summaries = rows
             .iter()
             .filter_map(|row| row.as_object())
-            .map(|row| {
+            .filter_map(|row| {
                 let group = row
                     .get("group")
                     .and_then(|value| value.as_object())
@@ -907,7 +908,6 @@ fn summarize_object_content(map: &serde_json::Map<String, serde_json::Value>) ->
                     (None, None) => None,
                 }
             })
-            .flatten()
             .take(2)
             .collect::<Vec<_>>();
         if !row_summaries.is_empty() {
@@ -976,7 +976,7 @@ pub(super) async fn call_operator(
     Path(op_name): Path<String>,
     headers: HeaderMap,
     req: Result<Json<OperatorCallRequest>, JsonRejection>,
-) -> Result<Json<OperatorCallResponse>, (StatusCode, Json<ErrorResponse>)> {
+) -> Result<Json<OperatorCallResponse>, ApiError> {
     let request_started = Instant::now();
     let op_name_for_metrics = op_name.clone();
 
@@ -2454,7 +2454,7 @@ pub(super) async fn call_operator(
 
     let status = match &handler_result {
         Ok(_) => StatusCode::OK,
-        Err((status, _)) => *status,
+        Err(err) => err.status_code(),
     };
     crate::metrics::observe_http_request(
         "/v1/operators",
@@ -2473,9 +2473,10 @@ pub(super) async fn call_operator(
         Ok(Json(body)) => {
             crate::metrics::observe_terminal_mode("/v1/operators", body.terminal_mode.as_str());
         }
-        Err((_, Json(err))) => {
-            crate::metrics::observe_terminal_mode("/v1/operators", err.terminal_mode_hint.as_str())
-        }
+        Err(err) => crate::metrics::observe_terminal_mode(
+            "/v1/operators",
+            err.error_response().terminal_mode_hint.as_str(),
+        ),
     }
 
     handler_result
@@ -2561,8 +2562,8 @@ mod tests {
 
         let err =
             normalize_operator_params("search", &params, 8).expect_err("invalid mode must fail");
-        assert_eq!(err.0, StatusCode::BAD_REQUEST);
-        assert!(err.1.0.message.contains("match_mode"));
+        assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+        assert!(err.error_response().message.contains("match_mode"));
     }
 
     #[test]

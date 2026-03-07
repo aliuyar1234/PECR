@@ -93,6 +93,7 @@ pub(super) fn apply_gateway_auth(
     }
 }
 
+#[allow(clippy::result_large_err)]
 fn validate_local_auth_shared_secret(
     headers: &HeaderMap,
     expected_secret: Option<&str>,
@@ -129,6 +130,7 @@ fn validate_local_auth_shared_secret(
     Ok(())
 }
 
+#[allow(clippy::result_large_err)]
 fn extract_principal_id(headers: &HeaderMap) -> Result<String, (StatusCode, Json<ErrorResponse>)> {
     let principal_id = headers
         .get("x-pecr-principal-id")

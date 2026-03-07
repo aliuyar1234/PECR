@@ -258,9 +258,8 @@ fn finalize_gate_rejects_unknown_evidence_unit_ids() {
     );
 
     let err = finalize_gate(&session, claim_map, 0.95).unwrap_err();
-    let (status, Json(body)) = err;
-    assert_eq!(status, StatusCode::BAD_REQUEST);
-    assert_eq!(body.code, "ERR_INVALID_PARAMS");
+    assert_eq!(err.status_code(), StatusCode::BAD_REQUEST);
+    assert_eq!(err.error_response().code, "ERR_INVALID_PARAMS");
 }
 
 #[test]

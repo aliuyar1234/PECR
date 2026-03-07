@@ -973,7 +973,7 @@ fn summarize_text_for_query(text: &str, query: &str) -> Option<String> {
     }
 
     let mut candidates = text
-        .split(|c: char| matches!(c, '\n' | '.' | '!' | '?'))
+        .split(['\n', '.', '!', '?'])
         .map(normalize_claim_text)
         .filter(|candidate| !candidate.is_empty())
         .collect::<Vec<_>>();
