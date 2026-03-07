@@ -721,10 +721,15 @@ fn parse_controller_engine(
     value: Option<&String>,
     rlm_default_enabled: bool,
 ) -> Result<ControllerEngine, StartupError> {
-    let engine = value
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-        .unwrap_or(if rlm_default_enabled { "rlm" } else { "baseline" });
+    let engine =
+        value
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .unwrap_or(if rlm_default_enabled {
+                "rlm"
+            } else {
+                "baseline"
+            });
 
     match engine {
         "baseline" => Ok(ControllerEngine::Baseline),
@@ -1124,10 +1129,7 @@ mod tests {
             "PECR_RLM_AUTO_FALLBACK_TO_BASELINE".to_string(),
             "0".to_string(),
         );
-        env.insert(
-            "PECR_BASELINE_SHADOW_PERCENT".to_string(),
-            "25".to_string(),
-        );
+        env.insert("PECR_BASELINE_SHADOW_PERCENT".to_string(), "25".to_string());
         env.insert(
             "PECR_CONTROLLER_ADAPTIVE_PARALLELISM_ENABLED".to_string(),
             "0".to_string(),

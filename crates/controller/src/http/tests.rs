@@ -2771,8 +2771,10 @@ sys.stdout.flush()
         replay
             .planner_traces
             .iter()
-            .any(|trace| trace.decision_summary.planner_source == "rust_owned"
-                && trace.decision_summary.selected_for_execution),
+            .any(
+                |trace| trace.decision_summary.planner_source == "rust_owned"
+                    && trace.decision_summary.selected_for_execution
+            ),
         "the runtime baseline fallback should be visible in planner traces"
     );
 }
@@ -2911,20 +2913,34 @@ sys.stdout.flush()
     let _ = fs::remove_file(&script_path);
 
     assert_eq!(response.0.terminal_mode, TerminalMode::Supported);
-    assert_eq!(engine_modes, BTreeSet::from([EngineMode::Baseline, EngineMode::Rlm]));
+    assert_eq!(
+        engine_modes,
+        BTreeSet::from([EngineMode::Baseline, EngineMode::Rlm])
+    );
     assert!(
-        evaluation.0.scorecards.iter().any(|row| row.engine_mode == EngineMode::Baseline),
+        evaluation
+            .0
+            .scorecards
+            .iter()
+            .any(|row| row.engine_mode == EngineMode::Baseline),
         "baseline shadow runs should surface in replay scorecards"
     );
     assert!(
-        evaluation.0.scorecards.iter().any(|row| row.engine_mode == EngineMode::Rlm),
+        evaluation
+            .0
+            .scorecards
+            .iter()
+            .any(|row| row.engine_mode == EngineMode::Rlm),
         "primary RLM runs should remain visible in replay scorecards"
     );
     assert!(
         evaluation.0.engine_comparisons.iter().any(|comparison| {
             comparison.paired_query_count == 1
                 && matches!(
-                    (comparison.primary_engine_mode, comparison.secondary_engine_mode),
+                    (
+                        comparison.primary_engine_mode,
+                        comparison.secondary_engine_mode
+                    ),
                     (EngineMode::Baseline, EngineMode::Rlm)
                         | (EngineMode::Rlm, EngineMode::Baseline)
                 )

@@ -30,11 +30,11 @@ use self::diagnostics::{healthz, metrics, readyz};
 #[cfg(test)]
 use self::finalize::build_claim_map;
 use self::finalize::build_finalize_output;
+#[cfg(feature = "rlm")]
+use self::orchestration::is_rlm_bridge_failure_stop_reason;
 use self::orchestration::{
     ContextLoopResult, GatewayCallContext, run_context_loop, run_context_loop_rlm,
 };
-#[cfg(feature = "rlm")]
-use self::orchestration::is_rlm_bridge_failure_stop_reason;
 use self::replay_api::{
     get_evaluation, get_replay, get_scorecards, list_replays, submit_evaluation,
 };
@@ -293,7 +293,8 @@ async fn run(
                         principal_id = %principal_id,
                         "controller.rlm_runtime_fallback_to_baseline"
                     );
-                    let mut baseline_result = run_context_loop(&state, ctx, &query, &budget).await?;
+                    let mut baseline_result =
+                        run_context_loop(&state, ctx, &query, &budget).await?;
                     let mut planner_traces = rlm_result.planner_traces.clone();
                     planner_traces.extend(baseline_result.planner_traces);
                     baseline_result.planner_traces = planner_traces;
@@ -590,11 +591,7 @@ fn should_capture_baseline_shadow(state: &AppState, request_id: &str, trace_id: 
     if state.config.controller_engine != ControllerEngine::Rlm {
         return false;
     }
-    shadow_sample_selected(
-        state.config.baseline_shadow_percent,
-        request_id,
-        trace_id,
-    )
+    shadow_sample_selected(state.config.baseline_shadow_percent, request_id, trace_id)
 }
 
 fn shadow_sample_selected(percent: u8, request_id: &str, trace_id: &str) -> bool {
