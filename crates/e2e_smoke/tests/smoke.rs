@@ -3405,6 +3405,14 @@ async fn useful_beam_planner_real_stack_falls_back_cleanly_when_planner_is_unava
         "beam planner unavailability should still produce a supported answer: {}",
         body
     );
+    let trace_id = body
+        .get("trace_id")
+        .and_then(|value| value.as_str())
+        .expect("trace_id should exist")
+        .to_string();
+    let _replay_list_body =
+        wait_for_replay_list_contains_traces(&client, stack.controller_addr, "dev", &[trace_id])
+            .await;
 
     let evaluation = client
         .post(format!("http://{}/v1/evaluations", stack.controller_addr))
