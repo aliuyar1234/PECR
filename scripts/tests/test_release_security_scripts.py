@@ -43,6 +43,23 @@ class ReleaseSmokeCheckParserTests(unittest.TestCase):
                 ],
             )
 
+    def test_parse_tarball_filenames_normalizes_relative_prefixes(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            checksums = Path(tmp_dir) / "SHA256SUMS.txt"
+            checksums.write_text(
+                "abc123  ./pecr-gateway_v1.2_linux_amd64.tar.gz\n"
+                "def456 *./pecr-controller_v1.2_linux_amd64.tar.gz\n",
+                encoding="utf-8",
+            )
+            names = self.mod.parse_tarball_filenames(checksums)
+            self.assertEqual(
+                names,
+                [
+                    "pecr-gateway_v1.2_linux_amd64.tar.gz",
+                    "pecr-controller_v1.2_linux_amd64.tar.gz",
+                ],
+            )
+
     def test_parse_tarball_filenames_rejects_invalid_line(self):
         with tempfile.TemporaryDirectory() as tmp_dir:
             checksums = Path(tmp_dir) / "SHA256SUMS.txt"
@@ -77,6 +94,28 @@ class ReleaseSmokeCheckParserTests(unittest.TestCase):
             )
             with self.assertRaises(ValueError):
                 self.mod.parse_image_refs(manifest)
+
+    def test_verify_release_assets_normalizes_expected_and_remote_names(self):
+        original = self.mod.fetch_release_assets
+        try:
+            self.mod.fetch_release_assets = lambda repo, tag: {
+                "pecr-controller_1.2_linux_amd64.tar.gz",
+                "pecr-gateway_1.2_linux_amd64.tar.gz",
+                "SHA256SUMS.txt",
+                "image-digests.txt",
+            }
+            self.mod.verify_release_assets(
+                "aliuyar1234/PECR",
+                "v1.2",
+                [
+                    "./pecr-controller_1.2_linux_amd64.tar.gz",
+                    "./pecr-gateway_1.2_linux_amd64.tar.gz",
+                    "SHA256SUMS.txt",
+                    "image-digests.txt",
+                ],
+            )
+        finally:
+            self.mod.fetch_release_assets = original
 
 
 class VerifyReleaseAttestationsParserTests(unittest.TestCase):

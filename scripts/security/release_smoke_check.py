@@ -62,7 +62,7 @@ def parse_tarball_filenames(checksums_path: Path) -> list[str]:
         filename = parts[1].strip()
         if filename.startswith("*"):
             filename = filename[1:]
-        names.append(filename)
+        names.append(Path(filename).name)
     if not names:
         raise ValueError(f"No tarball entries found in {checksums_path}")
     return names
@@ -104,12 +104,13 @@ def fetch_release_assets(repo: str, tag: str) -> set[str]:
     )
     payload = json.loads(completed.stdout)
     assets = payload.get("assets", [])
-    return {str(asset.get("name", "")) for asset in assets if asset.get("name")}
+    return {Path(str(asset.get("name", ""))).name for asset in assets if asset.get("name")}
 
 
 def verify_release_assets(repo: str, tag: str, expected_assets: list[str]) -> None:
     asset_names = fetch_release_assets(repo, tag)
-    missing = [name for name in expected_assets if name not in asset_names]
+    normalized_expected_assets = [Path(name).name for name in expected_assets]
+    missing = [name for name in normalized_expected_assets if name not in asset_names]
     if missing:
         raise RuntimeError(
             "Release asset check failed; missing assets: " + ", ".join(missing)
