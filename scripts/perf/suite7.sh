@@ -28,6 +28,7 @@ SUITE7_BASELINE_REPEATS="${SUITE7_BASELINE_REPEATS:-1}"
 SUITE7_SKIP_USEFUL_SCENARIOS="${SUITE7_SKIP_USEFUL_SCENARIOS:-0}"
 SUITE7_USEFUL_CONTROLLER_QUERY="${SUITE7_USEFUL_CONTROLLER_QUERY:-What is the customer status and plan tier?}"
 USER_CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE="${CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE-__UNSET__}"
+USER_USEFUL_CONTROLLER_EXPECT_TERMINAL_MODE="${USEFUL_CONTROLLER_EXPECT_TERMINAL_MODE-__UNSET__}"
 USER_RLM_BASELINE_EXPECT_TERMINAL_MODE="${RLM_BASELINE_EXPECT_TERMINAL_MODE-__UNSET__}"
 USER_GATEWAY_BASELINE_EXPECT_TERMINAL_MODE="${GATEWAY_BASELINE_EXPECT_TERMINAL_MODE-__UNSET__}"
 USER_SUITE7_ENFORCE_GATEWAY_FETCH_ROWS="${SUITE7_ENFORCE_GATEWAY_FETCH_ROWS-__UNSET__}"
@@ -167,6 +168,9 @@ if not isinstance(gateway_section, dict):
 
 values = {
     "CFG_CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE": read_expected("controller_baseline", ""),
+    "CFG_USEFUL_CONTROLLER_EXPECT_TERMINAL_MODE": read_expected(
+        "useful_controller_baseline", read_expected("controller_baseline", "")
+    ),
     "CFG_GATEWAY_BASELINE_EXPECT_TERMINAL_MODE": read_expected(
         "gateway_fetch_rows_baseline", "SUPPORTED"
     ),
@@ -199,6 +203,11 @@ apply_suite7_expectations() {
   CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE="${CFG_CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE}"
   if [[ "${USER_CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE}" != "__UNSET__" ]]; then
     CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE="${USER_CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE}"
+  fi
+
+  USEFUL_CONTROLLER_EXPECT_TERMINAL_MODE="${CFG_USEFUL_CONTROLLER_EXPECT_TERMINAL_MODE}"
+  if [[ "${USER_USEFUL_CONTROLLER_EXPECT_TERMINAL_MODE}" != "__UNSET__" ]]; then
+    USEFUL_CONTROLLER_EXPECT_TERMINAL_MODE="${USER_USEFUL_CONTROLLER_EXPECT_TERMINAL_MODE}"
   fi
 
   RLM_BASELINE_EXPECT_TERMINAL_MODE="${CFG_CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE}"
@@ -295,6 +304,11 @@ validate_suite7_runtime_args() {
   fi
   if [[ -z "${controller_expected}" ]]; then
     echo "controller baseline expected terminal mode must be configured when assertions are enabled" >&2
+    return 1
+  fi
+
+  if [[ "${SUITE7_SKIP_USEFUL_SCENARIOS}" != "1" && -z "${USEFUL_CONTROLLER_EXPECT_TERMINAL_MODE}" ]]; then
+    echo "useful controller expected terminal mode must be configured when useful scenarios are enabled" >&2
     return 1
   fi
 
@@ -531,7 +545,7 @@ run_k6_gateway_fetch_rows_checked \
 if [[ "${SUITE7_SKIP_USEFUL_SCENARIOS}" == "1" ]]; then
   echo "[suite7] useful controller probes skipped (SUITE7_SKIP_USEFUL_SCENARIOS=1)"
 else
-  useful_expected_mode="$(effective_expected_mode "${CONTROLLER_BASELINE_EXPECT_TERMINAL_MODE}")"
+  useful_expected_mode="$(effective_expected_mode "${USEFUL_CONTROLLER_EXPECT_TERMINAL_MODE}")"
   echo "[suite7] useful controller baseline query=${SUITE7_USEFUL_CONTROLLER_QUERY@Q}"
   run_k6_controller \
     "suite7_useful_baseline" \

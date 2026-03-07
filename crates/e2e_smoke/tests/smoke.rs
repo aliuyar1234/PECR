@@ -218,7 +218,7 @@ async fn smoke_controller_creates_session_calls_operator_and_finalizes() {
 
     assert_eq!(
         body.get("terminal_mode").and_then(|v| v.as_str()),
-        Some("INSUFFICIENT_EVIDENCE")
+        Some("SUPPORTED")
     );
     let trace_id = body
         .get("trace_id")
@@ -1118,7 +1118,7 @@ async fn injection_suite_context_as_malware_tool_steering() {
         "fetch_span",
         serde_json::json!({ "object_id": "../restricted/restricted_1.txt" }),
         StatusCode::BAD_REQUEST,
-        "object_id must be a relative path without parent components",
+        "invalid params.object_id: resource_id must not contain parent traversal segments",
     )
     .await;
 
