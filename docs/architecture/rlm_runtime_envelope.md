@@ -90,6 +90,7 @@ The first supported backend envelope should behave differently by environment:
 ### Local real-backend RLM integration
 
 - explicit opt-in
+- Phase 6 decision: keep this path opt-in locally instead of introducing a second default compose profile
 - controller built with `--features rlm`
 - `PECR_CONTROLLER_ENGINE=rlm` or `PECR_RLM_DEFAULT_ENABLED=1`
 - `PECR_RLM_SANDBOX_ACK=1`
@@ -105,7 +106,8 @@ The first supported backend envelope should behave differently by environment:
   - `.github/workflows/rlm-real-backend-smoke.yml`
   - `.github/workflows/rlm-real-backend-usefulness.yml`
 - the usefulness lane should keep replay artifacts and run with baseline auto-fallback disabled so it proves the real backend path directly
-- once the real backend lane is promoted beyond manual use, it should move into a dedicated integration or nightly path first
+- the promotion gate should require 3 consecutive successful usefulness runs on `master` for the same head SHA plus a passing `.github/workflows/rlm-real-backend-pre-release.yml` run
+- once that gate is satisfied, the real backend lane can move into a dedicated integration or pre-release path first
 - promotion to blocking CI should happen only after bridge stability, perf stability, and finalize correctness are proven
 
 ### Pre-release and production
@@ -113,6 +115,7 @@ The first supported backend envelope should behave differently by environment:
 - RLM bridge/backend health must be observable
 - rollout must support shadowing and auto-fallback
 - baseline should remain available as an intentional rollback/reference lane
+- operator guidance for rate limits, credential expiry, backend timeouts, and provider drift lives in `docs/observability/rlm_real_backend_operations.md`
 
 ## Explicit Non-Goals For The First Backend
 

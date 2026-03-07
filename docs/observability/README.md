@@ -12,6 +12,10 @@ This directory contains versioned observability artifacts for PECR runtime SLOs.
 - `alerts/pecr_slo_alerts.yaml`
   - Prometheus alert rules for P1/P2 conditions from `docs/standards/OBSERVABILITY_STACK_TARGET.md`, including rollout-era bridge and terminal-mode drift signals.
 
+## Real-Backend Ops
+- `rlm_real_backend_operations.md`
+  - Real-backend bridge operations, promotion-gate expectations, and incident-response signals for rate limits, credential expiry, timeouts, and provider drift.
+
 ## Operational Flow
 1. Import dashboards into Grafana (or track as Jsonnet/Tanka in downstream infra repos).
 2. Load alert rules into Prometheus/Alertmanager.

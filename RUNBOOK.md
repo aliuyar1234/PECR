@@ -73,6 +73,23 @@ CI also enforces RLM verification via `scripts/rlm/verify_vendor_rlm.py` inside 
   - Commit: `c723d8d234bf0d9eeda5766d2c08ac95c89657a7`
   - Runs: `22804181871`, `22804184647`, `22804185384`, `22804186066`, `22804186829`, `22804187671`, `22804188428`, `22804189241`, `22804190277`, `22804191241`
 
+## Real-backend promotion gate (Phase 6)
+
+- Required before broader release automation:
+  - 3 consecutive successful `rlm-real-backend-usefulness` runs on `master`
+  - all 3 runs must be on the same head SHA
+  - those runs must keep `PECR_RLM_AUTO_FALLBACK_TO_BASELINE=0`
+  - a fresh `rlm-real-backend-pre-release` run must pass on the same head SHA
+- Collect the recent runs:
+  - `gh run list -R <owner/repo> -w rlm-real-backend-usefulness --branch master --limit 12 --json databaseId,conclusion,createdAt,event,headBranch,headSha,status,updatedAt,url,workflowName > recent_real_backend_runs.json`
+- Validate the streak:
+  - `python3 -B scripts/ops/check_real_backend_promotion_gate.py --runs-json recent_real_backend_runs.json --workflow-name rlm-real-backend-usefulness --branch master --head-sha <sha> --required-successes 3 --require-ready`
+- Pre-release workflow:
+  - `.github/workflows/rlm-real-backend-pre-release.yml`
+- If the gate fails:
+  - do not promote the real backend into broader automation
+  - inspect replay artifacts and the real-backend usefulness reports before rerunning
+
 ## Service endpoints (docker compose)
 
 - Gateway: `http://127.0.0.1:8080` (`/healthz`, `/readyz`, `/metrics`)
@@ -112,6 +129,7 @@ The honest local story right now is:
 - default local product demo: `rlm` plus mock/runtime fixtures, with baseline auto-fallback available
 - opt-in real-backend RLM experimentation: bridge-backed `openai` mode with explicit model credentials
 - no default compose dependency on external model credentials
+- Phase 6 decision: keep the real-backend path opt-in locally rather than adding a second default compose profile
 
 Initial opt-in envs for the real bridge seam:
 
@@ -141,6 +159,13 @@ Manual real-backend usefulness lane:
 - writes replay-backed artifacts to `target/rlm-real-backend-usefulness-replay` during the run and uploads a usefulness JSON/Markdown report
 - configure repo variable `PECR_RLM_OPENAI_MODEL_NAME`
 - configure secret `OPENAI_API_KEY`
+
+Manual real-backend pre-release lane:
+
+- `.github/workflows/rlm-real-backend-pre-release.yml`
+- validates the last 3 matching usefulness runs on `master` with `scripts/ops/check_real_backend_promotion_gate.py`
+- reruns bridge smoke plus the real-backend usefulness comparison on the current head SHA
+- uploads a gate report plus the pre-release usefulness JSON/Markdown artifacts
 
 ## Replay/Eval developer commands
 
@@ -287,6 +312,7 @@ RLM bridge/protocol failures (`ERR_RLM_BRIDGE_*`):
 Real backend rollout note:
 
 - if the failure occurred on a future real-backend lane, first confirm whether the issue is bridge protocol, backend credentials, backend latency, or finalize downgrade drift
+- use `docs/observability/rlm_real_backend_operations.md` as the phase-6 incident guide for rate limits, credential expiry, backend timeouts, and provider drift
 - do not paper over backend instability by weakening finalize or hiding bridge failures
 
 ## Module ownership and coupling checklist

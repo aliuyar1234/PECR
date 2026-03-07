@@ -287,6 +287,12 @@ The migration in `RLM_FIRST_MIGRATION_PLAN.md` is about proving that default ope
 The first supported real backend envelope is documented in `docs/architecture/rlm_runtime_envelope.md`.
 Important current truth: the controller still rejects `PECR_MODEL_PROVIDER=external`, so the real RLM backend must land through the bridge/runtime path first rather than through the current Rust model-provider switch. Local compose defaults to the `mock` bridge backend; the initial `openai` seam is real but still opt-in.
 
+Phase 6 local-development decision:
+
+- keep the real backend explicit and opt-in for now
+- do not add a second default compose profile yet
+- when you want the live bridge backend locally, set `PECR_RLM_BACKEND=openai`, `PECR_RLM_MODEL_NAME`, and `OPENAI_API_KEY` or `PECR_RLM_API_KEY` before running `docker compose up`
+
 Enable RLM mode:
 
 - Build `pecr-controller` with feature `rlm`
@@ -328,6 +334,10 @@ Manual Actions lane:
 - `.github/workflows/rlm-real-backend-smoke.yml`
 - configure repo variable `PECR_RLM_OPENAI_MODEL_NAME`
 - configure secret `OPENAI_API_KEY`
+
+Pre-release gate and workflow:
+- `python3 -B scripts/ops/check_real_backend_promotion_gate.py`
+- `.github/workflows/rlm-real-backend-pre-release.yml`
 
 Vendored upstream sync:
 

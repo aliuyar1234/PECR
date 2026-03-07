@@ -81,3 +81,14 @@ groups:
         annotations:
           summary: "SOURCE_UNAVAILABLE terminal mode drift detected"
           description: "SOURCE_UNAVAILABLE terminal mode ratio > 5% for 10m."
+
+      - alert: PECRRlmBridgeFailureStopReasonSpike
+        expr: (sum(rate(pecr_controller_budget_stop_reasons_total{reason=~"bridge_backend_unavailable|bridge_backend_runtime_error|bridge_protocol_version_unsupported|bridge_invalid_json|bridge_invalid_message|bridge_unknown_message|bridge_eof|bridge_read_error"}[5m])) / clamp_min(sum(rate(pecr_controller_terminal_modes_total{route="/v1/run"}[5m])), 0.0001)) > 0.02
+        for: 10m
+        labels:
+          severity: P1
+          owner: controller
+          domain: runtime
+        annotations:
+          summary: "RLM bridge failure stop reasons are elevated"
+          description: "Bridge or protocol stop reasons exceed 2% of /v1/run outcomes for 10m."

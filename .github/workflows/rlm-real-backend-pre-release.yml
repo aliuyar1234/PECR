@@ -1,0 +1,141 @@
+name: rlm-real-backend-pre-release
+
+on:
+  workflow_dispatch:
+    inputs:
+      required_successes:
+        description: "Required consecutive successful usefulness runs before pre-release proceeds."
+        required: true
+        default: "3"
+        type: string
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  rlm_real_backend_pre_release:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: pecr
+          POSTGRES_PASSWORD: pecr
+          POSTGRES_DB: pecr
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U pecr -d pecr"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check RLM real-backend config
+        shell: bash
+        env:
+          PECR_RLM_MODEL_NAME: ${{ vars.PECR_RLM_OPENAI_MODEL_NAME }}
+          PECR_RLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [[ -z "${PECR_RLM_MODEL_NAME}" || -z "${PECR_RLM_API_KEY}" ]]; then
+            echo "Missing repo variable PECR_RLM_OPENAI_MODEL_NAME or secret OPENAI_API_KEY." | tee artifacts/rlm_real_backend_pre_release.log
+            exit 1
+          fi
+
+      - name: Capture recent real-backend usefulness runs
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          gh run list \
+            --repo "${GITHUB_REPOSITORY}" \
+            --workflow "rlm-real-backend-usefulness" \
+            --branch master \
+            --limit 12 \
+            --json databaseId,conclusion,createdAt,event,headBranch,headSha,status,updatedAt,url,workflowName \
+            > artifacts/rlm_real_backend_recent_runs.json
+
+      - name: Validate promotion gate
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/ops/check_real_backend_promotion_gate.py \
+            --runs-json artifacts/rlm_real_backend_recent_runs.json \
+            --workflow-name rlm-real-backend-usefulness \
+            --branch master \
+            --head-sha "${GITHUB_SHA}" \
+            --required-successes "${{ inputs.required_successes }}" \
+            --require-ready \
+            --output-json artifacts/rlm_real_backend_promotion_gate.json \
+            --output-md artifacts/rlm_real_backend_promotion_gate.md
+
+      - name: Set up Rust toolchain
+        uses: dtolnay/rust-toolchain@631a55b12751854ce901bb631d5902ceb48146f7 # stable
+        with:
+          toolchain: 1.91.1
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Install vendored RLM Python dependencies
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e ./vendor/rlm
+
+      - name: Run real backend bridge smoke
+        shell: bash
+        env:
+          PECR_RLM_BACKEND: openai
+          PECR_RLM_MODEL_NAME: ${{ vars.PECR_RLM_OPENAI_MODEL_NAME }}
+          PECR_RLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PECR_RLM_BASE_URL: ${{ vars.PECR_RLM_BASE_URL }}
+          PECR_RLM_MAX_ITERATIONS: "4"
+        run: |
+          set -euo pipefail
+          python3 -B scripts/rlm/openai_bridge_smoke.py 2>&1 | tee -a artifacts/rlm_real_backend_pre_release.log
+
+      - name: Run pre-release real-backend usefulness comparison
+        shell: bash
+        env:
+          PECR_TEST_DB_URL: postgres://pecr:pecr@localhost:5432/pecr
+          PECR_E2E_REQUIRE_DB_URL: "1"
+          PECR_E2E_REPLAY_STORE_DIR: target/rlm-real-backend-pre-release-replay
+          PECR_E2E_PRESERVE_REPLAY_STORE: "1"
+          PECR_RLM_SANDBOX_ACK: "1"
+          PECR_RLM_AUTO_FALLBACK_TO_BASELINE: "0"
+          PECR_BASELINE_SHADOW_PERCENT: "0"
+          PECR_RLM_BACKEND: openai
+          PECR_RLM_MODEL_NAME: ${{ vars.PECR_RLM_OPENAI_MODEL_NAME }}
+          PECR_RLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PECR_RLM_BASE_URL: ${{ vars.PECR_RLM_BASE_URL }}
+          PECR_RLM_MAX_ITERATIONS: "4"
+        run: |
+          set -euo pipefail
+          rm -rf target/rlm-real-backend-pre-release-replay
+          mkdir -p target/rlm-real-backend-pre-release-replay
+          cargo test -p e2e_smoke --features pecr-controller/rlm useful_rlm_real_stack_matches_or_beats_baseline_named_queries -- --nocapture 2>&1 | tee -a artifacts/rlm_real_backend_pre_release.log
+
+      - name: Generate pre-release usefulness report
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -B scripts/replay/nightly_usefulness_report.py \
+            --store target/rlm-real-backend-pre-release-replay \
+            --evaluation-name "rlm-real-backend-pre-release" \
+            --output-json artifacts/rlm_real_backend_pre_release.json \
+            --output-md artifacts/rlm_real_backend_pre_release.md
+
+      - name: Upload pre-release artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rlm-real-backend-pre-release
+          path: artifacts
+          if-no-files-found: error

@@ -81,8 +81,9 @@ services:
       PECR_LOCAL_AUTH_SHARED_SECRET: "${PECR_LOCAL_AUTH_SHARED_SECRET:-pecr-local-demo-secret}"
       PECR_GATEWAY_URL: http://gateway:8080
       # Local compose now defaults into the RLM-first controller path.
-      # Use PECR_RLM_BACKEND=openai plus model credentials when you want the live bridge backend;
-      # otherwise the bridge stays on the mock backend for zero-setup demos.
+      # Phase 6 decision: keep the live real-backend path explicit instead of adding a second
+      # compose profile. Use PECR_RLM_BACKEND=openai plus model credentials when you intentionally
+      # want the live bridge backend; otherwise the bridge stays on the mock backend for zero-setup demos.
       PECR_MODEL_PROVIDER: mock
       PECR_CONTROLLER_ENGINE: "${PECR_CONTROLLER_ENGINE:-}"
       PECR_RLM_DEFAULT_ENABLED: "${PECR_RLM_DEFAULT_ENABLED:-1}"
