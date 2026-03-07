@@ -11,7 +11,7 @@ use tracing::Instrument;
 
 use crate::config::{AuthMode, ControllerConfig, ControllerEngine, StartupError};
 use crate::rate_limit::RateLimiter;
-use crate::replay::{PersistedRun, ReplayStore};
+use crate::replay::{PersistedRun, ReplayPersistQueue, ReplayStore};
 
 mod auth;
 mod budget;
@@ -43,6 +43,7 @@ pub struct AppState {
     oidc: Option<OidcAuthenticator>,
     rate_limiter: RateLimiter,
     replay_store: ReplayStore,
+    replay_persist_queue: ReplayPersistQueue,
 }
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
@@ -78,12 +79,18 @@ pub async fn router(config: ControllerConfig) -> Result<Router, StartupError> {
         code: "ERR_REPLAY_STORE_INIT",
         message: format!("failed to initialize replay store: {}", err),
     })?;
+    let replay_persist_queue =
+        ReplayPersistQueue::new(replay_store.clone()).map_err(|err| StartupError {
+            code: "ERR_REPLAY_STORE_INIT",
+            message: format!("failed to initialize replay persistence queue: {}", err),
+        })?;
     let state = AppState {
         config,
         http: reqwest::Client::new(),
         oidc,
         rate_limiter,
         replay_store,
+        replay_persist_queue,
     };
 
     Ok(Router::new()
@@ -348,25 +355,18 @@ async fn run(
             evidence_unit_ids,
             planner_traces,
         };
-        let replay_state = state.clone();
         let replay_request_id = request_id.clone();
         let replay_trace_id = run_response.trace_id.clone();
         let replay_principal_id = principal_id.clone();
-        tokio::spawn(async move {
-            if let Err(err) = run_replay_store_io(&replay_state, move |replay_store| {
-                replay_store.persist_run(persisted_run)
-            })
-            .await
-            {
-                tracing::warn!(
-                    request_id = %replay_request_id,
-                    trace_id = %replay_trace_id,
-                    principal_id = %replay_principal_id,
-                    error = %err,
-                    "controller.replay_persist_failed"
-                );
-            }
-        });
+        if let Err(err) = state.replay_persist_queue.enqueue(persisted_run) {
+            tracing::warn!(
+                request_id = %replay_request_id,
+                trace_id = %replay_trace_id,
+                principal_id = %replay_principal_id,
+                error = %err,
+                "controller.replay_persist_failed"
+            );
+        }
 
         Ok(Json(run_response))
     }

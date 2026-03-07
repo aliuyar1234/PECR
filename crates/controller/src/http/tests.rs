@@ -1776,6 +1776,10 @@ fn controller_state(
 ) -> AppState {
     let replay_store_dir =
         std::env::temp_dir().join(format!("pecr-controller-http-tests-{}", Ulid::new()));
+    let replay_store =
+        ReplayStore::new(replay_store_dir.clone(), 30).expect("replay store should initialize");
+    let replay_persist_queue = crate::replay::ReplayPersistQueue::new(replay_store.clone())
+        .expect("replay persist queue should initialize");
     AppState {
         config: ControllerConfig {
             bind_addr: "127.0.0.1:0".parse().expect("bind addr must parse"),
@@ -1804,8 +1808,8 @@ fn controller_state(
         http: reqwest::Client::new(),
         oidc: None,
         rate_limiter: RateLimiter::new(Duration::from_secs(60), 1024),
-        replay_store: ReplayStore::new(replay_store_dir, 30)
-            .expect("replay store should initialize"),
+        replay_store,
+        replay_persist_queue,
     }
 }
 

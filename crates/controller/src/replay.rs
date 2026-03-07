@@ -4,6 +4,8 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, SystemTime};
 
 use pecr_contracts::canonical;
@@ -48,6 +50,45 @@ pub struct ReplayStore {
     root_dir: PathBuf,
     retention_days: u64,
     last_cleanup_unix_ms: Arc<AtomicU64>,
+}
+
+#[derive(Clone)]
+pub struct ReplayPersistQueue {
+    sender: mpsc::Sender<PersistedRun>,
+}
+
+impl ReplayPersistQueue {
+    pub fn new(replay_store: ReplayStore) -> io::Result<Self> {
+        let (sender, receiver) = mpsc::channel::<PersistedRun>();
+        thread::Builder::new()
+            .name("pecr-replay-persist".to_string())
+            .spawn(move || {
+                while let Ok(run) = receiver.recv() {
+                    let request_id = run.request_id.clone();
+                    let trace_id = run.trace_id.clone();
+                    let principal_id = run.principal_id.clone();
+                    if let Err(err) = replay_store.persist_run(run) {
+                        tracing::warn!(
+                            request_id = %request_id,
+                            trace_id = %trace_id,
+                            principal_id = %principal_id,
+                            error = %err,
+                            "controller.replay_persist_failed"
+                        );
+                    }
+                }
+            })?;
+        Ok(Self { sender })
+    }
+
+    pub fn enqueue(&self, run: PersistedRun) -> io::Result<()> {
+        self.sender.send(run).map_err(|err| {
+            io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                format!("replay persist queue unavailable: {}", err),
+            )
+        })
+    }
 }
 
 impl ReplayStore {
@@ -1071,6 +1112,59 @@ mod tests {
                 .expect("load should succeed")
                 .is_none()
         );
+
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn replay_persist_queue_writes_runs_eventually() {
+        let root = temp_store_dir();
+        let store = ReplayStore::new(root.clone(), 30).expect("store should initialize");
+        let queue =
+            ReplayPersistQueue::new(store.clone()).expect("persist queue should initialize");
+        let trace_id = Ulid::new().to_string();
+
+        queue
+            .enqueue(PersistedRun {
+                trace_id: trace_id.clone(),
+                request_id: "req-queued".to_string(),
+                principal_id: "alice".to_string(),
+                engine_mode: ControllerEngine::Baseline,
+                query: "queued".to_string(),
+                budget: sample_budget(),
+                session_id: "session".to_string(),
+                policy_snapshot_id: "policy".to_string(),
+                loop_terminal_mode: TerminalMode::Supported,
+                loop_response_text: Some("SUPPORTED".to_string()),
+                terminal_mode: TerminalMode::Supported,
+                response_text: "SUPPORTED".to_string(),
+                claim_map: sample_claim_map(TerminalMode::Supported, true),
+                operator_calls_used: 1,
+                bytes_used: 10,
+                depth_used: 1,
+                evidence_ref_count: 1,
+                evidence_unit_ids: vec![
+                    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string(),
+                ],
+                planner_traces: Vec::new(),
+            })
+            .expect("enqueue should succeed");
+
+        let principal_hash = hash_principal_id("alice");
+        let deadline = std::time::Instant::now() + Duration::from_secs(1);
+        loop {
+            let listed = store
+                .list_replay_metadata(&principal_hash, 10, None)
+                .expect("list should succeed");
+            if listed.iter().any(|meta| meta.trace_id == trace_id) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "queued replay was not persisted before timeout"
+            );
+            thread::sleep(Duration::from_millis(10));
+        }
 
         let _ = fs::remove_dir_all(root);
     }
