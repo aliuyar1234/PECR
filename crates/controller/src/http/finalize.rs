@@ -63,15 +63,15 @@ pub(super) fn build_finalize_output(
         return partial_output;
     }
 
-    if synthesize_supported_from_evidence {
-        if let Some(partial_output) = synthesize_partial_finalize_output(
+    if synthesize_supported_from_evidence
+        && let Some(partial_output) = synthesize_partial_finalize_output(
             query,
             TerminalMode::InsufficientEvidence,
             trimmed_loop_response_text,
             &ranked_evidence_units,
-        ) {
-            return partial_output;
-        }
+        )
+    {
+        return partial_output;
     }
 
     let response_text = if synthesize_supported_from_evidence {
