@@ -3,9 +3,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
-import time
 import unittest
-import urllib.request
 from pathlib import Path
 
 
@@ -14,28 +12,6 @@ USEFUL_TASK_FIXTURE_DIR = ROOT / "fixtures" / "replay" / "useful_tasks"
 USEFUL_TASK_MANIFEST = USEFUL_TASK_FIXTURE_DIR / "benchmark_manifest.json"
 USEFUL_TASK_MANIFEST_PAYLOAD = json.loads(USEFUL_TASK_MANIFEST.read_text(encoding="utf-8"))
 USEFUL_TASK_SCENARIO_COUNT = len(USEFUL_TASK_MANIFEST_PAYLOAD["scenarios"])
-
-
-def has_working_mix() -> bool:
-    mix_cmd = shutil.which("mix") or shutil.which("mix.bat") or shutil.which("mix.cmd")
-    if not mix_cmd:
-        return False
-    try:
-        result = subprocess.run(
-            [mix_cmd, "--version"],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-            check=False,
-            timeout=10,
-        )
-    except (OSError, subprocess.SubprocessError):
-        return False
-    return result.returncode == 0
-
-
-HAS_WORKING_MIX = has_working_mix()
-
 
 def make_planner_trace(
     *,
@@ -491,89 +467,6 @@ class ReplayScriptTests(unittest.TestCase):
         self.assertIn("beam_planner", scorecards)
         self.assertEqual(scorecards["beam_planner"]["benchmark_pass_rate"], 1.0)
         self.assertEqual(scorecards["beam_planner"]["fallback_rate"], 1.0)
-
-    @unittest.skipUnless(HAS_WORKING_MIX, "mix not installed")
-    def test_run_beam_usefulness_job_wrapper_returns_json(self):
-        cmd = [
-            sys.executable,
-            str(ROOT / "scripts" / "replay" / "run_beam_usefulness_job.py"),
-            "scenario-preview",
-            "--store",
-            str(USEFUL_TASK_FIXTURE_DIR),
-        ]
-        result = subprocess.run(cmd, check=False, capture_output=True, text=True)
-        self.assertEqual(result.returncode, 0, msg=result.stdout + result.stderr)
-
-        payload = json.loads(result.stdout)
-        self.assertEqual(payload["status"], "ok")
-        self.assertEqual(payload["job_name"], "scenario-preview")
-        self.assertEqual(payload["job_status"], "succeeded")
-        self.assertIn("useful_answer_benchmark_v1", payload["output"])
-
-    @unittest.skipUnless(HAS_WORKING_MIX, "mix not installed")
-    def test_beam_shadow_http_bridge_returns_contract_response(self):
-        port = "9199"
-        process = subprocess.Popen(
-            [
-                sys.executable,
-                str(ROOT / "scripts" / "planner" / "beam_shadow_http_bridge.py"),
-                "--host",
-                "127.0.0.1",
-                "--port",
-                port,
-            ],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            text=True,
-        )
-        try:
-            for _ in range(30):
-                try:
-                    with urllib.request.urlopen(
-                        f"http://127.0.0.1:{port}/health", timeout=2
-                    ) as response:
-                        if response.status == 200:
-                            break
-                except Exception:
-                    time.sleep(0.25)
-            else:
-                self.fail("beam shadow bridge did not become ready")
-
-            request = {
-                "schema_version": 1,
-                "query": "What is the customer status and plan tier?",
-                "budget": {
-                    "max_operator_calls": 10,
-                    "max_bytes": 2048,
-                    "max_wallclock_ms": 1000,
-                    "max_recursion_depth": 3,
-                    "max_parallelism": 1,
-                },
-                "planner_hints": {
-                    "intent": "structured_lookup",
-                    "recommended_path": [],
-                },
-                "available_operator_names": ["fetch_rows", "lookup_evidence"],
-                "allow_search_ref_fetch_span": True,
-            }
-            req = urllib.request.Request(
-                f"http://127.0.0.1:{port}/plan",
-                data=json.dumps(request).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=30) as response:
-                payload = json.loads(response.read().decode("utf-8"))
-
-            self.assertEqual(payload["schema_version"], 1)
-            self.assertEqual(
-                payload["steps"],
-                [{"kind": "operator", "op_name": "fetch_rows", "params": {}}],
-            )
-            self.assertIn("planner_summary", payload)
-        finally:
-            process.terminate()
-            process.wait(timeout=10)
 
     def test_replay_eval_cli_reports_benchmark_usefulness_fields(self):
         cmd = [

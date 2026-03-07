@@ -4,7 +4,7 @@ Use these baselines as the minimum production operating posture.
 
 ## RLM-First Operating Scorecard
 
-For the RLM-first rollout, every nightly lane and release candidate should report at least:
+For the RLM-first runtime, every nightly lane and release candidate should report at least:
 
 - useful-answer rate on the named usefulness corpus
 - supported-answer rate on the same corpus
@@ -18,7 +18,7 @@ For the RLM-first rollout, every nightly lane and release candidate should repor
 - shadow delta versus baseline on matched benchmark scenarios
 
 Release posture should not advance if these numbers are invisible, unstable, or moving in the wrong direction.
-Before `rlm` becomes the default path, shadow delta versus baseline should be non-negative on the core benchmark set and the finalize downgrade rate should not show unexplained regression.
+Shadow delta versus baseline should stay non-negative on the core benchmark set, and the finalize downgrade rate should not show unexplained regression.
 
 ## Core SLOs
 
@@ -43,7 +43,7 @@ Before `rlm` becomes the default path, shadow delta versus baseline should be no
 - citation-quality regression on supported answers after long-context packing changes.
 - shadow delta regression where RLM drops below baseline on the named benchmark set.
 
-## Phase 4 Rollout Views
+## RLM-First Runtime Views
 
 When RLM is the default product path, operators should have one place to answer these questions quickly:
 

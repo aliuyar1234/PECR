@@ -196,29 +196,29 @@ Implementation note:
 - Phase 4 implementation work is complete in-repo.
 - The rollout evidence gate was satisfied on `2026-03-07` by 10 consecutive green `ci` runs on commit `c723d8d234bf0d9eeda5766d2c08ac95c89657a7`.
 - Recorded run IDs: `22804181871`, `22804184647`, `22804185384`, `22804186066`, `22804186829`, `22804187671`, `22804188428`, `22804189241`, `22804190277`, `22804191241`.
-- Phase 5 may proceed.
+- Phase 5 is complete.
 
 ## Phase 5: Simplify The Repo Around The RLM-First Product
 
 Goal: stop presenting PECR as a three-way engine experiment once the product direction is proven.
 
-- [ ] Remove or hide user-facing product surfaces that imply `baseline` and `beam_planner` are equal long-term product modes.
+- [x] Remove or hide user-facing product surfaces that imply `baseline` and `beam_planner` are equal long-term product modes.
   Files: `README.md`, `RUNBOOK.md`, `docs/openapi/`, `crates/controller/src/config.rs`
-- [ ] Retain only the minimum shadow or reference path needed for regression detection and offline evaluation.
+- [x] Retain only the minimum shadow or reference path needed for regression detection and offline evaluation.
   Files: `crates/controller/src/replay.rs`, `scripts/replay/`, `.github/workflows/`
-- [ ] Delete dead code, dead env vars, and dead CI lanes that only supported the earlier multi-engine transition period.
+- [x] Delete dead code, dead env vars, and dead CI lanes that only supported the earlier multi-engine transition period.
   Files: `crates/controller/src/config.rs`, `crates/controller/src/http/orchestration.rs`, `.github/workflows/`, `perf/`, `scripts/`
-- [ ] Re-baseline performance, usefulness, and reliability targets around the real RLM-first runtime.
+- [x] Re-baseline performance, usefulness, and reliability targets around the real RLM-first runtime.
   Files: `perf/`, `docs/observability/baselines.md`, `docs/useful_benchmark.md`
-- [ ] Update the public architecture story so PECR is clearly described as an RLM-first governed reasoning runtime.
+- [x] Update the public architecture story so PECR is clearly described as an RLM-first governed reasoning runtime.
   Files: `README.md`, `docs/architecture/`, `PRODUCT_PRINCIPLES.md`
 
 Gate for completion:
 
-- [ ] The repo no longer treats `baseline` as a peer product strategy.
-- [ ] CI validates the RLM-first path as the main product path.
-- [ ] Any remaining shadow or reference path is intentional, documented, and low-maintenance.
-- [ ] The product story, architecture docs, and runtime defaults all agree.
+- [x] The repo no longer treats `baseline` as a peer product strategy.
+- [x] CI validates the RLM-first path as the main product path.
+- [x] Any remaining shadow or reference path is intentional, documented, and low-maintenance.
+- [x] The product story, architecture docs, and runtime defaults all agree.
 
 ## Cross-Phase Rules
 

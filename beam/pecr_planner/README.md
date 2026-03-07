@@ -45,15 +45,9 @@ PecrPlanner.request_example()
 PecrPlanner.response_example()
 ```
 
-Run the local HTTP bridge from the repo root:
-
-```bash
-python -B scripts/planner/beam_shadow_http_bridge.py --host 127.0.0.1 --port 9090
-```
-
-That bridge accepts `POST /plan` with the Rust `PlanRequest` JSON and returns a Rust-compatible
-`PlanResponse` JSON. Internally it shells into `mix run --no-start -e "PecrPlanner.CLI.main()"`,
-so this is suitable for local benchmarking and CI shadow runs, not high-throughput production use.
+Historical note: the old repo-root Python HTTP bridge wrapper was removed during the Phase 5 RLM-first cleanup.
+If you need to inspect legacy BEAM planner behavior, run the Mix scripts in this directory directly
+instead of relying on repo-level wrappers.
 
 Run a supervised usefulness prep job from the repo root:
 
@@ -83,11 +77,8 @@ Supported job names:
 These jobs are intentionally allowlisted and shell only into replay/report scripts that operate on
 fixture or replay stores. They must not access source systems, the gateway, or policy endpoints.
 
-From the repo root, the replay wrapper can invoke those jobs and emit parsed JSON:
-
-```bash
-python -B scripts/replay/run_beam_usefulness_job.py scenario-preview --store fixtures/replay/useful_tasks
-```
+These job entrypoints remain useful only for legacy/internal planner experiments. They are no longer
+part of the active rollout or nightly usefulness workflow.
 
 ## Contract Shape
 

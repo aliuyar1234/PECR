@@ -1,9 +1,10 @@
 # Controller State Machine and Budget Scheduler
 
-This document defines the controller orchestration model used by both baseline and RLM engine paths.
+This document defines the controller orchestration model used by the primary RLM path and the
+baseline reference path.
 
 ## Scope
-- Baseline engine loop: `crates/controller/src/http/orchestration.rs`
+- Baseline reference loop: `crates/controller/src/http/orchestration.rs`
 - RLM bridge loop: `crates/controller/src/http/orchestration.rs`
 - Budget scheduler: `crates/controller/src/http/budget.rs`
 
@@ -11,7 +12,7 @@ This document defines the controller orchestration model used by both baseline a
 
 The controller loop is modeled as transitions over a bounded execution state:
 - `Init`: validate inputs, initialize counters (`operator_calls_used`, `bytes_used`, `depth_used`), create scheduler.
-- `PlanStep` (baseline) or `BridgeMessage` (RLM): select next operation source.
+- `PlanStep` (baseline reference path) or `BridgeMessage` (RLM path): select next operation source.
 - `BudgetGate`: enforce depth/operator/wallclock/bytes constraints before any operator call.
 - `DispatchOperator`: call gateway operator with timeout.
 - `CollectResult`: parse response, collect evidence refs/units, update counters.

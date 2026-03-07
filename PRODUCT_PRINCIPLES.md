@@ -5,7 +5,7 @@ PECR should be a trustworthy, useful retrieval-and-reasoning runtime. Security, 
 ## Core Position
 
 - Be helpful first, constrained second, denying last.
-- Be RLM-first in product direction while keeping non-RLM paths limited to shadowing, evaluation, or safe fallback during migration.
+- Be RLM-first in product direction while keeping non-RLM paths limited to shadowing, evaluation, or safe fallback.
 - Prefer scoped, evidence-backed partial answers over hard failure when the safe path still exists.
 - Keep policy mostly invisible when the system is healthy.
 - Make every downgrade or refusal explainable and actionable.

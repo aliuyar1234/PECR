@@ -1,12 +1,18 @@
 # BEAM Migration Plan
 
+Archived historical context:
+
+- This document is no longer the active product roadmap.
+- The active roadmap is `RLM_FIRST_MIGRATION_PLAN.md`.
+- Keep this file only as reference for legacy/internal BEAM experiments that still inform replay evaluation or migration history.
+
 Goal: make PECR a more useful, resilient, and maintainable product without weakening its trust boundaries, replay guarantees, or evidence model.
 
 Phase 4 RLM-first decision:
 
 - BEAM remains an internal experiment and reference lane only.
 - Scheduled product-facing usefulness lanes now center `baseline` and `rlm`.
-- BEAM usefulness and planner-comparison lanes should run only through explicit manual workflows or focused experiments.
+- The old BEAM-specific usefulness wrappers have been removed from the active repo workflow surface.
 
 ## Recommendation
 

@@ -5,7 +5,7 @@ For the RLM-first migration, this corpus is the primary product scorecard, not a
 
 ## RLM-First Scorecard
 
-Before `rlm` becomes the default product path, every release candidate or nightly lane should be judged on the same core questions:
+Now that `rlm` is the default product path, every release candidate or nightly lane should still be judged on the same core questions:
 
 - useful-answer rate: does the system satisfy the named scenario expectations?
 - supported-answer rate: how often do useful scenarios finish as grounded `SUPPORTED` answers?
@@ -15,7 +15,7 @@ Before `rlm` becomes the default product path, every release candidate or nightl
 - throughput: does the runtime stay inside the deployment envelope?
 - shadow delta versus baseline: when the same scenario is run through both lanes, is RLM at least matching and ideally beating the reference path?
 
-`baseline` and `beam_planner` may still appear in reports during migration, but they are comparison lanes. The product question is whether the RLM-first path is good enough to own the default runtime.
+`baseline` may still appear in reports because it remains the comparison lane. The product question is whether the RLM-first path continues to earn the default runtime.
 
 ## Scenario Set
 
@@ -71,11 +71,9 @@ Validate that the manifest and replay fixtures stay aligned:
 python -B scripts/replay/useful_benchmark_cli.py validate
 ```
 
-Compare planner behavior on the named scenarios. During migration this may still grade `baseline`,
-`rlm`, `beam_planner`, and `beam_planner_shadow` traces against the scenario-declared planner
-prefixes when the replay store contains `planner_traces`. Recovery traces emitted as
-`beam_recovery` are folded into the `beam_planner` planner mode so recovered runs stay visible in
-the same benchmark lane, but only `rlm` is the target execution lane for the long-term product:
+Compare planner behavior on the named scenarios. During migration this should primarily grade
+`baseline` and `rlm` traces against the scenario-declared planner prefixes. Historical stores may
+still contain older BEAM-era traces, but they are not part of the active product release question:
 
 ```bash
 python -B scripts/replay/useful_benchmark_cli.py --store target/replay planner-compare
@@ -98,17 +96,6 @@ python -B scripts/replay/nightly_usefulness_report.py \
   --output-md target/replay/nightly_usefulness_baseline.md
 ```
 
-Generate the same report through the supervised BEAM job lane:
-
-```bash
-python -B scripts/replay/run_beam_usefulness_job.py nightly-report \
-  --store target/replay \
-  --evaluation-name nightly-usefulness-beam \
-  --engine-mode beam_planner \
-  --output-json target/replay/nightly_usefulness_beam.json \
-  --output-md target/replay/nightly_usefulness_beam.md
-```
-
 Use this corpus when adding planner, retrieval, finalize, or evaluation changes that are supposed to improve answer usefulness. If a change helps only synthetic safety checks but hurts these named scenarios, treat that as a regression.
 
 During the RLM-first rollout, treat these scenarios as the default answer to:
@@ -119,10 +106,10 @@ During the RLM-first rollout, treat these scenarios as the default answer to:
 - did finalize stay aligned with the higher-capability path?
 - did mixed or compacted evidence still preserve grounded citations after recombination?
 
-When your replay store contains paired `baseline`, `rlm`, and `beam_planner` runs for the same
-queries, local evaluation now emits an `engine_comparisons` section that compares them on matched
-queries or named scenarios. Use it to answer the practical question: did the alternate planner
-actually help on the same job, or just score well in aggregate?
+When your replay store contains paired `baseline` and `rlm` runs for the same queries, local
+evaluation emits an `engine_comparisons` section that compares them on matched queries or named
+scenarios. Use it to answer the practical question: did the alternate planner actually help on the
+same job, or just score well in aggregate?
 
 ```bash
 python -B scripts/replay/replay_eval_cli.py --store target/replay evaluate --name usefulness-compare
@@ -131,8 +118,8 @@ python -B scripts/replay/replay_eval_cli.py --store target/replay evaluate --nam
 Nightly usefulness reports now include a separate planner section. Across the execution and shadow
 lanes that means the same artifact can show:
 
-- execution scorecards for the baseline reference lane, the primary `rlm` lane, or a manual `beam_planner` experiment lane
-- planner scorecards for `baseline`, `rlm`, `beam_planner`, and `beam_planner_shadow` traces observed in those runs
-- planner comparisons that tell us whether BEAM shadow or BEAM execution planning is matching or beating the current planner on the same scenarios
+- execution scorecards for the baseline reference lane and the primary `rlm` lane
+- planner scorecards for `baseline` and `rlm` traces observed in those runs
+- planner comparisons that tell us whether the current RLM path is matching or beating the baseline reference lane on the same scenarios
 
-Automation: `.github/workflows/nightly-usefulness.yml` now schedules `baseline` and `rlm` by default, with the `rlm` lane able to sample baseline shadow runs so the same nightly artifacts can emit `engine_comparisons` on matched queries. BEAM lanes remain available only as manual `workflow_dispatch` experiments. The release question should always be framed around whether `rlm` is strong enough to own the default path.
+Automation: `.github/workflows/nightly-usefulness.yml` schedules `baseline` and `rlm`, with the `rlm` lane able to sample baseline shadow runs so the same nightly artifacts can emit `engine_comparisons` on matched queries. The release question should always be framed around whether `rlm` is strong enough to own the default path.

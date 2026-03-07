@@ -56,7 +56,7 @@
 - Baseline is no longer a peer default runtime; it is a reference lane.
 - Sampled shadow runs should persist as normal replay bundles with `engine_mode=baseline` so replay scorecards and `engine_comparisons` can compare them against the primary `rlm` runs on matched queries.
 - Scheduled nightly usefulness runs should keep the `baseline` lane and the `rlm` lane; the `rlm` lane may also sample baseline shadow runs for same-query comparisons.
-- BEAM lanes are manual/internal experiments only and must not be required for the default product release question.
+- BEAM usefulness lanes are no longer part of the default rollout-control workflow and must not be required for the product release question.
 
 ## Deployment Contract
 - Every rollout must define:
@@ -75,4 +75,4 @@
   - ENV patch snippet (next fallback stage)
 - CI integration:
   - `.github/workflows/ci.yml` perf job runs the guard for the RLM benchmark pass and publishes artifacts for rollout operators.
-  - `.github/workflows/nightly-usefulness.yml` keeps baseline and RLM scheduled lanes active, while BEAM experiment lanes are manual `workflow_dispatch` only.
+  - `.github/workflows/nightly-usefulness.yml` keeps only the baseline reference lane and the primary `rlm` lane active.

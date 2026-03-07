@@ -24,7 +24,7 @@ The first supported real RLM backend envelope should be:
 - one primary remote model backend
 - one primary model family/configuration per environment
 - bridge-configured, not request-configured
-- local compose defaults into the RLM path with the mock backend; the real remote backend remains opt-in during migration
+- local compose defaults into the RLM path with the mock backend; the real remote backend remains opt-in until a broader production backend rollout is explicitly approved
 - isolated to the controller/RLM bridge path only
 
 In practice, that means:
@@ -108,7 +108,7 @@ The first supported backend envelope should behave differently by environment:
 
 - RLM bridge/backend health must be observable
 - rollout must support shadowing and auto-fallback
-- baseline should remain available as a temporary rollback/reference lane until Phase 5 cleanup
+- baseline should remain available as an intentional rollback/reference lane
 
 ## Explicit Non-Goals For The First Backend
 

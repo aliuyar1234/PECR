@@ -892,6 +892,11 @@ components:
         - partial_answer
     EngineMode:
       type: string
+      description: |
+        Runtime engine identifier.
+        `rlm` is the primary product path.
+        `baseline` is the reference, shadow, and rollback lane.
+        `beam_planner` remains a legacy internal compatibility mode and is not part of the default product release path.
       enum:
         - baseline
         - beam_planner

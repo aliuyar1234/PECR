@@ -1,12 +1,14 @@
 # Planner Contract
 
-PECR now defines a narrow planner seam for future shadow planners, including a BEAM/Elixir planner.
+PECR defines a narrow planner seam for the active RLM bridge and any legacy/internal comparison
+planners that still remain.
 
 ## Purpose
 
 - Keep Rust as the execution and trust boundary.
 - Make planner inputs and outputs explicit, versioned, and replayable.
-- Let future planners improve path selection without bypassing gateway policy, budgets, or finalize rules.
+- Let internal comparison planners improve path selection without bypassing gateway policy, budgets,
+  or finalize rules.
 
 ## Request
 
@@ -51,9 +53,9 @@ mode, while the bridge compacts tool results into that envelope before they ente
 
 ## Current Controller Behavior
 
-- The Rust controller already emits `plan_request` to the existing RLM bridge.
+- The Rust controller already emits `plan_request` to the primary RLM bridge.
 - The legacy top-level `query`, `budget`, and `planner_hints` fields remain for backward compatibility.
-- The current bridge may ignore `plan_request`; future shadow planners should prefer it.
+- Legacy comparison planners may ignore `plan_request`; newer planner integrations should prefer it.
 - The bridge protocol is explicitly versioned around JSON message types:
   - `start`
   - `start_ack`

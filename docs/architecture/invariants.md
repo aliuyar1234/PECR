@@ -7,8 +7,8 @@ These are the rules future changes must preserve.
 - The controller orchestrates runs and persists replay artifacts, but it does not read source systems directly.
 - The gateway owns policy checks, source access, evidence emission, and session runtime enforcement.
 - `boundary-check` is the safety rail. If a new dependency crosses the controller/gateway trust boundary, update the boundary rules intentionally or fail the build.
-- `beam_planner` may choose or recover a plan, but Rust still owns operator execution, budget checks, allowlist enforcement, gateway auth, finalize, replay persistence, and the external API contract.
-- BEAM planner failures must degrade to the Rust-owned baseline path, not to a user-visible outage.
+- Legacy `beam_planner` compatibility may choose or recover a plan, but Rust still owns operator execution, budget checks, allowlist enforcement, gateway auth, finalize, replay persistence, and the external API contract.
+- Legacy BEAM planner failures must degrade to the Rust-owned baseline reference path, not to a user-visible outage.
 
 ## Finalize Semantics
 

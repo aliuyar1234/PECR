@@ -11,11 +11,11 @@ It keeps orchestration non-privileged, enforces policy at every data access boun
 
 ## Product Direction
 
-PECR is moving toward one clear product shape:
+PECR now has one clear product shape:
 
 - RLM should be the primary reasoning and planning runtime.
 - the controller and gateway should remain the trust, policy, evidence, and finalize boundary.
-- baseline and other planner paths should exist only as migration, shadow, evaluation, or fallback tools until the RLM-first rollout is complete.
+- baseline and other planner paths should exist only as shadow, evaluation, or fallback tools.
 - BEAM-era planner work is now an internal experiment/reference lane, not a scheduled product-default lane.
 
 The working migration plan for that direction lives in `RLM_FIRST_MIGRATION_PLAN.md`.
@@ -35,7 +35,7 @@ PECR adds those missing controls while aiming for more capable RLM-style plannin
 ## High-Level Architecture
 
 PECR is an RLM-first AI runtime wrapped by a policy/evidence governance plane.
-Today the repo still contains baseline and BEAM-era paths for reference, shadow evaluation, and migration safety, but the intended product shape is one primary RLM reasoning path over one governance plane.
+The repo still contains baseline and limited BEAM-era compatibility surfaces for reference, shadow evaluation, and legacy/internal experiments, but the product shape is one primary RLM reasoning path over one governance plane.
 
 ```mermaid
 flowchart LR
@@ -70,7 +70,7 @@ flowchart LR
     end
 
     Client -->|POST /v1/run| Controller
-    Controller -->|shadow/reference during migration| Baseline
+    Controller -->|shadow/reference lane| Baseline
     Controller -->|primary reasoning direction| RLM
     Baseline --> Scheduler
     RLM -->|plan, replan, batch, recover| Scheduler
@@ -206,12 +206,12 @@ SUITE7_SKIP_FAULTS=1 bash scripts/perf/suite7.sh
 
 Outputs: `target/perf/`
 
-## Execution Modes (Transition State)
+## Runtime Paths
 
 | Path | Engine | Enablement | Typical use |
 |---|---|---|---|
-| Baseline | `baseline` | Explicit `PECR_CONTROLLER_ENGINE=baseline`, or sampled as a shadow/reference lane via `PECR_BASELINE_SHADOW_PERCENT>0` while RLM serves the user-visible response | Reference, shadow comparison, migration safety, and rollback lane while RLM-first rollout evidence accumulates |
 | RLM | `rlm` | Explicit `PECR_CONTROLLER_ENGINE=rlm`, or default when `PECR_CONTROLLER_ENGINE` is unset and `PECR_RLM_DEFAULT_ENABLED=1`, plus `PECR_RLM_SANDBOX_ACK=1` (controller built with `--features rlm`) | Primary product path with adaptive planning, batching, recovery behavior, and optional baseline shadow comparison |
+| Baseline Reference | `baseline` | Explicit `PECR_CONTROLLER_ENGINE=baseline`, or sampled as a shadow/reference lane via `PECR_BASELINE_SHADOW_PERCENT>0` while RLM serves the user-visible response | Reference, shadow comparison, migration safety, and rollback lane rather than a peer product mode |
 
 Perf harness commands:
 
@@ -311,7 +311,7 @@ Current transition note:
 
 - `rlm` is the default local product path.
 - `baseline` remains intentionally available as a reference/shadow/fallback lane, not as a peer default product mode.
-- scheduled usefulness lanes now center `baseline` and `rlm`; BEAM usefulness lanes are manual experiment paths only.
+- scheduled usefulness lanes now center the baseline reference lane and the primary `rlm` lane.
 - the bridge-backed real backend seam currently starts with `PECR_RLM_BACKEND=openai` plus `PECR_RLM_MODEL_NAME` and `OPENAI_API_KEY` or `PECR_RLM_API_KEY`.
 - the governance model does not change: gateway policy, evidence capture, and finalize remain authoritative for every engine path.
 

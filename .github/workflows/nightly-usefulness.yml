@@ -4,23 +4,16 @@ on:
   schedule:
     - cron: "0 2 * * *"
   workflow_dispatch:
-    inputs:
-      include_beam_experiments:
-        description: Include BEAM experiment lanes
-        type: boolean
-        default: false
 
 jobs:
   nightly_usefulness:
     name: usefulness-${{ matrix.engine_mode }}
-    if: ${{ !matrix.beam_experiment || (github.event_name == 'workflow_dispatch' && (inputs.include_beam_experiments == true || inputs.include_beam_experiments == 'true')) }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - engine_mode: baseline
-            beam_experiment: false
             cargo_features: ""
             controller_engine: baseline
             report_engine_mode: baseline
@@ -29,7 +22,6 @@ jobs:
             planner_url: ""
             baseline_shadow_percent: "0"
           - engine_mode: rlm
-            beam_experiment: false
             cargo_features: "pecr-controller/rlm"
             controller_engine: rlm
             report_engine_mode: rlm
@@ -37,24 +29,6 @@ jobs:
             planner_client: disabled
             planner_url: ""
             baseline_shadow_percent: "100"
-          - engine_mode: beam_planner
-            beam_experiment: true
-            cargo_features: ""
-            controller_engine: beam_planner
-            report_engine_mode: beam_planner
-            planner_mode: rust_owned
-            planner_client: beam
-            planner_url: http://127.0.0.1:9090/plan
-            baseline_shadow_percent: "0"
-          - engine_mode: beam_shadow
-            beam_experiment: true
-            cargo_features: ""
-            controller_engine: baseline
-            report_engine_mode: baseline
-            planner_mode: shadow
-            planner_client: beam
-            planner_url: http://127.0.0.1:9090/plan
-            baseline_shadow_percent: "0"
     services:
       postgres:
         image: postgres:16-alpine
@@ -80,42 +54,6 @@ jobs:
       - name: Cache cargo
         uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
 
-      - name: Set up BEAM toolchain
-        if: matrix.engine_mode == 'beam_shadow' || matrix.engine_mode == 'beam_planner'
-        uses: erlef/setup-beam@3559ac3b631a9560f28817e8e7fdde1638664336 # v1
-        with:
-          elixir-version: '1.16'
-          otp-version: '26'
-
-      - name: Verify BEAM shadow planner scaffold
-        if: matrix.engine_mode == 'beam_shadow' || matrix.engine_mode == 'beam_planner'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          cd beam/pecr_planner
-          mix test 2>&1 | tee ../../artifacts/beam_shadow_mix_test.log
-
-      - name: Start BEAM shadow planner bridge
-        if: matrix.engine_mode == 'beam_shadow' || matrix.engine_mode == 'beam_planner'
-        shell: bash
-        run: |
-          set -euo pipefail
-          mkdir -p artifacts
-          python3 -B scripts/planner/beam_shadow_http_bridge.py \
-            --host 127.0.0.1 \
-            --port 9090 \
-            > "artifacts/beam_shadow_bridge.log" 2>&1 &
-          echo $! > artifacts/beam_shadow_bridge.pid
-          for attempt in $(seq 1 30); do
-            if curl --fail --silent http://127.0.0.1:9090/health >/dev/null; then
-              exit 0
-            fi
-            sleep 1
-          done
-          cat artifacts/beam_shadow_bridge.log || true
-          exit 1
-
       - name: Run nightly usefulness suites
         shell: bash
         env:
@@ -136,7 +74,6 @@ jobs:
           ./scripts/run_useful_e2e.sh 2>&1 | tee "artifacts/usefulness_${{ matrix.engine_mode }}.log"
 
       - name: Generate nightly usefulness report
-        if: matrix.engine_mode != 'beam_shadow' && matrix.engine_mode != 'beam_planner'
         shell: bash
         run: |
           set -euo pipefail
@@ -151,34 +88,6 @@ jobs:
             report_args+=(--engine-mode "${{ matrix.report_engine_mode }}")
           fi
           "${report_args[@]}"
-
-      - name: Generate nightly usefulness report through BEAM jobs
-        if: matrix.engine_mode == 'beam_shadow' || matrix.engine_mode == 'beam_planner'
-        shell: bash
-        run: |
-          set -euo pipefail
-          python3 -B scripts/replay/run_beam_usefulness_job.py nightly-report \
-            --store target/replay \
-            --evaluation-name "nightly-usefulness-${{ matrix.engine_mode }}" \
-            --engine-mode "${{ matrix.report_engine_mode }}" \
-            --output-json "artifacts/nightly_usefulness_${{ matrix.engine_mode }}.json" \
-            --output-md "artifacts/nightly_usefulness_${{ matrix.engine_mode }}.md" \
-            > "artifacts/nightly_usefulness_${{ matrix.engine_mode }}_beam_job.json"
-          python3 -B scripts/replay/run_beam_usefulness_job.py planner-compare \
-            --store target/replay \
-            > "artifacts/planner_compare_${{ matrix.engine_mode }}.json"
-          python3 -B scripts/replay/run_beam_usefulness_job.py scenario-preview \
-            --store fixtures/replay/useful_tasks \
-            > "artifacts/scenario_preview_${{ matrix.engine_mode }}.json"
-
-      - name: Stop BEAM shadow planner bridge
-        if: always() && (matrix.engine_mode == 'beam_shadow' || matrix.engine_mode == 'beam_planner')
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ -f artifacts/beam_shadow_bridge.pid ]]; then
-            kill "$(cat artifacts/beam_shadow_bridge.pid)" || true
-          fi
 
       - name: Upload nightly usefulness artifacts
         if: always()
