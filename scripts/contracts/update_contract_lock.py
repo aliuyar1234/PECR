@@ -6,17 +6,14 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 LOCK_PATH = ROOT / "contracts" / "contract-lock.json"
+TEXT_EXTENSIONS = {".json", ".yaml", ".yml"}
 
 
 def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        while True:
-            chunk = f.read(65536)
-            if not chunk:
-                break
-            h.update(chunk)
-    return h.hexdigest()
+    payload = path.read_bytes()
+    if path.suffix.lower() in TEXT_EXTENSIONS:
+        payload = payload.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def tracked_files() -> list[Path]:
