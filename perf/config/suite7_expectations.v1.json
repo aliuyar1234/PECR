@@ -3,7 +3,7 @@
   "engines": {
     "baseline": {
       "controller_baseline": {
-        "expected_terminal_mode": "INSUFFICIENT_EVIDENCE"
+        "expected_terminal_mode": "SUPPORTED"
       },
       "useful_controller_baseline": {
         "expected_terminal_mode": "SUPPORTED"
@@ -29,7 +29,7 @@
     },
     "rlm": {
       "controller_baseline": {
-        "expected_terminal_mode": "INSUFFICIENT_EVIDENCE"
+        "expected_terminal_mode": "SUPPORTED"
       },
       "useful_controller_baseline": {
         "expected_terminal_mode": "SUPPORTED"
