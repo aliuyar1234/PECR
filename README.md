@@ -6,36 +6,41 @@
 [![Latest Release](https://img.shields.io/github/v/release/aliuyar1234/pecr?display_name=tag&label=release&style=flat-square)](https://github.com/aliuyar1234/PECR/releases/latest)
 [![License](https://img.shields.io/github/license/aliuyar1234/PECR?style=flat-square)](LICENSE)
 
-PECR is an RLM-first governance runtime for AI retrieval and reasoning.
-It keeps orchestration non-privileged, enforces policy at every data access boundary, and returns deterministic outcomes with auditable evidence.
+Current stable tag: [`v1.0.4`](https://github.com/aliuyar1234/PECR/tree/v1.0.4)
 
-## Product Direction
+PECR is an RLM-first governed reasoning runtime for AI retrieval and synthesis. It keeps orchestration non-privileged, enforces policy at the data-access boundary, and only returns `SUPPORTED` answers when the gateway can prove claim-to-evidence coverage.
 
-PECR now has one clear product shape:
+`v1.0.4` marks the repo's current product posture:
 
-- RLM should be the primary reasoning and planning runtime.
-- the controller and gateway should remain the trust, policy, evidence, and finalize boundary.
-- baseline and other planner paths should exist only as shadow, evaluation, or fallback tools.
-- BEAM-era planner work is now an internal experiment/reference lane, not a scheduled product-default lane.
+- `rlm` is the primary runtime path.
+- `baseline` remains only as a reference, shadow, and rollback lane.
+- long-context evidence synthesis, replay visibility, rollout controls, and real-backend operating lanes are part of the shipped design.
+- the secret-backed real-backend promotion gate is implemented, but broader real-backend automation still depends on configured credentials and repeated green runs.
 
-The working migration plan for that direction lives in `RLM_FIRST_MIGRATION_PLAN.md`.
-The first supported real backend shape for that migration is defined in `docs/architecture/rlm_runtime_envelope.md`.
+## What PECR Is
 
-## What PECR Solves
+PECR combines a reasoning plane with a governance plane:
 
-Plain RAG pipelines and agentic retrieval loops usually leave hard governance gaps around policy, provenance, and deterministic failure handling.
-PECR adds those missing controls while aiming for more capable RLM-style planning and long-context synthesis:
+- the controller owns planning, budget enforcement, replay persistence, and the public API
+- the gateway owns policy checks, source access, evidence emission, redaction, and finalize enforcement
+- RLM improves planning, recovery, clarification, batching, and long-context synthesis
+- replay, evaluation, perf, and contract lanes keep the system testable instead of hand-wavy
 
-- Policy-first execution through OPA decisions.
-- Immutable, hash-stable EvidenceUnits with provenance metadata.
-- Deterministic terminal modes (`SUPPORTED`, `INSUFFICIENT_EVIDENCE`, `INSUFFICIENT_PERMISSION`, `SOURCE_UNAVAILABLE`).
-- Strict trust boundary between non-privileged controller and privileged gateway.
-- Replay and evaluation APIs for repeatability and quality gates.
+This is not "raw long-context plus hope." Retrieval still matters. Policy still matters. Finalize still matters.
+
+## Current Product State
+
+| Area | Current state |
+|---|---|
+| Default product runtime | `rlm` |
+| Reference and rollback path | `baseline` |
+| Local compose default | `rlm` plus the mock bridge backend, with baseline auto-fallback available |
+| First real backend seam | `PECR_RLM_BACKEND=openai` behind the Python RLM bridge |
+| Public API posture | `/v1/run` stays provider-agnostic; backend details do not leak into the public contract |
+| Real-backend promotion | gated by secret-backed usefulness and pre-release evidence lanes |
+| Upstream RLM model | research upstream is `alexzhang13/rlm`; PECR ships a reviewed vendored integration from `vendor/rlm` |
 
 ## High-Level Architecture
-
-PECR is an RLM-first AI runtime wrapped by a policy/evidence governance plane.
-The repo still contains baseline and limited BEAM-era compatibility surfaces for reference, shadow evaluation, and legacy/internal experiments, but the product shape is one primary RLM reasoning path over one governance plane.
 
 ```mermaid
 flowchart LR
@@ -71,7 +76,7 @@ flowchart LR
 
     Client -->|POST /v1/run| Controller
     Controller -->|shadow/reference lane| Baseline
-    Controller -->|primary reasoning direction| RLM
+    Controller -->|primary reasoning path| RLM
     Baseline --> Scheduler
     RLM -->|plan, replan, batch, recover| Scheduler
 
@@ -95,18 +100,17 @@ flowchart LR
     Gateway --> Obs
 ```
 
-Controller remains non-privileged: it never reads systems of record directly and only uses typed, policy-enforced gateway operations.
-RLM is meant to own reasoning behavior, not privileged access.
+Controller code never reads source systems directly. The gateway remains the only privileged data-access boundary.
 
-## Request Lifecycle
+## Request Flow
 
-1. Client starts a request (or full `/v1/run`) with principal identity.
-2. Controller executes a budgeted RLM-driven loop and calls only allowlisted gateway operators.
-3. Gateway enforces policy, applies redaction, and emits evidence.
-4. Controller submits response text plus claim map to finalize.
-5. Gateway validates claim-to-evidence coverage and returns terminal mode.
-
-During migration, a baseline/reference path may still run for shadowing or fallback, but it is not the intended long-term product center.
+1. A client sends `POST /v1/run` to the controller with principal identity and request metadata.
+2. The controller runs a budgeted RLM loop and can shadow or fall back to baseline when configured.
+3. The controller invokes only typed, allowlisted gateway operators.
+4. The gateway enforces policy, reads sources, redacts where needed, and emits evidence units.
+5. The controller assembles response text plus claim metadata and asks the gateway to finalize.
+6. The gateway returns a deterministic terminal mode such as `SUPPORTED`, `INSUFFICIENT_EVIDENCE`, `INSUFFICIENT_PERMISSION`, or `SOURCE_UNAVAILABLE`.
+7. The controller persists replay artifacts so the run can be inspected, scored, and compared later.
 
 ## API Surface (v1)
 
@@ -134,55 +138,37 @@ Controller:
 - `GET /v1/evaluations/{evaluation_id}`
 - `GET /v1/evaluations/scorecards`
 
-## 5-Minute Fast Start (Local)
+## 5-Minute Local Start
 
-### Prerequisites
+Prerequisites:
 
 - Docker + Docker Compose
 - Rust toolchain
-- Bash (or WSL/Git Bash on Windows)
+- Bash, WSL, Git Bash, or PowerShell
 
-### 1) Start the stack
-
-Bash:
+Start the stack:
 
 ```bash
 docker compose up -d --build
 ```
 
-PowerShell:
-
-```powershell
-docker compose up -d --build
-```
-
-Postgres is exposed on `127.0.0.1:${PECR_POSTGRES_PORT:-55432}` by default.
-The local compose path also defaults `PECR_LOCAL_AUTH_SHARED_SECRET` to `pecr-local-demo-secret`, so the demo commands below work without extra tuning.
-Local compose also defaults into the RLM controller path with the mock bridge backend plus baseline auto-fallback, so the fast start stays zero-setup.
-
-### 2) Verify health endpoints
+Verify health:
 
 ```bash
 curl -fsS http://127.0.0.1:8080/healthz
 curl -fsS http://127.0.0.1:8081/healthz
 ```
 
-### 3) Run a useful live scenario
+Run the quickest product demo:
 
 ```bash
-curl -sS http://127.0.0.1:8081/v1/capabilities \
-  -H 'x-pecr-principal-id: dev' \
-  -H 'x-pecr-local-auth-secret: pecr-local-demo-secret'
-
 python -B scripts/demo/useful_workflows.py tour
 python -B scripts/demo/useful_workflows.py live-tour
 python -B scripts/demo/useful_workflows.py live-scenario customer-status
 python -B scripts/demo/useful_workflows.py live-smoke
 ```
 
-`tour` gives a fast fixture-backed product walkthrough. `live-tour` waits for the local controller, fetches the safe-ask catalog, then runs a curated set of grounded product scenarios so new contributors can see structured lookup, source citation, aggregate comparison, partial answers, and narrowing guidance in one pass.
-
-### 4) Run a raw smoke request
+Run one raw request:
 
 ```bash
 curl -sS -X POST http://127.0.0.1:8081/v1/run \
@@ -193,33 +179,63 @@ curl -sS -X POST http://127.0.0.1:8081/v1/run \
   -d '{"query":"What is the customer status and plan tier?"}'
 ```
 
-The capability catalog gives callers a low-friction way to discover safe structured lookups, comparisons, evidence asks, and version-review prompts before they send a full `/v1/run` request.
-
-### 5) Run local quality, e2e, and perf smoke
+Run local verification:
 
 ```bash
 bash scripts/verify.sh
-pwsh -File scripts/verify.ps1
 PECR_TEST_DB_URL=postgres://pecr:pecr@localhost:55432/pecr cargo test -p e2e_smoke -- --nocapture
 SUITE7_SKIP_FAULTS=1 bash scripts/perf/suite7.sh
 ```
 
-Outputs: `target/perf/`
+Local compose defaults `PECR_LOCAL_AUTH_SHARED_SECRET` to `pecr-local-demo-secret`, so the demo paths work without extra setup.
 
-## Runtime Paths
+## Runtime Modes
 
-| Path | Engine | Enablement | Typical use |
-|---|---|---|---|
-| RLM | `rlm` | Explicit `PECR_CONTROLLER_ENGINE=rlm`, or default when `PECR_CONTROLLER_ENGINE` is unset and `PECR_RLM_DEFAULT_ENABLED=1`, plus `PECR_RLM_SANDBOX_ACK=1` (controller built with `--features rlm`) | Primary product path with adaptive planning, batching, recovery behavior, and optional baseline shadow comparison |
-| Baseline Reference | `baseline` | Explicit `PECR_CONTROLLER_ENGINE=baseline`, or sampled as a shadow/reference lane via `PECR_BASELINE_SHADOW_PERCENT>0` while RLM serves the user-visible response | Reference, shadow comparison, migration safety, and rollback lane rather than a peer product mode |
+| Mode | How to enable | Use |
+|---|---|---|
+| Local default | Leave `PECR_CONTROLLER_ENGINE` unset and use compose defaults | `rlm` path with mock bridge backend, baseline auto-fallback available |
+| Explicit RLM | `PECR_CONTROLLER_ENGINE=rlm` and `PECR_RLM_SANDBOX_ACK=1` | Primary reasoning path |
+| Baseline reference | `PECR_CONTROLLER_ENGINE=baseline` or `PECR_BASELINE_SHADOW_PERCENT>0` | Reference, shadow comparison, rollback |
+| Real backend | `PECR_RLM_BACKEND=openai`, `PECR_RLM_MODEL_NAME`, and `OPENAI_API_KEY` or `PECR_RLM_API_KEY` | Opt-in bridge-backed real model runs |
 
-Perf harness commands:
+Important current truth:
+
+- the controller still rejects `PECR_MODEL_PROVIDER=external`
+- the first real backend lands through `scripts/rlm/pecr_rlm_bridge.py`, not through the Rust model-provider switch
+- the public `/v1/run` API remains provider-agnostic
+
+Manual real-backend smoke:
 
 ```bash
-# Baseline
-bash scripts/perf/suite7.sh
+PECR_RLM_BACKEND=openai \
+PECR_RLM_MODEL_NAME=<model> \
+OPENAI_API_KEY=<key> \
+python -B scripts/rlm/openai_bridge_smoke.py
+```
 
-# RLM baseline matrix lane
+## Replay, Evaluation, Benchmarking, And Perf
+
+Replay and evaluation:
+
+```bash
+python3 scripts/replay/replay_eval_cli.py --store target/replay list
+python3 scripts/replay/replay_eval_cli.py --store target/replay replay --run-id <run_id>
+python3 scripts/replay/replay_eval_cli.py --store target/replay scorecards
+python3 scripts/replay/regression_gate.py --store target/replay --allow-empty
+```
+
+Named usefulness demos and benchmarks:
+
+```bash
+python3 scripts/demo/useful_workflows.py catalog
+python3 scripts/demo/useful_workflows.py benchmark
+python3 scripts/run_useful_e2e.sh
+```
+
+Perf harness:
+
+```bash
+bash scripts/perf/suite7.sh
 PECR_CONTROLLER_ENGINE_OVERRIDE=rlm \
 PECR_RLM_SANDBOX_ACK=1 \
 SUITE7_SKIP_FAULTS=1 \
@@ -229,123 +245,30 @@ METRICS_GATES_FILE=target/perf/suite7_rlm_metrics_gates.json \
 bash scripts/perf/suite7.sh
 ```
 
-Suite7 expectations are versioned in `perf/config/suite7_expectations.v1.json`.
-Terminal-mode assertions are explicit opt-in via `SUITE7_ENFORCE_TERMINAL_MODE_ASSERTIONS=1`.
+Real-backend evidence lanes:
 
-## Replay and Evaluation Tooling
-
-- Replay/eval CLI: `scripts/replay/replay_eval_cli.py`
-- Regression gate: `scripts/replay/regression_gate.py`
-- Contract templates runner: `scripts/replay/run_operator_contract_tests.py`
-
-Examples:
-
-```bash
-python3 scripts/replay/replay_eval_cli.py --store target/replay list
-python3 scripts/replay/replay_eval_cli.py --store target/replay replay --run-id <run_id>
-python3 scripts/replay/replay_eval_cli.py --store target/replay scorecards
-python3 scripts/replay/regression_gate.py --store target/replay --allow-empty
-```
-
-## Useful Demo Workflows
-
-If you want to see PECR’s user-value paths without booting the full stack first, use the named usefulness corpus in `fixtures/replay/useful_tasks/`.
-
-```bash
-python3 scripts/demo/useful_workflows.py catalog
-python3 scripts/demo/useful_workflows.py tour
-python3 scripts/demo/useful_workflows.py scenario customer-status
-python3 scripts/demo/useful_workflows.py scenario customer-counts-by-plan
-python3 scripts/demo/useful_workflows.py benchmark
-python3 scripts/demo/useful_workflows.py live-tour
-python3 scripts/demo/useful_workflows.py live-scenario customer-status
-python3 scripts/demo/useful_workflows.py live-smoke
-```
-
-`tour` is the quickest guided product summary without booting services. `live-tour` is the best under-five-minute contributor demo once `docker compose up -d --build` is running, because it uses `/v1/capabilities` and a curated set of live asks instead of isolated spot checks.
-
-These workflows cover structured lookup, source-backed evidence lookup, version review, compare, trend, partial-answer, and narrowing-guidance jobs. For the benchmark catalog and validation details, see `docs/useful_benchmark.md`.
-
-The `live-*` commands assume the default local compose secret `pecr-local-demo-secret` unless `PECR_LOCAL_AUTH_SHARED_SECRET` overrides it. To exercise the same named scenarios against the real stack, set `PECR_TEST_DB_URL` and run `scripts/run_useful_e2e.sh`.
-
-## Client Integration Semantics
-
-PECR returns `response_text` as the main user-facing answer, then uses `response_kind` and claim metadata to tell clients how to present edge cases cleanly:
-
-- No `response_kind`: treat the response as a normal grounded answer.
-- `partial_answer`: show the grounded portion normally and surface `claim_map.notes` as the unresolved-details callout.
-- `ambiguous`: render `claim_map.clarification_prompt.question` and its `options` as the next-step UX.
-- `blocked` or `source_down`: show the error `message`, then present `what_failed` and `safe_alternative` as the safe recovery path.
-
-For concrete payload examples, see `docs/client_integration.md` and the `/v1/run` examples in `docs/openapi/pecr.v1.yaml`.
-
-## RLM Runtime Direction
-
-PECR now defaults local runtime wiring toward an RLM-first controller path.
-The migration in `RLM_FIRST_MIGRATION_PLAN.md` is about proving that default operationally, not about keeping baseline as a peer product mode.
-
-The first supported real backend envelope is documented in `docs/architecture/rlm_runtime_envelope.md`.
-Important current truth: the controller still rejects `PECR_MODEL_PROVIDER=external`, so the real RLM backend must land through the bridge/runtime path first rather than through the current Rust model-provider switch. Local compose defaults to the `mock` bridge backend; the initial `openai` seam is real but still opt-in.
-
-RLM upstream/update model:
-
-- research upstream: `alexzhang13/rlm` and its accompanying Recursive Language Models paper
-- shipped PECR runtime: the vendored integration in `vendor/rlm`, adapted behind `scripts/rlm/pecr_rlm_bridge.py`
-- update policy: upstream changes may be proposed automatically or synced manually, but adoption into PECR is explicit and review-gated, not automatic at runtime
-
-Phase 6 local-development decision:
-
-- keep the real backend explicit and opt-in for now
-- do not add a second default compose profile yet
-- when you want the live bridge backend locally, set `PECR_RLM_BACKEND=openai`, `PECR_RLM_MODEL_NAME`, and `OPENAI_API_KEY` or `PECR_RLM_API_KEY` before running `docker compose up`
-
-Enable RLM mode:
-
-- Build `pecr-controller` with feature `rlm`
-- Set:
-  - either `PECR_CONTROLLER_ENGINE=rlm`, or leave `PECR_CONTROLLER_ENGINE` unset and use `PECR_RLM_DEFAULT_ENABLED=1`
-  - `PECR_RLM_SANDBOX_ACK=1`
-
-Useful knobs:
-- `PECR_RLM_BACKEND` (`mock` or `openai`)
-- `PECR_RLM_MODEL_NAME`
-- `PECR_RLM_API_KEY` or standard `OPENAI_API_KEY`
-- `PECR_RLM_BASE_URL`
-- `PECR_CONTROLLER_ADAPTIVE_PARALLELISM_ENABLED`
-- `PECR_CONTROLLER_BATCH_MODE_ENABLED`
-- `PECR_RLM_AUTO_FALLBACK_TO_BASELINE`
-- `PECR_BASELINE_SHADOW_PERCENT`
-- `PECR_OPERATOR_CONCURRENCY_POLICIES`
-- `PECR_RLM_SCRIPT_PATH`
-- the controller now keeps a persistent bridge worker alive across requests, auto-falls back to baseline on bridge degradation when enabled, and records bridge backend/stop-reason detail in replay-visible planner traces
-
-Current transition note:
-
-- `rlm` is the default local product path.
-- `baseline` remains intentionally available as a reference/shadow/fallback lane, not as a peer default product mode.
-- scheduled usefulness lanes now center the baseline reference lane and the primary `rlm` lane.
-- the bridge-backed real backend seam currently starts with `PECR_RLM_BACKEND=openai` plus `PECR_RLM_MODEL_NAME` and `OPENAI_API_KEY` or `PECR_RLM_API_KEY`.
-- the governance model does not change: gateway policy, evidence capture, and finalize remain authoritative for every engine path.
-
-Manual live smoke for the real bridge seam:
-
-```bash
-PECR_RLM_BACKEND=openai \
-PECR_RLM_MODEL_NAME=<model> \
-OPENAI_API_KEY=<key> \
-python3 -B scripts/rlm/openai_bridge_smoke.py
-```
-
-Manual Actions lane:
 - `.github/workflows/rlm-real-backend-smoke.yml`
-- configure repo variable `PECR_RLM_OPENAI_MODEL_NAME`
-- configure secret `OPENAI_API_KEY`
-
-Pre-release gate and workflow:
-- `python3 -B scripts/ops/check_real_backend_promotion_gate.py`
+- `.github/workflows/rlm-real-backend-usefulness.yml`
 - `.github/workflows/rlm-real-backend-pre-release.yml`
 
-Vendored upstream sync:
+The real-backend promotion gate is implemented, but it is not fully earned until the repo has credentials configured and repeated green usefulness runs on the same head SHA.
+
+## RLM Upstream And Vendored Runtime Policy
+
+PECR intentionally separates the research upstream from the shipped runtime:
+
+- research upstream: `https://github.com/alexzhang13/rlm`
+- shipped PECR runtime: the reviewed vendored integration in `vendor/rlm`
+- integration seam: `scripts/rlm/pecr_rlm_bridge.py`
+- active vendored pin: `vendor/rlm/UPSTREAM_PIN`
+
+Update policy:
+
+- upstream changes may be proposed automatically or synced manually
+- adoption into PECR is explicit and review-gated
+- shipped behavior only changes when the vendored copy is updated, verified, and merged
+
+Vendor sync commands:
 
 ```bash
 python3 scripts/rlm/sync_vendor_rlm.py
@@ -353,113 +276,60 @@ python3 scripts/rlm/sync_vendor_rlm.py --commit <40-char-sha>
 python3 scripts/rlm/verify_vendor_rlm.py
 ```
 
-The sync path updates `vendor/rlm` plus `vendor/rlm/UPSTREAM_PIN`; PECR still ships only what is reviewed and merged.
+Automation:
 
-Automation: `.github/workflows/vendor-rlm-sync.yml`
+- `.github/workflows/vendor-rlm-sync.yml`
 
-## Configuration Quick Reference
+## Release And Integrity
 
-Configuration comes from environment variables (optionally merged from `PECR_CONFIG_PATH`).
+Release workflow:
 
-Gateway minimum:
-- `PECR_DB_URL`
-- `PECR_OPA_URL`
-- `PECR_POLICY_BUNDLE_HASH`
-- `PECR_FS_CORPUS_PATH` (default `fixtures/fs_corpus`)
+- tag format: `vX.Y.Z`
+- workflow: `.github/workflows/release.yml`
+- CI gate: `.github/workflows/ci.yml`
 
-Controller minimum:
-- `PECR_GATEWAY_URL`
-- `PECR_MODEL_PROVIDER` (`mock` for local)
-- `PECR_BUDGET_DEFAULTS` (JSON)
+Release integrity is enforced with:
 
-RLM migration note:
-- local compose defaults `PECR_RLM_DEFAULT_ENABLED=1`, `PECR_RLM_SANDBOX_ACK=1`, and `PECR_RLM_AUTO_FALLBACK_TO_BASELINE=1`
-- use `PECR_BASELINE_SHADOW_PERCENT` when you want replay-visible baseline comparison runs during the rollout
-- keep `PECR_MODEL_PROVIDER=mock` as the honest default until Rust-native external-provider support exists
-- use `docs/architecture/rlm_runtime_envelope.md` as the source of truth for the first real backend shape
+- checksum validation for release tarballs
+- artifact provenance verification via `scripts/security/verify_release_attestations.py`
+- post-release smoke checks via `scripts/security/release_smoke_check.py`
 
-Auth modes:
-- `PECR_AUTH_MODE=local` (default)
-- `PECR_AUTH_MODE=oidc` (production baseline)
-
-## Observability and Operations
-
-- Structured logs via `tracing`
-- Prometheus metrics at `/metrics`
-- Optional OTLP traces (`PECR_OTEL_ENABLED=1`)
-- Dashboards and alerts:
-  - `docs/observability/dashboards/pecr_runtime_health.dashboard.json`
-  - `docs/observability/dashboards/pecr_budget_scheduler.dashboard.json`
-  - `docs/observability/alerts/pecr_slo_alerts.yaml`
-
-Operational runbook: `RUNBOOK.md`
-
-## Security and Release Integrity
-
-- Fail-closed policy behavior and deterministic terminal modes.
-- CI security checks (audit, secret scanning, SBOM, Trivy).
-- Release provenance and attestation verification in release workflow.
-- Artifact provenance policy: `docs/standards/ARTIFACT_PROVENANCE_POLICY.md`
-
-## Operator Troubleshooting (CI/Perf/Release)
-
-| Symptom | Inspect first | Operator action |
-|---|---|---|
-| Perf gate fails in CI | `artifacts/perf/perf_failure_reasons.json`, `artifacts/perf/benchmark_matrix.md` | Re-run `scripts/perf/suite7.sh` locally, compare against `perf/baselines/suite7_baseline.summary.json`, and review `failed_checks`/`failure_reasons` artifacts. |
-| Release publish fails while fetching artifacts | Release job step `Fetch release artifacts with retry/backoff and validate checksums` | Re-run release via `workflow_dispatch` using `mode=republish`, `tag=<release-tag>`, and `source_run_id=<previous-run-id>`. |
-| Release attestation verification fails | `scripts/security/verify_release_attestations.py` output in release logs | Re-run dispatch with correct `source_ref` for the artifact-producing run (for tag-triggered runs, use `refs/tags/<tag>`). |
-| Post-release smoke check fails | `scripts/security/release_smoke_check.py` logs | Verify `release/SHA256SUMS.txt`, `release/image-digests.txt`, and GH release assets; then republish from existing artifacts after correcting manifest/asset mismatch. |
-| Terminal-mode assertions are noisy | `perf/config/suite7_expectations.v1.json` + Suite7 env in CI | Keep mode assertions opt-in (`SUITE7_ENFORCE_TERMINAL_MODE_ASSERTIONS=0` by default) and only enable when validating mode-specific behavior. |
+This repo also keeps the real-backend promotion gate separate from binary release publication. That keeps the shipped open-source release honest even while the secret-backed real-backend lane is still being proven operationally.
 
 ## Repository Layout
 
-- `crates/controller`: non-privileged orchestration and budget scheduler
-- `crates/gateway`: privileged policy enforcement, adapters, evidence emission
-- `crates/contracts`: schemas, canonicalization, hashing helpers
-- `crates/ledger`: append-only ledger and migrations
-- `crates/auth`: local and OIDC auth helpers
-- `crates/e2e_smoke`: release-gating adversarial and smoke suites
-- `opa/bundle`: OPA policy bundle
-- `scripts`: CI, replay/eval, perf/fault, and security tooling
-- `vendor/rlm`: vendored upstream RLM integration source
-- `RLM_FIRST_MIGRATION_PLAN.md`: phased roadmap to make PECR RLM-first
+- `crates/`: Rust workspace crates, including controller, gateway, contracts, policy, adapters, boundary-check, and e2e smoke
+- `db/init/`: Postgres bootstrap schema
+- `docker/` and `docker-compose.yml`: local stack wiring
+- `fixtures/`: deterministic corpora, named usefulness scenarios, and replay fixtures
+- `opa/`: policy assets
+- `perf/`: baseline summaries and expectations
+- `scripts/`: CI, replay, perf, demo, security, and release tooling
+- `vendor/rlm/`: vendored RLM runtime
+- `docs/`: architecture, observability, standards, and API documentation
 
 ## Development
 
+Main verification commands:
+
 ```bash
-cargo fmt --all
+docker compose up -d --build
+cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace --exclude e2e_smoke
-PECR_TEST_DB_URL=postgres://pecr:pecr@localhost:55432/pecr cargo test -p e2e_smoke
-bash scripts/verify.sh
-pwsh -File scripts/verify.ps1
+cargo test -p e2e_smoke
+cargo run -p pecr-boundary-check
+bash scripts/ci.sh
+bash scripts/perf/suite7.sh
 ```
 
 ## Docs Index
 
-- Architecture:
-  - `docs/architecture/controller_state_machine.md`
-  - `docs/architecture/request_path_blocking_audit.md`
-  - `docs/architecture/invariants.md`
-  - `docs/architecture/rlm_runtime_envelope.md`
-  - `RLM_FIRST_MIGRATION_PLAN.md`
-- Runbook:
-  - `RUNBOOK.md`
-  - `docs/observability/baselines.md`
-- Replay/Eval:
-  - `scripts/replay/replay_eval_cli.py`
-  - `scripts/replay/regression_gate.py`
-  - `docs/standards/REPLAY_PERSISTENCE_MODEL.md`
-  - `docs/standards/EVALUATION_DATA_LIFECYCLE.md`
-- Client integration:
-  - `docs/client_integration.md`
-  - `docs/openapi/pecr.v1.yaml`
-- Release:
-  - `.github/workflows/release.yml`
-  - `scripts/security/verify_release_attestations.py`
-  - `scripts/security/release_smoke_check.py`
-  - `docs/standards/ARTIFACT_PROVENANCE_POLICY.md`
-- Operability and quality:
-  - `RUNBOOK.md`
-  - `docs/observability/README.md`
-  - `docs/enterprise/QUALITY_GUARDRAILS.md`
+- Product principles: `PRODUCT_PRINCIPLES.md`
+- Migration status: `RLM_FIRST_MIGRATION_PLAN.md`
+- Runbook: `RUNBOOK.md`
+- Client-facing behavior: `docs/client_integration.md`
+- OpenAPI contract: `docs/openapi/pecr.v1.yaml`
+- RLM runtime envelope: `docs/architecture/rlm_runtime_envelope.md`
+- Useful benchmark definition: `docs/useful_benchmark.md`
+- Real-backend operations: `docs/observability/rlm_real_backend_operations.md`
