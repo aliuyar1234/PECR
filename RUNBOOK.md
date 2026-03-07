@@ -68,6 +68,10 @@ CI also enforces RLM verification via `scripts/rlm/verify_vendor_rlm.py` inside 
   - collect at least 10 consecutive green `ci` runs on the same rollout posture
   - those runs must keep usefulness integration, perf, e2e smoke, and contract lanes green
   - use `gh run list -w ci --branch master --limit 20` to verify the streak
+- Latest verified streak:
+  - Date: `2026-03-07`
+  - Commit: `c723d8d234bf0d9eeda5766d2c08ac95c89657a7`
+  - Runs: `22804181871`, `22804184647`, `22804185384`, `22804186066`, `22804186829`, `22804187671`, `22804188428`, `22804189241`, `22804190277`, `22804191241`
 
 ## Service endpoints (docker compose)
 

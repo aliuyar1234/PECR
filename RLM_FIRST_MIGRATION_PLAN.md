@@ -188,13 +188,15 @@ Gate before Phase 5:
 
 - [x] Fresh installs and local demos use RLM by default.
 - [x] Shadow baseline remains available as a regression detector.
-- [ ] At least 10 consecutive nightly or pre-release runs are green for usefulness, perf, e2e smoke, and contract lanes.
+- [x] At least 10 consecutive nightly or pre-release runs are green for usefulness, perf, e2e smoke, and contract lanes.
 - [x] Rollback and auto-fallback controls are documented and tested.
 
 Implementation note:
 
 - Phase 4 implementation work is complete in-repo.
-- Promotion into Phase 5 still waits on the time-based rollout evidence gate above; do not skip that requirement.
+- The rollout evidence gate was satisfied on `2026-03-07` by 10 consecutive green `ci` runs on commit `c723d8d234bf0d9eeda5766d2c08ac95c89657a7`.
+- Recorded run IDs: `22804181871`, `22804184647`, `22804185384`, `22804186066`, `22804186829`, `22804187671`, `22804188428`, `22804189241`, `22804190277`, `22804191241`.
+- Phase 5 may proceed.
 
 ## Phase 5: Simplify The Repo Around The RLM-First Product
 
