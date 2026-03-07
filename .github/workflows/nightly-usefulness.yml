@@ -78,8 +78,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p artifacts
           cd beam/pecr_planner
-          mix test
+          mix test 2>&1 | tee ../../artifacts/beam_shadow_mix_test.log
 
       - name: Start BEAM shadow planner bridge
         if: matrix.engine_mode == 'beam_shadow' || matrix.engine_mode == 'beam_planner'

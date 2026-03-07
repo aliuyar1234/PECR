@@ -21,7 +21,10 @@ defmodule PecrPlanner.Paths do
   end
 
   def resolve_repo_path(path, _default_relative_path) when is_binary(path) do
-    expanded = Path.expand(path, @repo_root)
+    expanded =
+      path
+      |> String.replace("\\", "/")
+      |> Path.expand(@repo_root)
 
     if within_root?(expanded, @repo_root) do
       {:ok, expanded}
