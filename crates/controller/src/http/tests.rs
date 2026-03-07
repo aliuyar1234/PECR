@@ -2329,6 +2329,123 @@ sys.stdout.flush()
     assert!(response.0.response_text.contains("SUPPORTED:"));
 }
 
+#[cfg(feature = "rlm")]
+#[tokio::test]
+async fn run_rlm_smoke_query_with_unknown_placeholder_stays_insufficient_evidence() {
+    let _env_lock = RLM_SCRIPT_ENV_LOCK
+        .lock()
+        .expect("rlm script env lock should not be poisoned");
+    let script_path = write_temp_bridge_script(
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+start = json.loads(sys.stdin.readline())
+if start.get("type") != "start":
+    raise SystemExit("expected start")
+
+sys.stdout.write(json.dumps({"type": "start_ack", "protocol_version": 1}) + "\n")
+sys.stdout.flush()
+
+call_id = "call-fetch-rows"
+sys.stdout.write(json.dumps({
+    "type": "call_operator",
+    "id": call_id,
+    "depth": 0,
+    "op_name": "fetch_rows",
+    "params": {
+        "view_id": "safe_customer_view_public",
+        "filter_spec": {"customer_id": "cust_public_1"},
+        "fields": ["status", "plan_tier"]
+    }
+}) + "\n")
+sys.stdout.flush()
+
+result = json.loads(sys.stdin.readline())
+if result.get("type") != "operator_result" or result.get("id") != call_id:
+    raise SystemExit("expected operator_result for fetch_rows")
+
+sys.stdout.write(json.dumps({
+    "type": "done",
+    "final_answer": "UNKNOWN: insufficient evidence to answer the query."
+}) + "\n")
+sys.stdout.flush()
+"#,
+    );
+
+    let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+    // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+    unsafe {
+        std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+    }
+
+    let budget = Budget {
+        max_operator_calls: 10,
+        max_bytes: 1024 * 1024,
+        max_wallclock_ms: 10_000,
+        max_recursion_depth: 10,
+        max_parallelism: Some(2),
+    };
+    let (gateway_addr, shutdown, task) = spawn_run_gateway().await;
+    let mut state = controller_state(
+        gateway_addr,
+        budget.clone(),
+        crate::config::default_baseline_plan(),
+    );
+    state.config.controller_engine = crate::config::ControllerEngine::Rlm;
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-pecr-principal-id", HeaderValue::from_static("dev"));
+    headers.insert(
+        "x-pecr-request-id",
+        HeaderValue::from_static("req-rlm-smoke"),
+    );
+    headers.insert(
+        "x-pecr-trace-id",
+        HeaderValue::from_static("trace-rlm-smoke"),
+    );
+
+    let response = run(
+        State(state),
+        headers,
+        Json(RunRequest {
+            query: "smoke".to_string(),
+            budget: None,
+        }),
+    )
+    .await
+    .expect("run should succeed");
+
+    shutdown.send(()).ok();
+    let _ = task.await;
+    if let Some(previous) = previous_script_path {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+        }
+    } else {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+        }
+    }
+    let _ = fs::remove_file(&script_path);
+
+    assert_eq!(response.0.terminal_mode, TerminalMode::InsufficientEvidence);
+    assert_eq!(
+        response.0.response_text,
+        "UNKNOWN: insufficient evidence to answer the query."
+    );
+    assert!(
+        response
+            .0
+            .claim_map
+            .claims
+            .iter()
+            .all(|claim| claim.status != ClaimStatus::Supported)
+    );
+}
+
 #[test]
 fn run_request_rejects_unknown_fields() {
     let err = serde_json::from_value::<RunRequest>(serde_json::json!({

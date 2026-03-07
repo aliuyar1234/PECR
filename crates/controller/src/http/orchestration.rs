@@ -439,7 +439,7 @@ fn query_has_any_token(tokens: &[String], candidates: &[&str]) -> bool {
         .any(|candidate| tokens.iter().any(|token| token == candidate))
 }
 
-fn semantic_query_tokens(query: &str) -> Vec<String> {
+pub(super) fn semantic_query_tokens(query: &str) -> Vec<String> {
     query_tokens(query)
         .into_iter()
         .filter(|token| {
@@ -4103,9 +4103,6 @@ pub(super) async fn run_context_loop_rlm(
 
     let stop_reason = stop_reason.unwrap_or("unknown");
     crate::metrics::observe_budget_stop_reason(stop_reason);
-    if !budget_violation && stop_reason == "rlm_done" && !evidence_units.is_empty() {
-        terminal_mode = TerminalMode::Supported;
-    }
     if response_text.is_none() && terminal_mode == TerminalMode::Supported {
         response_text = render_operator_summaries_response_text(&operator_summaries);
     }

@@ -9,6 +9,7 @@ use ulid::Ulid;
 
 use super::orchestration::{
     ambiguity_guidance_for_query, clarification_prompt_for_query, decompose_query_clauses,
+    semantic_query_tokens,
 };
 
 pub(super) struct FinalizeOutput {
@@ -40,9 +41,20 @@ pub(super) fn build_finalize_output(
         .as_deref()
         .map(str::trim)
         .filter(|text| !text.is_empty());
+    let evidence_matches_query = evidence_meaningfully_matches_query(query, &ranked_evidence_units);
+    let loop_response_has_only_non_supported_claims =
+        trimmed_loop_response_text.is_some_and(response_text_has_only_non_supported_claims);
     let effective_terminal_mode = match loop_terminal_mode {
-        TerminalMode::InsufficientEvidence if !supported_evidence_unit_ids.is_empty() => {
+        TerminalMode::InsufficientEvidence
+            if evidence_matches_query && !supported_evidence_unit_ids.is_empty() =>
+        {
             TerminalMode::Supported
+        }
+        TerminalMode::Supported
+            if loop_response_has_only_non_supported_claims
+                && (!evidence_matches_query || supported_evidence_unit_ids.is_empty()) =>
+        {
+            TerminalMode::InsufficientEvidence
         }
         _ => loop_terminal_mode,
     };
@@ -51,6 +63,7 @@ pub(super) fn build_finalize_output(
             effective_terminal_mode,
             text,
             &supported_evidence_unit_ids,
+            evidence_matches_query,
         )
     });
 
@@ -140,7 +153,9 @@ fn synthesize_partial_finalize_output(
     loop_response_text: Option<&str>,
     evidence_units: &[&EvidenceUnit],
 ) -> Option<FinalizeOutput> {
-    if loop_terminal_mode != TerminalMode::InsufficientEvidence {
+    if loop_terminal_mode != TerminalMode::InsufficientEvidence
+        || !evidence_meaningfully_matches_query(query, evidence_units)
+    {
         return None;
     }
 
@@ -1310,12 +1325,34 @@ fn contains_explicit_claim_labels(text: &str) -> bool {
     })
 }
 
+fn response_text_has_only_non_supported_claims(response_text: &str) -> bool {
+    contains_explicit_claim_labels(response_text)
+        && extract_atomic_claims(response_text)
+            .into_iter()
+            .all(|(status, _)| status != ClaimStatus::Supported)
+}
+
+fn evidence_meaningfully_matches_query(query: &str, evidence_units: &[&EvidenceUnit]) -> bool {
+    let query_tokens = semantic_query_tokens(query)
+        .into_iter()
+        .collect::<BTreeSet<_>>();
+    if query_tokens.is_empty() {
+        return false;
+    }
+
+    evidence_units
+        .iter()
+        .any(|unit| token_overlap_score(&query_tokens, &describe_evidence_unit(query, unit)) > 0)
+}
+
 fn should_synthesize_supported_from_evidence(
     terminal_mode: TerminalMode,
     response_text: &str,
     supported_evidence_unit_ids: &[String],
+    evidence_matches_query: bool,
 ) -> bool {
     terminal_mode == TerminalMode::Supported
+        && evidence_matches_query
         && !supported_evidence_unit_ids.is_empty()
         && contains_explicit_claim_labels(response_text)
         && extract_atomic_claims(response_text)
@@ -1900,6 +1937,40 @@ mod tests {
             "supported evidence-backed claims should be synthesized from the retrieved evidence"
         );
         assert!(out.response_text.contains("SUPPORTED:"));
+    }
+
+    #[test]
+    fn build_finalize_output_demotes_placeholder_supported_mode_without_query_match() {
+        let evidence_units = vec![sample_evidence_unit(
+            "f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0f0",
+            serde_json::json!({
+                "status": "active",
+                "plan_tier": "starter"
+            }),
+            EvidenceContentType::ApplicationJson,
+        )];
+
+        let out = build_finalize_output(
+            "smoke",
+            TerminalMode::Supported,
+            Some("UNKNOWN: insufficient evidence to answer the query.".to_string()),
+            &evidence_units,
+        );
+
+        assert_eq!(
+            out.claim_map.terminal_mode,
+            TerminalMode::InsufficientEvidence
+        );
+        assert_eq!(
+            out.response_text,
+            "UNKNOWN: insufficient evidence to answer the query."
+        );
+        assert!(
+            out.claim_map
+                .claims
+                .iter()
+                .all(|claim| claim.status != ClaimStatus::Supported)
+        );
     }
 
     #[test]
