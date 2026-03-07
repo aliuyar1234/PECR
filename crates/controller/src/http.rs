@@ -140,6 +140,15 @@ struct FinalizedRunArtifacts {
     persisted_run: PersistedRun,
 }
 
+struct FinalizeRunContext<'a> {
+    principal_id: &'a str,
+    query: &'a str,
+    budget: &'a Budget,
+    engine_mode: ControllerEngine,
+    session_id: &'a str,
+    policy_snapshot_id: &'a str,
+}
+
 async fn capabilities(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -308,12 +317,14 @@ async fn run(
         let finalized = finalize_run_result(
             &state,
             ctx,
-            &principal_id,
-            &query,
-            &budget,
-            state.config.controller_engine,
-            &session.session.session_id,
-            &session.session.policy_snapshot_id,
+            FinalizeRunContext {
+                principal_id: &principal_id,
+                query: &query,
+                budget: &budget,
+                engine_mode: state.config.controller_engine,
+                session_id: &session.session.session_id,
+                policy_snapshot_id: &session.session.policy_snapshot_id,
+            },
             loop_result,
         )
         .await?;
@@ -687,12 +698,14 @@ async fn run_baseline_shadow_run(
     let finalized = match finalize_run_result(
         &state,
         ctx,
-        &principal_id,
-        &query,
-        &budget,
-        ControllerEngine::Baseline,
-        &created_session.session.session_id,
-        &created_session.session.policy_snapshot_id,
+        FinalizeRunContext {
+            principal_id: &principal_id,
+            query: &query,
+            budget: &budget,
+            engine_mode: ControllerEngine::Baseline,
+            session_id: &created_session.session.session_id,
+            policy_snapshot_id: &created_session.session.policy_snapshot_id,
+        },
         loop_result,
     )
     .await
@@ -717,12 +730,7 @@ async fn run_baseline_shadow_run(
 async fn finalize_run_result(
     state: &AppState,
     ctx: GatewayCallContext<'_>,
-    principal_id: &str,
-    query: &str,
-    budget: &Budget,
-    engine_mode: ControllerEngine,
-    session_id: &str,
-    policy_snapshot_id: &str,
+    finalize_ctx: FinalizeRunContext<'_>,
     loop_result: ContextLoopResult,
 ) -> Result<FinalizedRunArtifacts, ApiError> {
     let loop_terminal_mode = loop_result.terminal_mode;
@@ -744,7 +752,7 @@ async fn finalize_run_result(
         "finalize.compile",
         trace_id = %ctx.trace_id,
         request_id = %ctx.request_id,
-        session_id = %session_id,
+        session_id = %finalize_ctx.session_id,
         terminal_mode = %loop_result.terminal_mode.as_str(),
         latency_ms = tracing::field::Empty,
         outcome = tracing::field::Empty,
@@ -754,7 +762,7 @@ async fn finalize_run_result(
         let finalize_started = Instant::now();
 
         let finalized_output = build_finalize_output(
-            query,
+            finalize_ctx.query,
             loop_terminal_mode,
             loop_result.response_text.clone(),
             &loop_result.evidence_units,
@@ -804,12 +812,12 @@ async fn finalize_run_result(
         persisted_run: PersistedRun {
             trace_id: finalized.trace_id,
             request_id: ctx.request_id.to_string(),
-            principal_id: principal_id.to_string(),
-            engine_mode,
-            query: query.to_string(),
-            budget: budget.clone(),
-            session_id: session_id.to_string(),
-            policy_snapshot_id: policy_snapshot_id.to_string(),
+            principal_id: finalize_ctx.principal_id.to_string(),
+            engine_mode: finalize_ctx.engine_mode,
+            query: finalize_ctx.query.to_string(),
+            budget: finalize_ctx.budget.clone(),
+            session_id: finalize_ctx.session_id.to_string(),
+            policy_snapshot_id: finalize_ctx.policy_snapshot_id.to_string(),
             loop_terminal_mode,
             loop_response_text,
             terminal_mode: run_response.terminal_mode,
