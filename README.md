@@ -44,60 +44,72 @@ This is not "raw long-context plus hope." Retrieval still matters. Policy still 
 
 ```mermaid
 flowchart LR
-    Client["Client / Agent UI"]
+    classDef edge fill:#ffffff,stroke:#0f172a,stroke-width:1.2px,color:#0f172a;
+    classDef control fill:#eef4ff,stroke:#1d4ed8,stroke-width:1.4px,color:#0f172a;
+    classDef governance fill:#ecfdf3,stroke:#059669,stroke-width:1.4px,color:#0f172a;
+    classDef storage fill:#fff7ed,stroke:#ea580c,stroke-width:1.4px,color:#0f172a;
+    classDef ops fill:#f5f3ff,stroke:#7c3aed,stroke-width:1.4px,color:#0f172a;
 
-    subgraph AIPlane["AI Execution Plane - Non Privileged"]
-      Controller["PECR Controller API"]
-      Baseline["Baseline Shadow / Reference Loop"]
-      RLM["RLM Planner Bridge (vendored upstream rlm)"]
-      Scheduler["Budget Scheduler + Batch Executor"]
-      Replay["Replay Store + Evaluation APIs"]
+    Client["Client or Agent UI"]
+
+    subgraph AI["AI Execution Plane - Non-Privileged"]
+      Controller["Controller API"]
+      RLM["RLM Planner Bridge"]
+      Baseline["Baseline Reference Lane"]
+      Scheduler["Budget Scheduler and Batch Executor"]
+      Replay["Replay Store and Evaluation APIs"]
     end
 
-    subgraph Governance["Policy + Evidence Plane - Privileged"]
-      Gateway["PECR Gateway"]
+    subgraph GOV["Governance Plane - Privileged"]
+      Gateway["Gateway"]
       OPA["OPA Policy Engine"]
-      Evidence["Redaction + Evidence Builder"]
-      Finalize["Claim-Evidence Finalize Gate"]
+      Evidence["Evidence and Redaction"]
+      Finalize["Finalize Gate"]
       Ledger["Append-Only Ledger"]
     end
 
-    subgraph SoR["Systems of Record"]
+    subgraph DATA["Systems of Record"]
       FS["Filesystem Corpus"]
-      PG["PostgreSQL Safe Views"]
-      EXT["External Sources / Adapters"]
+      PG["Postgres Safe Views"]
+      EXT["External Adapters"]
     end
 
-    subgraph Ops["Quality + Operability"]
-      Eval["Replay Regression + Scorecards"]
-      Canary["Canary + Auto-Fallback"]
-      Obs["Metrics + Traces + SLO Dashboards"]
+    subgraph OPS["Quality and Operability"]
+      Eval["Replay Regression and Scorecards"]
+      Canary["Canary and Auto-Fallback"]
+      Obs["Metrics, Traces, and SLOs"]
     end
 
-    Client -->|POST /v1/run| Controller
-    Controller -->|shadow/reference lane| Baseline
-    Controller -->|primary reasoning path| RLM
-    Baseline --> Scheduler
-    RLM -->|plan, replan, batch, recover| Scheduler
+    Client -->|"POST /v1/run"| Controller
+    Controller -->|"primary reasoning"| RLM
+    Controller -.->|"shadow or rollback"| Baseline
+    RLM -->|"plan, replan, batch, recover"| Scheduler
+    Baseline -->|"reference execution"| Scheduler
 
-    Scheduler -->|typed operator calls| Gateway
-    Gateway -->|authz decisions| OPA
-    Gateway --> Evidence
-    Evidence --> Finalize
-    Finalize -->|deterministic terminal mode| Controller
+    Scheduler -->|"typed operators"| Gateway
+    Gateway -->|"authz"| OPA
+    Gateway -->|"evidence units"| Evidence
+    Evidence -->|"claim coverage"| Finalize
+    Finalize -->|"terminal mode"| Controller
 
-    Gateway -->|policy-scoped reads| FS
-    Gateway -->|policy-scoped reads| PG
-    Gateway -->|policy-scoped reads| EXT
-    Gateway -->|append-only audit events| Ledger
+    Gateway -->|"policy-scoped reads"| FS
+    Gateway -->|"policy-scoped reads"| PG
+    Gateway -->|"policy-scoped reads"| EXT
+    Gateway -->|"audit events"| Ledger
 
-    Controller -->|persist run artifacts| Replay
+    Controller -->|"persist run artifacts"| Replay
     Replay --> Eval
     Eval --> Canary
-    Canary -->|runtime control knobs| Controller
+    Canary -->|"runtime controls"| Controller
 
     Controller --> Obs
     Gateway --> Obs
+
+    class Client edge;
+    class Controller,RLM,Baseline,Scheduler,Replay control;
+    class Gateway,OPA,Evidence,Finalize,Ledger governance;
+    class FS,PG,EXT storage;
+    class Eval,Canary,Obs ops;
 ```
 
 Controller code never reads source systems directly. The gateway remains the only privileged data-access boundary.
