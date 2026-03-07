@@ -11,6 +11,9 @@ pub struct ControllerConfig {
     pub bind_addr: SocketAddr,
     pub gateway_url: String,
     pub controller_engine: ControllerEngine,
+    pub rlm_default_enabled: bool,
+    pub rlm_auto_fallback_to_baseline: bool,
+    pub baseline_shadow_percent: u8,
     pub model_provider: ModelProvider,
     pub rlm_script_path: Option<String>,
     pub budget_defaults: Budget,
@@ -171,7 +174,16 @@ impl ControllerConfig {
         }
 
         let gateway_url = require_nonempty(kv, "PECR_GATEWAY_URL")?;
-        let controller_engine = parse_controller_engine(kv.get("PECR_CONTROLLER_ENGINE"))?;
+        let rlm_default_enabled = parse_bool(kv.get("PECR_RLM_DEFAULT_ENABLED")).unwrap_or(false);
+        let controller_engine =
+            parse_controller_engine(kv.get("PECR_CONTROLLER_ENGINE"), rlm_default_enabled)?;
+        let rlm_auto_fallback_to_baseline =
+            parse_bool(kv.get("PECR_RLM_AUTO_FALLBACK_TO_BASELINE")).unwrap_or(true);
+        let baseline_shadow_percent = parse_u8_percentage(
+            kv.get("PECR_BASELINE_SHADOW_PERCENT"),
+            0,
+            "PECR_BASELINE_SHADOW_PERCENT",
+        )?;
 
         #[cfg(not(feature = "rlm"))]
         if controller_engine == ControllerEngine::Rlm {
@@ -327,6 +339,9 @@ impl ControllerConfig {
             bind_addr,
             gateway_url,
             controller_engine,
+            rlm_default_enabled,
+            rlm_auto_fallback_to_baseline,
+            baseline_shadow_percent,
             model_provider,
             rlm_script_path,
             budget_defaults,
@@ -469,6 +484,30 @@ fn parse_usize(
             code: "ERR_INVALID_CONFIG",
             message: format!("{} must be an integer", key),
         }),
+    }
+}
+
+fn parse_u8_percentage(
+    value: Option<&String>,
+    default: u8,
+    key: &'static str,
+) -> Result<u8, StartupError> {
+    match value {
+        None => Ok(default),
+        Some(v) if v.trim().is_empty() => Ok(default),
+        Some(v) => {
+            let parsed = v.parse::<u8>().map_err(|_| StartupError {
+                code: "ERR_INVALID_CONFIG",
+                message: format!("{} must be an integer between 0 and 100", key),
+            })?;
+            if parsed > 100 {
+                return Err(StartupError {
+                    code: "ERR_INVALID_CONFIG",
+                    message: format!("{} must be an integer between 0 and 100", key),
+                });
+            }
+            Ok(parsed)
+        }
     }
 }
 
@@ -678,11 +717,14 @@ fn parse_planner_client_kind(value: Option<&String>) -> Result<PlannerClientKind
     }
 }
 
-fn parse_controller_engine(value: Option<&String>) -> Result<ControllerEngine, StartupError> {
+fn parse_controller_engine(
+    value: Option<&String>,
+    rlm_default_enabled: bool,
+) -> Result<ControllerEngine, StartupError> {
     let engine = value
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
-        .unwrap_or("baseline");
+        .unwrap_or(if rlm_default_enabled { "rlm" } else { "baseline" });
 
     match engine {
         "baseline" => Ok(ControllerEngine::Baseline),
@@ -937,10 +979,23 @@ mod tests {
         assert!(cfg.adaptive_parallelism_enabled);
         assert!(cfg.batch_mode_enabled);
         assert!(cfg.operator_concurrency_policies.is_empty());
+        assert!(!cfg.rlm_default_enabled);
+        assert!(cfg.rlm_auto_fallback_to_baseline);
+        assert_eq!(cfg.baseline_shadow_percent, 0);
         assert_eq!(cfg.context_budget, ContextBudget::default());
         assert_eq!(cfg.replay_store_dir, "target/replay");
         assert_eq!(cfg.replay_retention_days, 30);
         assert_eq!(cfg.replay_list_limit, 200);
+    }
+
+    #[test]
+    fn explicit_engine_overrides_rlm_default_flag() {
+        let mut env = minimal_ok_env();
+        env.insert("PECR_RLM_DEFAULT_ENABLED".to_string(), "1".to_string());
+        env.insert("PECR_CONTROLLER_ENGINE".to_string(), "baseline".to_string());
+
+        let cfg = ControllerConfig::from_kv(&env).expect("config should load");
+        assert_eq!(cfg.controller_engine, ControllerEngine::Baseline);
     }
 
     #[test]
@@ -1063,6 +1118,16 @@ mod tests {
     #[test]
     fn runtime_flags_and_operator_policy_parse_from_env() {
         let mut env = minimal_ok_env();
+        env.insert("PECR_RLM_DEFAULT_ENABLED".to_string(), "1".to_string());
+        env.insert("PECR_RLM_SANDBOX_ACK".to_string(), "1".to_string());
+        env.insert(
+            "PECR_RLM_AUTO_FALLBACK_TO_BASELINE".to_string(),
+            "0".to_string(),
+        );
+        env.insert(
+            "PECR_BASELINE_SHADOW_PERCENT".to_string(),
+            "25".to_string(),
+        );
         env.insert(
             "PECR_CONTROLLER_ADAPTIVE_PARALLELISM_ENABLED".to_string(),
             "0".to_string(),
@@ -1081,6 +1146,9 @@ mod tests {
         );
 
         let cfg = ControllerConfig::from_kv(&env).expect("config should load");
+        assert!(cfg.rlm_default_enabled);
+        assert!(!cfg.rlm_auto_fallback_to_baseline);
+        assert_eq!(cfg.baseline_shadow_percent, 25);
         assert!(!cfg.adaptive_parallelism_enabled);
         assert!(!cfg.batch_mode_enabled);
 
@@ -1153,6 +1221,19 @@ mod tests {
     }
 
     #[test]
+    fn baseline_shadow_percent_rejects_out_of_range_values() {
+        let mut env = minimal_ok_env();
+        env.insert(
+            "PECR_BASELINE_SHADOW_PERCENT".to_string(),
+            "101".to_string(),
+        );
+
+        let err =
+            ControllerConfig::from_kv(&env).expect_err("config must reject shadow percent > 100");
+        assert_eq!(err.code, "ERR_INVALID_CONFIG");
+    }
+
+    #[test]
     fn replay_list_limit_requires_positive_value() {
         let mut env = minimal_ok_env();
         env.insert("PECR_REPLAY_LIST_LIMIT".to_string(), "0".to_string());
@@ -1170,6 +1251,15 @@ mod tests {
         assert_eq!(err.code, "ERR_RLM_FEATURE_DISABLED");
     }
 
+    #[cfg(not(feature = "rlm"))]
+    #[test]
+    fn rlm_default_flag_requires_feature_flag() {
+        let mut env = minimal_ok_env();
+        env.insert("PECR_RLM_DEFAULT_ENABLED".to_string(), "1".to_string());
+        let err = ControllerConfig::from_kv(&env).unwrap_err();
+        assert_eq!(err.code, "ERR_RLM_FEATURE_DISABLED");
+    }
+
     #[cfg(feature = "rlm")]
     #[test]
     fn rlm_engine_requires_sandbox_ack() {
@@ -1177,5 +1267,16 @@ mod tests {
         env.insert("PECR_CONTROLLER_ENGINE".to_string(), "rlm".to_string());
         let err = ControllerConfig::from_kv(&env).unwrap_err();
         assert_eq!(err.code, "ERR_RLM_REQUIRES_SANDBOX_ACK");
+    }
+
+    #[cfg(feature = "rlm")]
+    #[test]
+    fn rlm_default_flag_uses_rlm_engine_when_unset() {
+        let mut env = minimal_ok_env();
+        env.insert("PECR_RLM_DEFAULT_ENABLED".to_string(), "1".to_string());
+        env.insert("PECR_RLM_SANDBOX_ACK".to_string(), "1".to_string());
+
+        let cfg = ControllerConfig::from_kv(&env).expect("config should load");
+        assert_eq!(cfg.controller_engine, ControllerEngine::Rlm);
     }
 }

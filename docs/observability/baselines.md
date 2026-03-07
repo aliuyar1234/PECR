@@ -43,6 +43,22 @@ Before `rlm` becomes the default path, shadow delta versus baseline should be no
 - citation-quality regression on supported answers after long-context packing changes.
 - shadow delta regression where RLM drops below baseline on the named benchmark set.
 
+## Phase 4 Rollout Views
+
+When RLM is the default product path, operators should have one place to answer these questions quickly:
+
+- Is the RLM bridge healthy, or are protocol/runtime failures forcing baseline auto-fallback?
+- Is planning quality degrading even when latency still looks acceptable?
+- Is finalize downgrading promising runs more often than it did on the last healthy baseline?
+- Is sampled baseline shadow comparison showing that RLM still beats or at least matches the reference lane?
+
+The minimum Phase 4 dashboard and alert posture should therefore cover:
+
+- bridge health and `SOURCE_UNAVAILABLE` drift on `/v1/run`
+- tool-planning quality signals such as fallback recovery rate and budget stop-reason mix
+- finalize downgrade drift and citation-quality regression
+- baseline-shadow delta from nightly usefulness or replay evaluation artifacts
+
 ## Operator Runbook Expectations
 
 - Replay-store failures:

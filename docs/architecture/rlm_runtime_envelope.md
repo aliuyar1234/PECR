@@ -12,9 +12,10 @@ As of March 7, 2026:
 - `PECR_CONTROLLER_ENGINE=rlm` exists.
 - the controller can run the Python bridge in `scripts/rlm/pecr_rlm_bridge.py`.
 - the bridge now supports `PECR_RLM_BACKEND=mock` and an initial opt-in `PECR_RLM_BACKEND=openai` seam.
+- local compose now defaults into the RLM controller path with `PECR_RLM_DEFAULT_ENABLED=1`, `PECR_RLM_SANDBOX_ACK=1`, and baseline auto-fallback enabled.
 - controller startup still refuses `PECR_MODEL_PROVIDER=external`.
 
-So the repository now has an initial real-backend bridge seam, but it is not yet the default runtime and should not be treated as rollout-complete.
+So the repository now defaults into an RLM-first controller posture, but the real remote backend seam is still opt-in and should not be treated as rollout-complete.
 
 ## Phase 0 Decision
 
@@ -23,7 +24,7 @@ The first supported real RLM backend envelope should be:
 - one primary remote model backend
 - one primary model family/configuration per environment
 - bridge-configured, not request-configured
-- opt-in during migration, not enabled by default in local compose
+- local compose defaults into the RLM path with the mock backend; the real remote backend remains opt-in during migration
 - isolated to the controller/RLM bridge path only
 
 In practice, that means:
@@ -64,8 +65,8 @@ For the first rollout:
 
 - keep `PECR_MODEL_PROVIDER=mock` as the controller default until Rust-native external-provider support actually exists
 - configure the real RLM backend at the bridge/runtime layer, not through the current controller model-provider switch
-- keep `PECR_CONTROLLER_ENGINE=baseline` as the default local compose setting until Phase 4 rollout gates are met
-- require explicit opt-in for the real RLM path in local development, CI, and pre-release environments
+- local compose may default into `rlm` as long as the bridge backend stays `mock` and rollback controls remain enabled
+- require explicit opt-in only for the real remote-backend path in local development, CI, and pre-release environments
 
 Current opt-in bridge envs for the initial seam:
 
@@ -82,15 +83,15 @@ The first supported backend envelope should behave differently by environment:
 
 ### Local default
 
-- baseline plus mock remains the zero-setup developer path
+- RLM plus the mock bridge backend is now the zero-setup developer path
 - local compose should continue to boot without model credentials
 - usefulness demos should still work without external model access
 
-### Local RLM integration
+### Local real-backend RLM integration
 
 - explicit opt-in
 - controller built with `--features rlm`
-- `PECR_CONTROLLER_ENGINE=rlm`
+- `PECR_CONTROLLER_ENGINE=rlm` or `PECR_RLM_DEFAULT_ENABLED=1`
 - `PECR_RLM_SANDBOX_ACK=1`
 - `PECR_RLM_BACKEND=openai`
 - `PECR_RLM_MODEL_NAME=<model>`

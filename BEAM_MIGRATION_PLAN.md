@@ -2,6 +2,12 @@
 
 Goal: make PECR a more useful, resilient, and maintainable product without weakening its trust boundaries, replay guarantees, or evidence model.
 
+Phase 4 RLM-first decision:
+
+- BEAM remains an internal experiment and reference lane only.
+- Scheduled product-facing usefulness lanes now center `baseline` and `rlm`.
+- BEAM usefulness and planner-comparison lanes should run only through explicit manual workflows or focused experiments.
+
 ## Recommendation
 
 Do not rewrite PECR wholesale into Elixir, Gleam, or Erlang.

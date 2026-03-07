@@ -4,43 +4,57 @@ on:
   schedule:
     - cron: "0 2 * * *"
   workflow_dispatch:
+    inputs:
+      include_beam_experiments:
+        description: Include BEAM experiment lanes
+        type: boolean
+        default: false
 
 jobs:
   nightly_usefulness:
     name: usefulness-${{ matrix.engine_mode }}
+    if: ${{ !matrix.beam_experiment || (github.event_name == 'workflow_dispatch' && (inputs.include_beam_experiments == true || inputs.include_beam_experiments == 'true')) }}
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         include:
           - engine_mode: baseline
+            beam_experiment: false
             cargo_features: ""
             controller_engine: baseline
             report_engine_mode: baseline
             planner_mode: rust_owned
             planner_client: disabled
             planner_url: ""
+            baseline_shadow_percent: "0"
           - engine_mode: rlm
+            beam_experiment: false
             cargo_features: "pecr-controller/rlm"
             controller_engine: rlm
             report_engine_mode: rlm
             planner_mode: rust_owned
             planner_client: disabled
             planner_url: ""
+            baseline_shadow_percent: "100"
           - engine_mode: beam_planner
+            beam_experiment: true
             cargo_features: ""
             controller_engine: beam_planner
             report_engine_mode: beam_planner
             planner_mode: rust_owned
             planner_client: beam
             planner_url: http://127.0.0.1:9090/plan
+            baseline_shadow_percent: "0"
           - engine_mode: beam_shadow
+            beam_experiment: true
             cargo_features: ""
             controller_engine: baseline
             report_engine_mode: baseline
             planner_mode: shadow
             planner_client: beam
             planner_url: http://127.0.0.1:9090/plan
+            baseline_shadow_percent: "0"
     services:
       postgres:
         image: postgres:16-alpine
@@ -112,6 +126,8 @@ jobs:
           PECR_CONTROLLER_PLANNER_CLIENT: ${{ matrix.planner_client }}
           PECR_CONTROLLER_PLANNER_URL: ${{ matrix.planner_url }}
           PECR_RLM_SANDBOX_ACK: "1"
+          PECR_RLM_AUTO_FALLBACK_TO_BASELINE: "1"
+          PECR_BASELINE_SHADOW_PERCENT: ${{ matrix.baseline_shadow_percent }}
           PECR_E2E_CARGO_FEATURES: ${{ matrix.cargo_features }}
         run: |
           set -euo pipefail
@@ -124,12 +140,17 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          python3 -B scripts/replay/nightly_usefulness_report.py \
-            --store target/replay \
-            --evaluation-name "nightly-usefulness-${{ matrix.engine_mode }}" \
-            --engine-mode "${{ matrix.report_engine_mode }}" \
-            --output-json "artifacts/nightly_usefulness_${{ matrix.engine_mode }}.json" \
+          report_args=(
+            python3 -B scripts/replay/nightly_usefulness_report.py
+            --store target/replay
+            --evaluation-name "nightly-usefulness-${{ matrix.engine_mode }}"
+            --output-json "artifacts/nightly_usefulness_${{ matrix.engine_mode }}.json"
             --output-md "artifacts/nightly_usefulness_${{ matrix.engine_mode }}.md"
+          )
+          if [[ "${{ matrix.engine_mode }}" != "rlm" ]]; then
+            report_args+=(--engine-mode "${{ matrix.report_engine_mode }}")
+          fi
+          "${report_args[@]}"
 
       - name: Generate nightly usefulness report through BEAM jobs
         if: matrix.engine_mode == 'beam_shadow' || matrix.engine_mode == 'beam_planner'

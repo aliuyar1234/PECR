@@ -74,7 +74,7 @@ class CanaryRolloutGuardTests(unittest.TestCase):
                 "disable_adaptive_parallelism",
             )
 
-    def test_guard_switches_to_baseline_when_flags_already_disabled(self):
+    def test_guard_disables_rlm_defaulting_before_switching_engine(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             tmp = Path(tmpdir)
             summary = tmp / "summary.json"
@@ -94,6 +94,42 @@ class CanaryRolloutGuardTests(unittest.TestCase):
                 "--adaptive-enabled",
                 "false",
                 "--batch-enabled",
+                "false",
+                "--rlm-default-enabled",
+                "true",
+                "--output-json",
+                str(report),
+            ]
+            with patch.object(sys, "argv", argv):
+                with redirect_stdout(io.StringIO()):
+                    code = self.mod.main()
+
+            self.assertEqual(code, 0)
+            payload = json.loads(report.read_text(encoding="utf-8"))
+            self.assertEqual(payload["recommended_fallback"]["step"], "disable_rlm_defaulting")
+
+    def test_guard_switches_to_baseline_after_rlm_defaulting_is_disabled(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            tmp = Path(tmpdir)
+            summary = tmp / "summary.json"
+            gates = tmp / "gates.json"
+            report = tmp / "report.json"
+            write_summary(summary, p95=1700.0, p99=2100.0)
+            write_gates(gates, bvr=0.02, ser=0.01, bvr_threshold=0.005, ser_threshold=0.005)
+
+            argv = [
+                "canary_rollout_guard.py",
+                "--summary",
+                str(summary),
+                "--metrics-gates",
+                str(gates),
+                "--engine",
+                "rlm",
+                "--adaptive-enabled",
+                "false",
+                "--batch-enabled",
+                "false",
+                "--rlm-default-enabled",
                 "false",
                 "--output-json",
                 str(report),

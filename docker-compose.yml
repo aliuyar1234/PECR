@@ -80,11 +80,15 @@ services:
       PECR_DEV_ALLOW_NONLOCAL_BIND: "${PECR_DEV_ALLOW_NONLOCAL_BIND:-1}"
       PECR_LOCAL_AUTH_SHARED_SECRET: "${PECR_LOCAL_AUTH_SHARED_SECRET:-pecr-local-demo-secret}"
       PECR_GATEWAY_URL: http://gateway:8080
-      # Keep local compose zero-setup by default.
-      # The first real RLM backend is a Phase 1 bridge/runtime target, documented in
-      # docs/architecture/rlm_runtime_envelope.md, and should remain opt-in until rollout gates are met.
+      # Local compose now defaults into the RLM-first controller path.
+      # Use PECR_RLM_BACKEND=openai plus model credentials when you want the live bridge backend;
+      # otherwise the bridge stays on the mock backend for zero-setup demos.
       PECR_MODEL_PROVIDER: mock
-      PECR_CONTROLLER_ENGINE: "${PECR_CONTROLLER_ENGINE:-baseline}"
+      PECR_CONTROLLER_ENGINE: "${PECR_CONTROLLER_ENGINE:-}"
+      PECR_RLM_DEFAULT_ENABLED: "${PECR_RLM_DEFAULT_ENABLED:-1}"
+      PECR_RLM_SANDBOX_ACK: "${PECR_RLM_SANDBOX_ACK:-1}"
+      PECR_RLM_AUTO_FALLBACK_TO_BASELINE: "${PECR_RLM_AUTO_FALLBACK_TO_BASELINE:-1}"
+      PECR_BASELINE_SHADOW_PERCENT: "${PECR_BASELINE_SHADOW_PERCENT:-0}"
       PECR_BUDGET_DEFAULTS: '{"max_operator_calls":10,"max_bytes":1048576,"max_wallclock_ms":10000,"max_recursion_depth":5,"max_parallelism":4}'
       PECR_RATE_LIMIT_WINDOW_SECS: "${PECR_RATE_LIMIT_WINDOW_SECS:-60}"
       PECR_RATE_LIMIT_RUN_PER_WINDOW: "${PECR_RATE_LIMIT_RUN_PER_WINDOW:-60}"

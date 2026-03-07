@@ -166,28 +166,35 @@ Gate before Phase 4:
 
 Goal: make RLM the default product path while keeping safe fallback controls during rollout.
 
-- [ ] Make `rlm` the default engine in config, docs, and local runtime defaults.
+- [x] Add an explicit RLM-default rollout flag so unset-engine environments can canary into RLM without losing a clean rollback path.
+  Files: `crates/controller/src/config.rs`, `docker-compose.yml`, `docs/standards/ROLLOUT_CONTROL_PLANE_CONTRACT.md`
+- [x] Make `rlm` the default engine in config, docs, and local runtime defaults.
   Files: `crates/controller/src/config.rs`, `README.md`, `docker-compose.yml`, `RUNBOOK.md`
-- [ ] Move `baseline` into shadow or reference mode only.
+- [x] Move `baseline` into shadow or reference mode only.
   Files: `crates/controller/src/http.rs`, `crates/controller/src/replay.rs`, `scripts/replay/`, `.github/workflows/`
-- [ ] Decide whether `beam_planner` remains as an internal experiment, is folded into evaluation tooling, or is retired from the product path.
+- [x] Decide whether `beam_planner` remains as an internal experiment, is folded into evaluation tooling, or is retired from the product path.
   Files: `IMPLEMENTATION_ROADMAP.md`, `BEAM_MIGRATION_PLAN.md`, `.github/workflows/`, `beam/`
-- [ ] Add rollout knobs and canary controls for:
+- [x] Add rollout knobs and canary controls for:
   Files: `docs/standards/ROLLOUT_CONTROL_PLANE_CONTRACT.md`, `crates/controller/src/config.rs`, `.github/workflows/`
   Controls:
   - enable or disable RLM defaulting
   - change shadow percentage
   - auto-fallback on bridge degradation
   - compare shadow outputs in replay scorecards
-- [ ] Add dashboards and alerts for bridge health, tool planning quality, finalize downgrade drift, and shadow deltas.
+- [x] Add dashboards and alerts for bridge health, tool planning quality, finalize downgrade drift, and shadow deltas.
   Files: `docs/observability/`, dashboards and alerts
 
 Gate before Phase 5:
 
-- [ ] Fresh installs and local demos use RLM by default.
-- [ ] Shadow baseline remains available as a regression detector.
+- [x] Fresh installs and local demos use RLM by default.
+- [x] Shadow baseline remains available as a regression detector.
 - [ ] At least 10 consecutive nightly or pre-release runs are green for usefulness, perf, e2e smoke, and contract lanes.
-- [ ] Rollback and auto-fallback controls are documented and tested.
+- [x] Rollback and auto-fallback controls are documented and tested.
+
+Implementation note:
+
+- Phase 4 implementation work is complete in-repo.
+- Promotion into Phase 5 still waits on the time-based rollout evidence gate above; do not skip that requirement.
 
 ## Phase 5: Simplify The Repo Around The RLM-First Product
 

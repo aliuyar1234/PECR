@@ -6,8 +6,18 @@
 
 ## Feature Flags
 - `PECR_CONTROLLER_ENGINE`:
-  - `baseline` (default)
+  - `baseline`
   - `rlm`
+- `PECR_RLM_DEFAULT_ENABLED`:
+  - `false`/`true` (controller config default `false`; local compose default `true`)
+  - only applies when `PECR_CONTROLLER_ENGINE` is unset or empty
+  - when `true`, the controller defaults to `rlm` instead of `baseline`
+- `PECR_RLM_AUTO_FALLBACK_TO_BASELINE`:
+  - `false`/`true` (default `true`)
+  - when `true`, the controller retries the request through the baseline runtime when the RLM bridge degrades with a replay-visible bridge failure
+- `PECR_BASELINE_SHADOW_PERCENT`:
+  - integer `0-100` (default `0`)
+  - sampled percentage of RLM-served requests that also persist a baseline comparison replay
 - `PECR_CONTROLLER_ADAPTIVE_PARALLELISM_ENABLED`:
   - `true`/`false` (default `true`)
 - `PECR_CONTROLLER_BATCH_MODE_ENABLED`:
@@ -26,6 +36,9 @@
   - `pecr_controller_operator_queue_wait_seconds`
 - Outcome:
   - `pecr_controller_terminal_modes_total`
+- Replay/evaluation:
+  - engine scorecards and `engine_comparisons` from replay evaluation results
+  - nightly usefulness reports for baseline-shadow delta, finalize downgrade drift, and fallback recovery rate
 
 ## Auto-Fallback Policy
 - Trigger rollback to safer settings when any condition is met for a sustained window (recommended: 5-10 minutes):
@@ -35,8 +48,15 @@
 - Fallback order:
   1. Disable adaptive parallelism (`PECR_CONTROLLER_ADAPTIVE_PARALLELISM_ENABLED=false`)
   2. Disable batch mode (`PECR_CONTROLLER_BATCH_MODE_ENABLED=false`)
-  3. Switch engine to baseline (`PECR_CONTROLLER_ENGINE=baseline`)
+  3. Disable RLM defaulting (`PECR_RLM_DEFAULT_ENABLED=0`)
+  4. Switch engine to baseline (`PECR_CONTROLLER_ENGINE=baseline`)
 - Recovery requires explicit operator acknowledgment and fresh canary run.
+
+## Shadow Comparison Contract
+- Baseline is no longer a peer default runtime; it is a reference lane.
+- Sampled shadow runs should persist as normal replay bundles with `engine_mode=baseline` so replay scorecards and `engine_comparisons` can compare them against the primary `rlm` runs on matched queries.
+- Scheduled nightly usefulness runs should keep the `baseline` lane and the `rlm` lane; the `rlm` lane may also sample baseline shadow runs for same-query comparisons.
+- BEAM lanes are manual/internal experiments only and must not be required for the default product release question.
 
 ## Deployment Contract
 - Every rollout must define:
@@ -55,3 +75,4 @@
   - ENV patch snippet (next fallback stage)
 - CI integration:
   - `.github/workflows/ci.yml` perf job runs the guard for the RLM benchmark pass and publishes artifacts for rollout operators.
+  - `.github/workflows/nightly-usefulness.yml` keeps baseline and RLM scheduled lanes active, while BEAM experiment lanes are manual `workflow_dispatch` only.

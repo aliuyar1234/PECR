@@ -16,6 +16,7 @@ This repo follows the SSOT runbook baseline in `pcdr/spec/12_RUNBOOK.md`.
 Notes:
 - Postgres is exposed on `127.0.0.1:${PECR_POSTGRES_PORT:-55432}` by default (override via `PECR_POSTGRES_PORT`).
 - Local compose defaults `PECR_LOCAL_AUTH_SHARED_SECRET` to `pecr-local-demo-secret` so the demo commands below work without extra setup.
+- Local compose now defaults into the RLM controller path with the mock bridge backend, baseline auto-fallback enabled, and no required model credentials.
 
 2) Run the end-to-end suites (requires a Postgres URL):
 - PowerShell: `$env:PECR_TEST_DB_URL='postgres://pecr:pecr@localhost:55432/pecr'; cargo test -p e2e_smoke`
@@ -59,6 +60,15 @@ CI also enforces RLM verification via `scripts/rlm/verify_vendor_rlm.py` inside 
   - `python3 scripts/perf/compare_k6_baseline.py --baseline perf/baselines/suite7_baseline.summary.json --current target/perf/suite7_rlm_baseline.summary.json --alarm-label rlm --output-json target/perf/perf_alarm_rlm.json`
   - `python3 scripts/perf/benchmark_matrix.py --baseline perf/baselines/suite7_baseline.summary.json --candidate baseline=target/perf/suite7_baseline.summary.json --candidate rlm=target/perf/suite7_rlm_baseline.summary.json --output-json target/perf/benchmark_matrix.json --output-md target/perf/benchmark_matrix.md`
 
+## Pre-release evidence workflow
+
+- Manual pre-release CI dispatch:
+  - `gh workflow run ci.yml --ref master`
+- Phase 4 rollout evidence gate:
+  - collect at least 10 consecutive green `ci` runs on the same rollout posture
+  - those runs must keep usefulness integration, perf, e2e smoke, and contract lanes green
+  - use `gh run list -w ci --branch master --limit 20` to verify the streak
+
 ## Service endpoints (docker compose)
 
 - Gateway: `http://127.0.0.1:8080` (`/healthz`, `/readyz`, `/metrics`)
@@ -71,6 +81,9 @@ CI also enforces RLM verification via `scripts/rlm/verify_vendor_rlm.py` inside 
 
 - `PECR_CONTROLLER_ADAPTIVE_PARALLELISM_ENABLED` (default enabled).
 - `PECR_CONTROLLER_BATCH_MODE_ENABLED` (default enabled).
+- `PECR_RLM_DEFAULT_ENABLED` (local compose default enabled; only applies when `PECR_CONTROLLER_ENGINE` is unset).
+- `PECR_RLM_AUTO_FALLBACK_TO_BASELINE` (default enabled).
+- `PECR_BASELINE_SHADOW_PERCENT` (default `0`; set above `0` to persist sampled baseline comparison runs while RLM serves the primary answer).
 - `PECR_OPERATOR_CONCURRENCY_POLICIES` (JSON map by operator, supports `max_in_flight` and `fairness_weight`).
 
 Replay/eval knobs:
@@ -84,22 +97,24 @@ The first supported real RLM backend is defined in `docs/architecture/rlm_runtim
 
 Operator summary:
 
-- local docker compose remains baseline plus mock by default
-- the first real RLM backend is an opt-in controller-side bridge configuration, not a default local dependency
+- local docker compose now defaults into the RLM path with the mock bridge backend plus rollback controls
+- the first real remote RLM backend is still an opt-in controller-side bridge configuration, not a default local dependency
 - the initial real bridge seam currently supports `PECR_RLM_BACKEND=openai`
 - do not treat `PECR_MODEL_PROVIDER=external` as ready; controller startup still refuses it today
 - the first real backend should be implemented behind the Python RLM bridge, then proven in replay, e2e, finalize, and perf lanes before becoming a default path
 
-Until Phase 1 lands, the honest local story is:
+The honest local story right now is:
 
-- default local product demo: `baseline` plus mock/runtime fixtures
-- opt-in RLM experimentation: `rlm` engine with explicit sandbox acknowledgement
+- default local product demo: `rlm` plus mock/runtime fixtures, with baseline auto-fallback available
+- opt-in real-backend RLM experimentation: bridge-backed `openai` mode with explicit model credentials
 - no default compose dependency on external model credentials
 
 Initial opt-in envs for the real bridge seam:
 
-- `PECR_CONTROLLER_ENGINE=rlm`
+- `PECR_CONTROLLER_ENGINE=rlm` or `PECR_RLM_DEFAULT_ENABLED=1`
 - `PECR_RLM_SANDBOX_ACK=1`
+- `PECR_RLM_AUTO_FALLBACK_TO_BASELINE=1`
+- optional `PECR_BASELINE_SHADOW_PERCENT=<0-100>`
 - `PECR_RLM_BACKEND=openai`
 - `PECR_RLM_MODEL_NAME=<model>`
 - `OPENAI_API_KEY=<key>` or `PECR_RLM_API_KEY=<key>`
@@ -156,10 +171,11 @@ The `live-*` commands assume the default local compose secret `pecr-local-demo-s
 ## Canary rollout guard (OPS-002 path)
 
 - Evaluate canary SLOs and auto-fallback action:
-  - `python3 scripts/ops/canary_rollout_guard.py --summary target/perf/suite7_rlm_baseline.summary.json --metrics-gates target/perf/suite7_rlm_metrics_gates.json --engine rlm --adaptive-enabled true --batch-enabled true --output-json target/perf/canary_guard.json --output-md target/perf/canary_guard.md --output-env target/perf/canary_fallback.env`
+  - `python3 scripts/ops/canary_rollout_guard.py --summary target/perf/suite7_rlm_baseline.summary.json --metrics-gates target/perf/suite7_rlm_metrics_gates.json --engine rlm --adaptive-enabled true --batch-enabled true --rlm-default-enabled true --auto-fallback-enabled true --baseline-shadow-percent 0 --output-json target/perf/canary_guard.json --output-md target/perf/canary_guard.md --output-env target/perf/canary_fallback.env`
 - Fallback order encoded by the tool:
   - Disable adaptive parallelism.
   - Disable batch mode.
+  - Disable RLM defaulting.
   - Switch engine to baseline.
 
 ## Observability artifacts (OBS-003)

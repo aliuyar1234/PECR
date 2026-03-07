@@ -203,6 +203,27 @@ const RLM_BRIDGE_PROTOCOL_MIN_VERSION: u32 = 1;
 const RLM_BRIDGE_PROTOCOL_MAX_VERSION: u32 = 1;
 
 #[cfg(feature = "rlm")]
+pub(super) fn is_rlm_bridge_failure_stop_reason(stop_reason: &str) -> bool {
+    matches!(
+        stop_reason,
+        "bridge_eof"
+            | "bridge_read_error"
+            | "bridge_invalid_json"
+            | "bridge_invalid_message"
+            | "bridge_invalid_tool_request"
+            | "bridge_unknown_message"
+            | "bridge_invalid_request"
+            | "bridge_protocol_missing_version"
+            | "bridge_protocol_version_unsupported"
+            | "bridge_script_not_found"
+            | "bridge_spawn_failed"
+            | "bridge_internal"
+            | "bridge_backend_unavailable"
+            | "bridge_backend_runtime_error"
+    )
+}
+
+#[cfg(feature = "rlm")]
 #[derive(Clone, Default)]
 pub(super) struct RlmBridgeRuntime {
     cached_process: Arc<AsyncMutex<Option<CachedRlmBridgeProcess>>>,
@@ -4818,23 +4839,7 @@ pub(super) async fn run_context_loop_rlm(
     if response_text.is_none() && terminal_mode == TerminalMode::Supported {
         response_text = render_operator_summaries_response_text(&operator_summaries);
     }
-    let stop_is_bridge_failure = matches!(
-        stop_reason.as_str(),
-        "bridge_eof"
-            | "bridge_read_error"
-            | "bridge_invalid_json"
-            | "bridge_invalid_message"
-            | "bridge_invalid_tool_request"
-            | "bridge_unknown_message"
-            | "bridge_invalid_request"
-            | "bridge_protocol_missing_version"
-            | "bridge_protocol_version_unsupported"
-            | "bridge_script_not_found"
-            | "bridge_spawn_failed"
-            | "bridge_internal"
-            | "bridge_backend_unavailable"
-            | "bridge_backend_runtime_error"
-    );
+    let stop_is_bridge_failure = is_rlm_bridge_failure_stop_reason(stop_reason.as_str());
     if !stop_is_bridge_failure
         && !budget_violation
         && stop_reason == "rlm_done"

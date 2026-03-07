@@ -16,6 +16,7 @@ PECR is moving toward one clear product shape:
 - RLM should be the primary reasoning and planning runtime.
 - the controller and gateway should remain the trust, policy, evidence, and finalize boundary.
 - baseline and other planner paths should exist only as migration, shadow, evaluation, or fallback tools until the RLM-first rollout is complete.
+- BEAM-era planner work is now an internal experiment/reference lane, not a scheduled product-default lane.
 
 The working migration plan for that direction lives in `RLM_FIRST_MIGRATION_PLAN.md`.
 The first supported real backend shape for that migration is defined in `docs/architecture/rlm_runtime_envelope.md`.
@@ -157,6 +158,7 @@ docker compose up -d --build
 
 Postgres is exposed on `127.0.0.1:${PECR_POSTGRES_PORT:-55432}` by default.
 The local compose path also defaults `PECR_LOCAL_AUTH_SHARED_SECRET` to `pecr-local-demo-secret`, so the demo commands below work without extra tuning.
+Local compose also defaults into the RLM controller path with the mock bridge backend plus baseline auto-fallback, so the fast start stays zero-setup.
 
 ### 2) Verify health endpoints
 
@@ -208,8 +210,8 @@ Outputs: `target/perf/`
 
 | Path | Engine | Enablement | Typical use |
 |---|---|---|---|
-| Baseline | `baseline` | Current default when `PECR_CONTROLLER_ENGINE` is unset or `baseline` | Reference, shadow, migration safety, and fallback lane while RLM-first rollout completes |
-| RLM | `rlm` | `PECR_CONTROLLER_ENGINE=rlm` and `PECR_RLM_SANDBOX_ACK=1` (controller built with `--features rlm`) | Primary target product path with adaptive planning, batching, and recovery behavior |
+| Baseline | `baseline` | Explicit `PECR_CONTROLLER_ENGINE=baseline`, or sampled as a shadow/reference lane via `PECR_BASELINE_SHADOW_PERCENT>0` while RLM serves the user-visible response | Reference, shadow comparison, migration safety, and rollback lane while RLM-first rollout evidence accumulates |
+| RLM | `rlm` | Explicit `PECR_CONTROLLER_ENGINE=rlm`, or default when `PECR_CONTROLLER_ENGINE` is unset and `PECR_RLM_DEFAULT_ENABLED=1`, plus `PECR_RLM_SANDBOX_ACK=1` (controller built with `--features rlm`) | Primary product path with adaptive planning, batching, recovery behavior, and optional baseline shadow comparison |
 
 Perf harness commands:
 
@@ -279,17 +281,17 @@ For concrete payload examples, see `docs/client_integration.md` and the `/v1/run
 
 ## RLM Runtime Direction
 
-PECR is moving toward an RLM-first controller path.
-Today the RLM runtime remains behind explicit runtime guards while the migration in `RLM_FIRST_MIGRATION_PLAN.md` completes.
+PECR now defaults local runtime wiring toward an RLM-first controller path.
+The migration in `RLM_FIRST_MIGRATION_PLAN.md` is about proving that default operationally, not about keeping baseline as a peer product mode.
 
 The first supported real backend envelope is documented in `docs/architecture/rlm_runtime_envelope.md`.
-Important current truth: the controller still rejects `PECR_MODEL_PROVIDER=external`, so the real RLM backend must land through the bridge/runtime path first rather than through the current Rust model-provider switch. The bridge now supports an initial opt-in `openai` backend seam, but it is not yet the default runtime.
+Important current truth: the controller still rejects `PECR_MODEL_PROVIDER=external`, so the real RLM backend must land through the bridge/runtime path first rather than through the current Rust model-provider switch. Local compose defaults to the `mock` bridge backend; the initial `openai` seam is real but still opt-in.
 
 Enable RLM mode:
 
 - Build `pecr-controller` with feature `rlm`
 - Set:
-  - `PECR_CONTROLLER_ENGINE=rlm`
+  - either `PECR_CONTROLLER_ENGINE=rlm`, or leave `PECR_CONTROLLER_ENGINE` unset and use `PECR_RLM_DEFAULT_ENABLED=1`
   - `PECR_RLM_SANDBOX_ACK=1`
 
 Useful knobs:
@@ -299,14 +301,17 @@ Useful knobs:
 - `PECR_RLM_BASE_URL`
 - `PECR_CONTROLLER_ADAPTIVE_PARALLELISM_ENABLED`
 - `PECR_CONTROLLER_BATCH_MODE_ENABLED`
+- `PECR_RLM_AUTO_FALLBACK_TO_BASELINE`
+- `PECR_BASELINE_SHADOW_PERCENT`
 - `PECR_OPERATOR_CONCURRENCY_POLICIES`
 - `PECR_RLM_SCRIPT_PATH`
-- the controller now keeps a persistent bridge worker alive across requests and records bridge backend/stop-reason detail in replay-visible planner traces
+- the controller now keeps a persistent bridge worker alive across requests, auto-falls back to baseline on bridge degradation when enabled, and records bridge backend/stop-reason detail in replay-visible planner traces
 
 Current transition note:
 
-- `baseline` still exists as the current default and as a reference/shadow lane.
-- `rlm` is the intended primary runtime once the rollout gates in `RLM_FIRST_MIGRATION_PLAN.md` are met.
+- `rlm` is the default local product path.
+- `baseline` remains intentionally available as a reference/shadow/fallback lane, not as a peer default product mode.
+- scheduled usefulness lanes now center `baseline` and `rlm`; BEAM usefulness lanes are manual experiment paths only.
 - the bridge-backed real backend seam currently starts with `PECR_RLM_BACKEND=openai` plus `PECR_RLM_MODEL_NAME` and `OPENAI_API_KEY` or `PECR_RLM_API_KEY`.
 - the governance model does not change: gateway policy, evidence capture, and finalize remain authoritative for every engine path.
 
@@ -350,7 +355,9 @@ Controller minimum:
 - `PECR_BUDGET_DEFAULTS` (JSON)
 
 RLM migration note:
-- keep `PECR_MODEL_PROVIDER=mock` as the honest default until the real bridge-backed RLM backend is implemented
+- local compose defaults `PECR_RLM_DEFAULT_ENABLED=1`, `PECR_RLM_SANDBOX_ACK=1`, and `PECR_RLM_AUTO_FALLBACK_TO_BASELINE=1`
+- use `PECR_BASELINE_SHADOW_PERCENT` when you want replay-visible baseline comparison runs during the rollout
+- keep `PECR_MODEL_PROVIDER=mock` as the honest default until Rust-native external-provider support exists
 - use `docs/architecture/rlm_runtime_envelope.md` as the source of truth for the first real backend shape
 
 Auth modes:

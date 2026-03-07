@@ -6,6 +6,7 @@ on:
     branches:
       - main
       - master
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -303,6 +304,9 @@ jobs:
             --engine rlm \
             --adaptive-enabled true \
             --batch-enabled true \
+            --rlm-default-enabled true \
+            --auto-fallback-enabled true \
+            --baseline-shadow-percent 0 \
             --output-json artifacts/ops/canary_guard.json \
             --output-md artifacts/ops/canary_guard.md \
             --output-env artifacts/ops/canary_fallback.env \

@@ -88,6 +88,22 @@ def main() -> int:
         help="Current batch mode flag (true/false).",
     )
     parser.add_argument(
+        "--rlm-default-enabled",
+        default="false",
+        help="Whether unset-engine environments currently default into RLM (true/false).",
+    )
+    parser.add_argument(
+        "--auto-fallback-enabled",
+        default="true",
+        help="Whether bridge degradation currently auto-falls back to baseline (true/false).",
+    )
+    parser.add_argument(
+        "--baseline-shadow-percent",
+        type=int,
+        default=0,
+        help="Current sampled baseline shadow percentage.",
+    )
+    parser.add_argument(
         "--max-p95-ms",
         type=float,
         default=parse_float_env("PECR_CANARY_P95_BUDGET_MS", 1200.0),
@@ -146,7 +162,11 @@ def main() -> int:
 
     adaptive_enabled = parse_bool(args.adaptive_enabled)
     batch_enabled = parse_bool(args.batch_enabled)
+    rlm_default_enabled = parse_bool(args.rlm_default_enabled)
+    auto_fallback_enabled = parse_bool(args.auto_fallback_enabled)
     engine = args.engine.strip().lower() or "baseline"
+    if not 0 <= args.baseline_shadow_percent <= 100:
+        raise SystemExit("--baseline-shadow-percent must be between 0 and 100")
 
     triggers: list[dict[str, object]] = []
     if p95 > args.max_p95_ms:
@@ -204,6 +224,12 @@ def main() -> int:
                 "env_updates": {"PECR_CONTROLLER_BATCH_MODE_ENABLED": "false"},
                 "reason": "Second fallback stage in contract order.",
             }
+        elif rlm_default_enabled:
+            fallback_action = {
+                "step": "disable_rlm_defaulting",
+                "env_updates": {"PECR_RLM_DEFAULT_ENABLED": "false"},
+                "reason": "Third fallback stage in contract order.",
+            }
         elif engine != "baseline":
             fallback_action = {
                 "step": "switch_engine_to_baseline",
@@ -224,6 +250,9 @@ def main() -> int:
         "current_state": {
             "adaptive_parallelism_enabled": adaptive_enabled,
             "batch_mode_enabled": batch_enabled,
+            "rlm_default_enabled": rlm_default_enabled,
+            "auto_fallback_enabled": auto_fallback_enabled,
+            "baseline_shadow_percent": args.baseline_shadow_percent,
         },
         "signals": {
             "p95_ms": p95,

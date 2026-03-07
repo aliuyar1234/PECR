@@ -131,8 +131,8 @@ python -B scripts/replay/replay_eval_cli.py --store target/replay evaluate --nam
 Nightly usefulness reports now include a separate planner section. Across the execution and shadow
 lanes that means the same artifact can show:
 
-- execution scorecards for the Rust-owned, `rlm`, or `beam_planner` engine that actually served the answer
+- execution scorecards for the baseline reference lane, the primary `rlm` lane, or a manual `beam_planner` experiment lane
 - planner scorecards for `baseline`, `rlm`, `beam_planner`, and `beam_planner_shadow` traces observed in those runs
 - planner comparisons that tell us whether BEAM shadow or BEAM execution planning is matching or beating the current planner on the same scenarios
 
-Automation: `.github/workflows/nightly-usefulness.yml` runs the named usefulness suites and publishes nightly artifacts for `baseline`, `rlm`, `beam_planner`, and the BEAM shadow-planner benchmark lane. During the RLM-first migration, those extra lanes are still useful as comparison artifacts, but the release question should always be framed around whether `rlm` is strong enough to own the default path.
+Automation: `.github/workflows/nightly-usefulness.yml` now schedules `baseline` and `rlm` by default, with the `rlm` lane able to sample baseline shadow runs so the same nightly artifacts can emit `engine_comparisons` on matched queries. BEAM lanes remain available only as manual `workflow_dispatch` experiments. The release question should always be framed around whether `rlm` is strong enough to own the default path.

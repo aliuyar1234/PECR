@@ -5,6 +5,8 @@ use axum::{Json, Router};
 use pecr_auth::OidcAuthenticator;
 use pecr_contracts::{Budget, ClaimMap, ClientResponseKind, SafeAskCatalog, TerminalMode};
 use serde::{Deserialize, Serialize};
+use std::collections::hash_map::DefaultHasher;
+use std::hash::{Hash, Hasher};
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 use tracing::Instrument;
@@ -28,7 +30,11 @@ use self::diagnostics::{healthz, metrics, readyz};
 #[cfg(test)]
 use self::finalize::build_claim_map;
 use self::finalize::build_finalize_output;
-use self::orchestration::{GatewayCallContext, run_context_loop, run_context_loop_rlm};
+use self::orchestration::{
+    ContextLoopResult, GatewayCallContext, run_context_loop, run_context_loop_rlm,
+};
+#[cfg(feature = "rlm")]
+use self::orchestration::is_rlm_bridge_failure_stop_reason;
 use self::replay_api::{
     get_evaluation, get_replay, get_scorecards, list_replays, submit_evaluation,
 };
@@ -127,6 +133,11 @@ struct RunResponse {
     response_text: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_kind: Option<ClientResponseKind>,
+}
+
+struct FinalizedRunArtifacts {
+    run_response: RunResponse,
+    persisted_run: PersistedRun,
 }
 
 async fn capabilities(
@@ -269,121 +280,59 @@ async fn run(
             session_id: &session.session.session_id,
         };
 
+        let mut used_baseline_runtime_fallback = false;
         let loop_result = match state.config.controller_engine {
             ControllerEngine::Baseline => run_context_loop(&state, ctx, &query, &budget).await?,
             ControllerEngine::BeamPlanner => run_context_loop(&state, ctx, &query, &budget).await?,
-            ControllerEngine::Rlm => run_context_loop_rlm(&state, ctx, &query, &budget).await?,
+            ControllerEngine::Rlm => {
+                let rlm_result = run_context_loop_rlm(&state, ctx, &query, &budget).await?;
+                if should_auto_fallback_to_baseline(&state, &rlm_result) {
+                    tracing::warn!(
+                        request_id = %request_id,
+                        trace_id = %trace_id,
+                        principal_id = %principal_id,
+                        "controller.rlm_runtime_fallback_to_baseline"
+                    );
+                    let mut baseline_result = run_context_loop(&state, ctx, &query, &budget).await?;
+                    let mut planner_traces = rlm_result.planner_traces.clone();
+                    planner_traces.extend(baseline_result.planner_traces);
+                    baseline_result.planner_traces = planner_traces;
+                    used_baseline_runtime_fallback = true;
+                    baseline_result
+                } else {
+                    rlm_result
+                }
+            }
         };
-        let loop_terminal_mode = loop_result.terminal_mode;
-        let loop_response_text = loop_result.response_text.clone();
-        let planner_traces = loop_result.planner_traces.clone();
-        let operator_calls_used = loop_result.operator_calls_used;
-        let bytes_used = loop_result.bytes_used;
-        let depth_used = loop_result.depth_used;
-        let evidence_ref_count = loop_result.evidence_refs.len() as u32;
-        let mut evidence_unit_ids = loop_result
-            .evidence_units
-            .iter()
-            .map(|unit| unit.evidence_unit_id.clone())
-            .collect::<Vec<_>>();
-        evidence_unit_ids.sort();
-        evidence_unit_ids.dedup();
-
-        let finalize_span = tracing::info_span!(
-            "finalize.compile",
-            trace_id = %trace_id,
-            request_id = %request_id,
-            session_id = %session.session.session_id,
-            terminal_mode = %loop_result.terminal_mode.as_str(),
-            latency_ms = tracing::field::Empty,
-            outcome = tracing::field::Empty,
-        );
-
-        let finalized = async {
-            let finalize_started = Instant::now();
-
-            let finalized_output = build_finalize_output(
-                &query,
-                loop_terminal_mode,
-                loop_result.response_text.clone(),
-                &loop_result.evidence_units,
-                &state.config.context_budget,
-            );
-            crate::metrics::observe_finalize_evidence_pack(
-                finalized_output.context_stats.pack_mode.as_str(),
-                finalized_output.context_stats.input_evidence_units,
-                finalized_output.context_stats.packed_evidence_units,
-                finalized_output.context_stats.input_chars,
-                finalized_output.context_stats.packed_chars,
-            );
-            crate::metrics::observe_citation_quality(compute_citation_quality(
-                &finalized_output.claim_map,
-            ));
-
-            let finalized = finalize_session(
-                &state,
-                ctx,
-                finalized_output.response_text,
-                finalized_output.claim_map,
-            )
-            .await?;
-
-            let latency_ms = finalize_started.elapsed().as_millis() as u64;
-            tracing::Span::current().record("latency_ms", latency_ms);
-            tracing::Span::current().record("outcome", "ok");
-
-            Ok::<_, (StatusCode, Json<ErrorResponse>)>(finalized)
-        }
-        .instrument(finalize_span)
+        let finalized = finalize_run_result(
+            &state,
+            ctx,
+            &principal_id,
+            &query,
+            &budget,
+            state.config.controller_engine,
+            &session.session.session_id,
+            &session.session.policy_snapshot_id,
+            loop_result,
+        )
         .await?;
-
-        let run_response = RunResponse {
-            terminal_mode: finalized.terminal_mode,
-            trace_id: finalized.trace_id.clone(),
-            claim_map: finalized.claim_map.clone(),
-            response_text: finalized.response_text.clone(),
-            response_kind: classify_run_response_kind(
-                finalized.terminal_mode,
-                finalized.response_text.as_str(),
-                &finalized.claim_map,
-            ),
-        };
-
-        let persisted_run = PersistedRun {
-            trace_id: finalized.trace_id,
-            request_id: request_id.clone(),
-            principal_id: principal_id.clone(),
-            engine_mode: state.config.controller_engine,
-            query: query.clone(),
-            budget: budget.clone(),
-            session_id: session.session.session_id.clone(),
-            policy_snapshot_id: session.session.policy_snapshot_id.clone(),
-            loop_terminal_mode,
-            loop_response_text,
-            terminal_mode: run_response.terminal_mode,
-            response_text: run_response.response_text.clone(),
-            claim_map: run_response.claim_map.clone(),
-            operator_calls_used,
-            bytes_used,
-            depth_used,
-            evidence_ref_count,
-            evidence_unit_ids,
-            planner_traces,
-        };
-        let replay_request_id = request_id.clone();
-        let replay_trace_id = run_response.trace_id.clone();
-        let replay_principal_id = principal_id.clone();
-        if let Err(err) = state.replay_persist_queue.enqueue(persisted_run) {
-            tracing::warn!(
-                request_id = %replay_request_id,
-                trace_id = %replay_trace_id,
-                principal_id = %replay_principal_id,
-                error = %err,
-                "controller.replay_persist_failed"
-            );
+        enqueue_persisted_run_with_warning(&state, finalized.persisted_run);
+        if should_capture_baseline_shadow(&state, &request_id, &trace_id)
+            && !used_baseline_runtime_fallback
+        {
+            run_baseline_shadow_run(
+                state.clone(),
+                principal_id.clone(),
+                authz_header.clone(),
+                request_id.clone(),
+                trace_id.clone(),
+                query.clone(),
+                budget.clone(),
+            )
+            .await;
         }
 
-        Ok(Json(run_response))
+        Ok(Json(finalized.run_response))
     }
     .instrument(span)
     .await;
@@ -620,6 +569,264 @@ struct FinalizeResponse {
     trace_id: String,
     claim_map: ClaimMap,
     response_text: String,
+}
+
+fn enqueue_persisted_run_with_warning(state: &AppState, persisted_run: PersistedRun) {
+    let replay_request_id = persisted_run.request_id.clone();
+    let replay_trace_id = persisted_run.trace_id.clone();
+    let replay_principal_id = persisted_run.principal_id.clone();
+    if let Err(err) = state.replay_persist_queue.enqueue(persisted_run) {
+        tracing::warn!(
+            request_id = %replay_request_id,
+            trace_id = %replay_trace_id,
+            principal_id = %replay_principal_id,
+            error = %err,
+            "controller.replay_persist_failed"
+        );
+    }
+}
+
+fn should_capture_baseline_shadow(state: &AppState, request_id: &str, trace_id: &str) -> bool {
+    if state.config.controller_engine != ControllerEngine::Rlm {
+        return false;
+    }
+    shadow_sample_selected(
+        state.config.baseline_shadow_percent,
+        request_id,
+        trace_id,
+    )
+}
+
+fn shadow_sample_selected(percent: u8, request_id: &str, trace_id: &str) -> bool {
+    if percent == 0 {
+        return false;
+    }
+    if percent >= 100 {
+        return true;
+    }
+
+    let mut hasher = DefaultHasher::new();
+    request_id.hash(&mut hasher);
+    trace_id.hash(&mut hasher);
+    hasher.finish() % 100 < u64::from(percent)
+}
+
+#[cfg(feature = "rlm")]
+fn should_auto_fallback_to_baseline(state: &AppState, loop_result: &ContextLoopResult) -> bool {
+    state.config.controller_engine == ControllerEngine::Rlm
+        && state.config.rlm_auto_fallback_to_baseline
+        && loop_result.terminal_mode == TerminalMode::SourceUnavailable
+        && loop_result.planner_traces.iter().any(|trace| {
+            trace.decision_summary.planner_source == "rlm_bridge"
+                && is_rlm_bridge_failure_stop_reason(trace.decision_summary.stop_reason.as_str())
+        })
+}
+
+#[cfg(not(feature = "rlm"))]
+fn should_auto_fallback_to_baseline(_state: &AppState, _loop_result: &ContextLoopResult) -> bool {
+    false
+}
+
+async fn run_baseline_shadow_run(
+    state: AppState,
+    principal_id: String,
+    authz_header: Option<String>,
+    request_id: String,
+    trace_id: String,
+    query: String,
+    budget: Budget,
+) {
+    let shadow_request_id = format!("{request_id}-baseline-shadow");
+    let shadow_trace_id = format!("{trace_id}-baseline-shadow");
+    let created_session = match create_session(
+        &state,
+        &principal_id,
+        &shadow_request_id,
+        &shadow_trace_id,
+        authz_header.as_deref(),
+        &budget,
+    )
+    .await
+    {
+        Ok(session) => session,
+        Err((status, Json(err))) => {
+            tracing::warn!(
+                request_id = %shadow_request_id,
+                trace_id = %shadow_trace_id,
+                principal_id = %principal_id,
+                status = status.as_u16(),
+                code = %err.code,
+                "controller.baseline_shadow_session_failed"
+            );
+            return;
+        }
+    };
+
+    let ctx = GatewayCallContext {
+        principal_id: &principal_id,
+        authz_header: authz_header.as_deref(),
+        local_auth_shared_secret: state.config.local_auth_shared_secret.as_deref(),
+        request_id: &shadow_request_id,
+        trace_id: &shadow_trace_id,
+        session_token: &created_session.session_token,
+        session_id: &created_session.session.session_id,
+    };
+
+    let loop_result = match run_context_loop(&state, ctx, &query, &budget).await {
+        Ok(loop_result) => loop_result,
+        Err((status, Json(err))) => {
+            tracing::warn!(
+                request_id = %shadow_request_id,
+                trace_id = %shadow_trace_id,
+                principal_id = %principal_id,
+                status = status.as_u16(),
+                code = %err.code,
+                "controller.baseline_shadow_loop_failed"
+            );
+            return;
+        }
+    };
+
+    let finalized = match finalize_run_result(
+        &state,
+        ctx,
+        &principal_id,
+        &query,
+        &budget,
+        ControllerEngine::Baseline,
+        &created_session.session.session_id,
+        &created_session.session.policy_snapshot_id,
+        loop_result,
+    )
+    .await
+    {
+        Ok(artifacts) => artifacts,
+        Err((status, Json(err))) => {
+            tracing::warn!(
+                request_id = %shadow_request_id,
+                trace_id = %shadow_trace_id,
+                principal_id = %principal_id,
+                status = status.as_u16(),
+                code = %err.code,
+                "controller.baseline_shadow_finalize_failed"
+            );
+            return;
+        }
+    };
+
+    enqueue_persisted_run_with_warning(&state, finalized.persisted_run);
+}
+
+async fn finalize_run_result(
+    state: &AppState,
+    ctx: GatewayCallContext<'_>,
+    principal_id: &str,
+    query: &str,
+    budget: &Budget,
+    engine_mode: ControllerEngine,
+    session_id: &str,
+    policy_snapshot_id: &str,
+    loop_result: ContextLoopResult,
+) -> Result<FinalizedRunArtifacts, ApiError> {
+    let loop_terminal_mode = loop_result.terminal_mode;
+    let loop_response_text = loop_result.response_text.clone();
+    let planner_traces = loop_result.planner_traces.clone();
+    let operator_calls_used = loop_result.operator_calls_used;
+    let bytes_used = loop_result.bytes_used;
+    let depth_used = loop_result.depth_used;
+    let evidence_ref_count = loop_result.evidence_refs.len() as u32;
+    let mut evidence_unit_ids = loop_result
+        .evidence_units
+        .iter()
+        .map(|unit| unit.evidence_unit_id.clone())
+        .collect::<Vec<_>>();
+    evidence_unit_ids.sort();
+    evidence_unit_ids.dedup();
+
+    let finalize_span = tracing::info_span!(
+        "finalize.compile",
+        trace_id = %ctx.trace_id,
+        request_id = %ctx.request_id,
+        session_id = %session_id,
+        terminal_mode = %loop_result.terminal_mode.as_str(),
+        latency_ms = tracing::field::Empty,
+        outcome = tracing::field::Empty,
+    );
+
+    let finalized = async {
+        let finalize_started = Instant::now();
+
+        let finalized_output = build_finalize_output(
+            query,
+            loop_terminal_mode,
+            loop_result.response_text.clone(),
+            &loop_result.evidence_units,
+            &state.config.context_budget,
+        );
+        crate::metrics::observe_finalize_evidence_pack(
+            finalized_output.context_stats.pack_mode.as_str(),
+            finalized_output.context_stats.input_evidence_units,
+            finalized_output.context_stats.packed_evidence_units,
+            finalized_output.context_stats.input_chars,
+            finalized_output.context_stats.packed_chars,
+        );
+        crate::metrics::observe_citation_quality(compute_citation_quality(
+            &finalized_output.claim_map,
+        ));
+
+        let finalized = finalize_session(
+            state,
+            ctx,
+            finalized_output.response_text,
+            finalized_output.claim_map,
+        )
+        .await?;
+
+        let latency_ms = finalize_started.elapsed().as_millis() as u64;
+        tracing::Span::current().record("latency_ms", latency_ms);
+        tracing::Span::current().record("outcome", "ok");
+
+        Ok::<_, (StatusCode, Json<ErrorResponse>)>(finalized)
+    }
+    .instrument(finalize_span)
+    .await?;
+
+    let run_response = RunResponse {
+        terminal_mode: finalized.terminal_mode,
+        trace_id: finalized.trace_id.clone(),
+        claim_map: finalized.claim_map.clone(),
+        response_text: finalized.response_text.clone(),
+        response_kind: classify_run_response_kind(
+            finalized.terminal_mode,
+            finalized.response_text.as_str(),
+            &finalized.claim_map,
+        ),
+    };
+
+    Ok(FinalizedRunArtifacts {
+        persisted_run: PersistedRun {
+            trace_id: finalized.trace_id,
+            request_id: ctx.request_id.to_string(),
+            principal_id: principal_id.to_string(),
+            engine_mode,
+            query: query.to_string(),
+            budget: budget.clone(),
+            session_id: session_id.to_string(),
+            policy_snapshot_id: policy_snapshot_id.to_string(),
+            loop_terminal_mode,
+            loop_response_text,
+            terminal_mode: run_response.terminal_mode,
+            response_text: run_response.response_text.clone(),
+            claim_map: run_response.claim_map.clone(),
+            operator_calls_used,
+            bytes_used,
+            depth_used,
+            evidence_ref_count,
+            evidence_unit_ids,
+            planner_traces,
+        },
+        run_response,
+    })
 }
 
 async fn finalize_session(

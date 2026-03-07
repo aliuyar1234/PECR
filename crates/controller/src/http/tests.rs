@@ -1827,7 +1827,7 @@ async fn wait_for_replays(
     principal_hash: &str,
     minimum: usize,
 ) -> Vec<ReplayBundleMetadata> {
-    let deadline = tokio::time::Instant::now() + Duration::from_secs(2);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
     loop {
         let replays = state
             .replay_store
@@ -1860,6 +1860,9 @@ fn controller_state(
             bind_addr: "127.0.0.1:0".parse().expect("bind addr must parse"),
             gateway_url: format!("http://{}", gateway_addr),
             controller_engine: crate::config::ControllerEngine::Baseline,
+            rlm_default_enabled: false,
+            rlm_auto_fallback_to_baseline: true,
+            baseline_shadow_percent: 0,
             model_provider: crate::config::ModelProvider::Mock,
             rlm_script_path: None,
             budget_defaults: budget,
@@ -2582,6 +2585,7 @@ while True:
         crate::config::default_baseline_plan(),
     );
     state.config.controller_engine = crate::config::ControllerEngine::Rlm;
+    state.config.rlm_auto_fallback_to_baseline = false;
     let persisted_state = state.clone();
 
     let mut headers = HeaderMap::new();
@@ -2649,6 +2653,283 @@ while True:
                     })
         }),
         "bridge failure should stay replay-visible with structured detail"
+    );
+}
+
+#[cfg(feature = "rlm")]
+#[tokio::test]
+async fn run_auto_falls_back_to_baseline_when_rlm_bridge_degrades() {
+    let _env_lock = RLM_SCRIPT_ENV_LOCK
+        .lock()
+        .expect("rlm script env lock should not be poisoned");
+    let script_path = write_temp_bridge_script(
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+start = json.loads(sys.stdin.readline())
+if start.get("type") != "start":
+    raise SystemExit("expected start")
+
+sys.stdout.write(json.dumps({
+    "type": "start_ack",
+    "protocol_version": 1,
+    "backend": "test",
+    "session_mode": "persistent_worker"
+}) + "\n")
+sys.stdout.flush()
+sys.stdout.write(json.dumps({
+    "type": "error",
+    "protocol_version": 1,
+    "reason": "bridge_backend_unavailable",
+    "message": "simulated backend outage"
+}) + "\n")
+sys.stdout.flush()
+"#,
+    );
+
+    let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+    // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+    unsafe {
+        std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+    }
+
+    let budget = Budget {
+        max_operator_calls: 10,
+        max_bytes: 1024 * 1024,
+        max_wallclock_ms: 10_000,
+        max_recursion_depth: 10,
+        max_parallelism: Some(2),
+    };
+    let (gateway_addr, shutdown, task) = spawn_run_gateway().await;
+    let mut state = controller_state(
+        gateway_addr,
+        budget.clone(),
+        crate::config::default_baseline_plan(),
+    );
+    state.config.controller_engine = crate::config::ControllerEngine::Rlm;
+    state.config.rlm_auto_fallback_to_baseline = true;
+    let persisted_state = state.clone();
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-pecr-principal-id", HeaderValue::from_static("dev"));
+    headers.insert(
+        "x-pecr-request-id",
+        HeaderValue::from_static("req-rlm-auto-fallback"),
+    );
+    headers.insert(
+        "x-pecr-trace-id",
+        HeaderValue::from_static("trace-rlm-auto-fallback"),
+    );
+
+    let response = run(
+        State(state),
+        headers,
+        Json(RunRequest {
+            query: "support".to_string(),
+            budget: Some(budget),
+        }),
+    )
+    .await
+    .expect("run should fall back to baseline");
+
+    let principal_hash = hash_principal_id("dev");
+    let replays = wait_for_replays(&persisted_state, &principal_hash, 1).await;
+    let replay = persisted_state
+        .replay_store
+        .load_replay(&principal_hash, &replays[0].run_id)
+        .expect("replay load should succeed")
+        .expect("replay bundle should exist");
+
+    shutdown.send(()).ok();
+    let _ = task.await;
+    if let Some(previous) = previous_script_path {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+        }
+    } else {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+        }
+    }
+    let _ = fs::remove_file(&script_path);
+
+    assert_eq!(response.0.terminal_mode, TerminalMode::Supported);
+    assert!(response.0.response_text.contains("SUPPORTED:"));
+    assert_eq!(replay.metadata.engine_mode, EngineMode::Rlm);
+    assert_eq!(replay.metadata.terminal_mode, TerminalMode::Supported);
+    assert!(
+        replay.planner_traces.iter().any(|trace| {
+            trace.decision_summary.planner_source == "rlm_bridge"
+                && trace.decision_summary.stop_reason == "bridge_backend_unavailable"
+        }),
+        "the original RLM bridge failure should stay replay-visible"
+    );
+    assert!(
+        replay
+            .planner_traces
+            .iter()
+            .any(|trace| trace.decision_summary.planner_source == "rust_owned"
+                && trace.decision_summary.selected_for_execution),
+        "the runtime baseline fallback should be visible in planner traces"
+    );
+}
+
+#[cfg(feature = "rlm")]
+#[tokio::test]
+async fn run_baseline_shadow_persists_comparison_replays_for_rlm_default() {
+    let _env_lock = RLM_SCRIPT_ENV_LOCK
+        .lock()
+        .expect("rlm script env lock should not be poisoned");
+    let script_path = write_temp_bridge_script(
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+start = json.loads(sys.stdin.readline())
+if start.get("type") != "start":
+    raise SystemExit("expected start")
+
+sys.stdout.write(json.dumps({"type": "start_ack", "protocol_version": 1}) + "\n")
+sys.stdout.flush()
+
+call_id = "call-fetch-rows"
+sys.stdout.write(json.dumps({
+    "type": "call_operator",
+    "id": call_id,
+    "depth": 0,
+    "op_name": "fetch_rows",
+    "params": {
+        "view_id": "safe_customer_view_public",
+        "filter_spec": {"customer_id": "cust_public_1"},
+        "fields": ["status", "plan_tier"]
+    }
+}) + "\n")
+sys.stdout.flush()
+
+result = json.loads(sys.stdin.readline())
+if result.get("type") != "operator_result" or result.get("id") != call_id:
+    raise SystemExit("expected operator_result for fetch_rows")
+
+sys.stdout.write(json.dumps({
+    "type": "done",
+    "final_answer": "UNKNOWN: insufficient evidence to answer the query."
+}) + "\n")
+sys.stdout.flush()
+"#,
+    );
+
+    let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+    // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+    unsafe {
+        std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+    }
+
+    let budget = Budget {
+        max_operator_calls: 10,
+        max_bytes: 1024 * 1024,
+        max_wallclock_ms: 10_000,
+        max_recursion_depth: 10,
+        max_parallelism: Some(2),
+    };
+    let (gateway_addr, shutdown, task) = spawn_run_gateway().await;
+    let mut state = controller_state(
+        gateway_addr,
+        budget.clone(),
+        crate::config::default_baseline_plan(),
+    );
+    state.config.controller_engine = crate::config::ControllerEngine::Rlm;
+    state.config.baseline_shadow_percent = 100;
+    let persisted_state = state.clone();
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-pecr-principal-id", HeaderValue::from_static("dev"));
+    headers.insert(
+        "x-pecr-request-id",
+        HeaderValue::from_static("req-rlm-shadow"),
+    );
+    headers.insert(
+        "x-pecr-trace-id",
+        HeaderValue::from_static("trace-rlm-shadow"),
+    );
+
+    let response = run(
+        State(state.clone()),
+        headers.clone(),
+        Json(RunRequest {
+            query: "What is the customer status and plan tier?".to_string(),
+            budget: Some(budget),
+        }),
+    )
+    .await
+    .expect("run should succeed and emit a shadow baseline replay");
+
+    let principal_hash = hash_principal_id("dev");
+    let replays = wait_for_replays(&persisted_state, &principal_hash, 2).await;
+    let engine_modes = replays
+        .iter()
+        .map(|meta| {
+            persisted_state
+                .replay_store
+                .load_replay(&principal_hash, &meta.run_id)
+                .expect("replay load should succeed")
+                .expect("replay bundle should exist")
+                .metadata
+                .engine_mode
+        })
+        .collect::<BTreeSet<_>>();
+
+    let evaluation = submit_evaluation(
+        State(persisted_state.clone()),
+        headers,
+        Json(ReplayEvaluationSubmission {
+            evaluation_name: "rlm-shadow-comparison".to_string(),
+            replay_ids: replays.iter().map(|meta| meta.run_id.clone()).collect(),
+            engine_mode: None,
+            min_quality_score: Some(0.0),
+            max_source_unavailable_rate: Some(1.0),
+        }),
+    )
+    .await
+    .expect("evaluation should compare shadow runs");
+
+    shutdown.send(()).ok();
+    let _ = task.await;
+    if let Some(previous) = previous_script_path {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+        }
+    } else {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+        }
+    }
+    let _ = fs::remove_file(&script_path);
+
+    assert_eq!(response.0.terminal_mode, TerminalMode::Supported);
+    assert_eq!(engine_modes, BTreeSet::from([EngineMode::Baseline, EngineMode::Rlm]));
+    assert!(
+        evaluation.0.scorecards.iter().any(|row| row.engine_mode == EngineMode::Baseline),
+        "baseline shadow runs should surface in replay scorecards"
+    );
+    assert!(
+        evaluation.0.scorecards.iter().any(|row| row.engine_mode == EngineMode::Rlm),
+        "primary RLM runs should remain visible in replay scorecards"
+    );
+    assert!(
+        evaluation.0.engine_comparisons.iter().any(|comparison| {
+            comparison.paired_query_count == 1
+                && matches!(
+                    (comparison.primary_engine_mode, comparison.secondary_engine_mode),
+                    (EngineMode::Baseline, EngineMode::Rlm)
+                        | (EngineMode::Rlm, EngineMode::Baseline)
+                )
+        }),
+        "evaluation should compare primary and shadow runs on the same query"
     );
 }
 
