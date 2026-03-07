@@ -1,6 +1,6 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
-import { Rate } from "k6/metrics";
+import { Counter } from "k6/metrics";
 
 const vus = parseInt(__ENV.VUS || "5", 10);
 const duration = __ENV.DURATION || "15s";
@@ -32,11 +32,11 @@ const sessionBudgetMaxParallelism = parseInt(
   10
 );
 
-const wrongModeRate = new Rate("wrong_mode_rate");
+const wrongModeCount = new Counter("wrong_mode_count");
 
 const thresholds = {};
 if (expectedTerminalMode) {
-  thresholds.wrong_mode_rate = ["rate==0"];
+  thresholds.wrong_mode_count = ["count==0"];
 }
 if (enforceP99) {
   thresholds.http_req_duration = [`p(99)<${p99BudgetMs}`];
@@ -158,7 +158,9 @@ export default function (data) {
   const sessionToken = data && data.sessionToken ? data.sessionToken : "";
 
   if (!sessionId || !sessionToken) {
-    wrongModeRate.add(true);
+    if (expectedTerminalMode) {
+      wrongModeCount.add(1);
+    }
     return;
   }
 
@@ -198,7 +200,9 @@ export default function (data) {
   });
 
   if (expectedTerminalMode) {
-    wrongModeRate.add(!hasTerminalMode || terminalMode !== expectedTerminalMode);
+    if (!hasTerminalMode || terminalMode !== expectedTerminalMode) {
+      wrongModeCount.add(1);
+    }
   }
 }
 

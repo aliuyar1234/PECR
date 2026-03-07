@@ -202,15 +202,13 @@ impl FsVersionCache {
             }
         }
 
-        if out.is_empty() {
-            let mut version_ids = self.list_version_ids(object_id);
-            version_ids.sort();
-            version_ids.reverse();
-            out.extend(
-                version_ids
-                    .into_iter()
-                    .map(|version_id| (version_id, String::new())),
-            );
+        let mut version_ids = self.list_version_ids(object_id);
+        version_ids.sort();
+        version_ids.reverse();
+        for version_id in version_ids {
+            if seen.insert(version_id.clone()) {
+                out.push((version_id, String::new()));
+            }
         }
 
         out
@@ -3294,6 +3292,27 @@ mod tests {
             vec![
                 ("latest".to_string(), "2026-03-02T00:00:00Z".to_string()),
                 ("older".to_string(), "2026-03-01T00:00:00Z".to_string())
+            ]
+        );
+    }
+
+    #[test]
+    fn fs_version_cache_keeps_cached_versions_when_as_of_time_is_reused() {
+        let mut cache = FsVersionCache::new(1024, 4);
+        cache.insert("public/support_policy.txt", "older", b"older".to_vec());
+        cache.observe_version("public/support_policy.txt", "1970-01-01T00:00:00Z", "older");
+        cache.insert("public/support_policy.txt", "latest", b"latest".to_vec());
+        cache.observe_version(
+            "public/support_policy.txt",
+            "1970-01-01T00:00:00Z",
+            "latest",
+        );
+
+        assert_eq!(
+            cache.ordered_versions("public/support_policy.txt"),
+            vec![
+                ("latest".to_string(), "1970-01-01T00:00:00Z".to_string()),
+                ("older".to_string(), String::new())
             ]
         );
     }

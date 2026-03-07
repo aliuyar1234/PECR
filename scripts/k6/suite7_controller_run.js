@@ -1,6 +1,6 @@
 import http from "k6/http";
 import { check, sleep } from "k6";
-import { Rate } from "k6/metrics";
+import { Counter } from "k6/metrics";
 
 const vus = parseInt(__ENV.VUS || "10", 10);
 const duration = __ENV.DURATION || "20s";
@@ -13,14 +13,14 @@ const enforceP99 = (__ENV.ENFORCE_P99 || "1") === "1";
 const p99BudgetMs = parseInt(__ENV.P99_BUDGET_MS || "2000", 10);
 const healthTimeoutMs = parseInt(__ENV.HEALTH_TIMEOUT_MS || "60000", 10);
 
-const wrongModeRate = new Rate("wrong_mode_rate");
+const wrongModeCount = new Counter("wrong_mode_count");
 
 const thresholds = {};
 if (enforceP99) {
   thresholds.http_req_duration = [`p(99)<${p99BudgetMs}`];
 }
 if (expectedTerminalMode) {
-  thresholds.wrong_mode_rate = ["rate==0"];
+  thresholds.wrong_mode_count = ["count==0"];
 }
 
 export const options = {
@@ -80,6 +80,8 @@ export default function () {
   });
 
   if (expectedTerminalMode) {
-    wrongModeRate.add(!hasTerminalMode || terminalMode !== expectedTerminalMode);
+    if (!hasTerminalMode || terminalMode !== expectedTerminalMode) {
+      wrongModeCount.add(1);
+    }
   }
 }
