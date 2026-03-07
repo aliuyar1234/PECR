@@ -1,0 +1,56 @@
+name: rlm-real-backend-smoke
+
+on:
+  workflow_dispatch:
+
+jobs:
+  rlm_real_backend_smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Check RLM real-backend config
+        id: cfg
+        shell: bash
+        env:
+          PECR_RLM_MODEL_NAME: ${{ vars.PECR_RLM_OPENAI_MODEL_NAME }}
+          PECR_RLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [[ -n "${PECR_RLM_MODEL_NAME}" && -n "${PECR_RLM_API_KEY}" ]]; then
+            echo "enabled=true" >> "$GITHUB_OUTPUT"
+            echo "Configured real backend smoke lane." | tee artifacts/rlm_real_backend_smoke.log
+          else
+            echo "enabled=false" >> "$GITHUB_OUTPUT"
+            echo "Skipping real backend smoke lane: configure repo variable PECR_RLM_OPENAI_MODEL_NAME and secret OPENAI_API_KEY." | tee artifacts/rlm_real_backend_smoke.log
+          fi
+
+      - name: Install vendored RLM Python dependencies
+        if: steps.cfg.outputs.enabled == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 -m pip install --upgrade pip
+          python3 -m pip install -e ./vendor/rlm
+
+      - name: Run real backend smoke
+        if: steps.cfg.outputs.enabled == 'true'
+        shell: bash
+        env:
+          PECR_RLM_BACKEND: openai
+          PECR_RLM_MODEL_NAME: ${{ vars.PECR_RLM_OPENAI_MODEL_NAME }}
+          PECR_RLM_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          PECR_RLM_BASE_URL: ${{ vars.PECR_RLM_BASE_URL }}
+          PECR_RLM_MAX_ITERATIONS: "4"
+        run: |
+          set -euo pipefail
+          python3 -B scripts/rlm/openai_bridge_smoke.py 2>&1 | tee -a artifacts/rlm_real_backend_smoke.log
+
+      - name: Upload smoke artifacts
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: rlm-real-backend-smoke
+          path: artifacts
+          if-no-files-found: error

@@ -24,7 +24,13 @@ use std::path::PathBuf;
 #[cfg(feature = "rlm")]
 use std::process::Stdio;
 #[cfg(feature = "rlm")]
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use std::sync::Arc;
+#[cfg(feature = "rlm")]
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, Lines};
+#[cfg(feature = "rlm")]
+use tokio::process::{Child, ChildStdin, ChildStdout};
+#[cfg(feature = "rlm")]
+use tokio::sync::Mutex as AsyncMutex;
 
 const PLANNER_AVAILABLE_OPERATOR_NAMES: &[&str] = &[
     "aggregate",
@@ -193,6 +199,33 @@ struct PendingBatchCall {
 const RLM_BRIDGE_PROTOCOL_MIN_VERSION: u32 = 1;
 #[cfg(feature = "rlm")]
 const RLM_BRIDGE_PROTOCOL_MAX_VERSION: u32 = 1;
+
+#[cfg(feature = "rlm")]
+#[derive(Clone, Default)]
+pub(super) struct RlmBridgeRuntime {
+    cached_process: Arc<AsyncMutex<Option<CachedRlmBridgeProcess>>>,
+}
+
+#[cfg(feature = "rlm")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RlmBridgeProcessKey {
+    python: String,
+    script_path: PathBuf,
+}
+
+#[cfg(feature = "rlm")]
+struct CachedRlmBridgeProcess {
+    key: RlmBridgeProcessKey,
+    child: Child,
+    stdin: ChildStdin,
+    stdout_lines: Lines<BufReader<ChildStdout>>,
+}
+
+#[cfg(feature = "rlm")]
+struct RlmBridgeSetupError {
+    stop_reason: &'static str,
+    message: String,
+}
 
 #[derive(Clone, Copy)]
 pub(super) struct GatewayCallContext<'a> {
@@ -1682,7 +1715,7 @@ fn replay_planner_trace(
     plan_request: PlanRequest,
     output_steps: Vec<PlannerStep>,
     planner_source: &str,
-    stop_reason: &str,
+    stop_reason: impl Into<String>,
     selected_for_execution: bool,
     planner_summary: Option<String>,
 ) -> ReplayPlannerTrace {
@@ -1693,7 +1726,7 @@ fn replay_planner_trace(
         decision_summary: {
             let mut decision_summary = ReplayPlannerDecisionSummary {
                 planner_source: planner_source.to_string(),
-                stop_reason: stop_reason.to_string(),
+                stop_reason: stop_reason.into(),
                 selected_for_execution,
                 used_fallback_plan: false,
                 fallback_from_step: None,
@@ -3346,6 +3379,192 @@ fn should_short_circuit_mock_perf_probe(
         && plan_request.planner_hints.intent == PlannerIntent::Default
 }
 
+#[cfg(feature = "rlm")]
+fn default_rlm_python() -> String {
+    std::env::var("PECR_RLM_PYTHON")
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| {
+            if cfg!(windows) {
+                "python".to_string()
+            } else {
+                "python3".to_string()
+            }
+        })
+}
+
+#[cfg(feature = "rlm")]
+fn resolve_rlm_bridge_process_key(
+    explicit_script_path: Option<PathBuf>,
+) -> Result<RlmBridgeProcessKey, RlmBridgeSetupError> {
+    let python = default_rlm_python();
+    let script_path = explicit_script_path
+        .or_else(|| {
+            let candidates = [
+                PathBuf::from("/usr/local/share/pecr/pecr_rlm_bridge.py"),
+                PathBuf::from("scripts/rlm/pecr_rlm_bridge.py"),
+            ];
+            candidates.into_iter().find(|p| p.exists())
+        })
+        .ok_or_else(|| RlmBridgeSetupError {
+            stop_reason: "bridge_script_not_found",
+            message: "rlm bridge script not found; set PECR_RLM_SCRIPT_PATH or ensure scripts/rlm/pecr_rlm_bridge.py is present"
+                .to_string(),
+        })?;
+
+    Ok(RlmBridgeProcessKey {
+        python,
+        script_path,
+    })
+}
+
+#[cfg(feature = "rlm")]
+async fn reset_cached_rlm_bridge_process(cached: &mut Option<CachedRlmBridgeProcess>) {
+    if let Some(process) = cached.as_mut() {
+        let _ = process.child.kill().await;
+        let _ = tokio::time::timeout(Duration::from_millis(250), process.child.wait()).await;
+    }
+    *cached = None;
+}
+
+#[cfg(feature = "rlm")]
+fn cached_rlm_bridge_process_matches(
+    cached: &mut CachedRlmBridgeProcess,
+    key: &RlmBridgeProcessKey,
+) -> bool {
+    if &cached.key != key {
+        return false;
+    }
+    cached.child.try_wait().ok().flatten().is_none()
+}
+
+#[cfg(feature = "rlm")]
+async fn spawn_cached_rlm_bridge_process(
+    key: RlmBridgeProcessKey,
+) -> Result<CachedRlmBridgeProcess, RlmBridgeSetupError> {
+    let mut child = tokio::process::Command::new(&key.python)
+        .arg(&key.script_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .kill_on_drop(true)
+        .spawn()
+        .map_err(|_| RlmBridgeSetupError {
+            stop_reason: "bridge_spawn_failed",
+            message: format!(
+                "failed to spawn rlm bridge (python={}, script={})",
+                key.python,
+                key.script_path.display()
+            ),
+        })?;
+
+    let stdin = child.stdin.take().ok_or_else(|| RlmBridgeSetupError {
+        stop_reason: "bridge_internal",
+        message: "failed to open rlm bridge stdin".to_string(),
+    })?;
+    let stdout = child.stdout.take().ok_or_else(|| RlmBridgeSetupError {
+        stop_reason: "bridge_internal",
+        message: "failed to open rlm bridge stdout".to_string(),
+    })?;
+    let stderr = child.stderr.take().ok_or_else(|| RlmBridgeSetupError {
+        stop_reason: "bridge_internal",
+        message: "failed to open rlm bridge stderr".to_string(),
+    })?;
+
+    let python = key.python.clone();
+    let script_path = key.script_path.clone();
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::warn!(
+                python = %python,
+                script_path = %script_path.display(),
+                line = %line,
+                "rlm.bridge.stderr"
+            );
+        }
+    });
+
+    Ok(CachedRlmBridgeProcess {
+        key,
+        child,
+        stdin,
+        stdout_lines: BufReader::new(stdout).lines(),
+    })
+}
+
+#[cfg(feature = "rlm")]
+async fn ensure_cached_rlm_bridge_process(
+    runtime: &RlmBridgeRuntime,
+    explicit_script_path: Option<PathBuf>,
+) -> Result<tokio::sync::MutexGuard<'_, Option<CachedRlmBridgeProcess>>, RlmBridgeSetupError> {
+    let key = resolve_rlm_bridge_process_key(explicit_script_path)?;
+    let mut cached = runtime.cached_process.lock().await;
+    let needs_respawn = match cached.as_mut() {
+        Some(process) => !cached_rlm_bridge_process_matches(process, &key),
+        None => true,
+    };
+
+    if needs_respawn {
+        reset_cached_rlm_bridge_process(&mut cached).await;
+        *cached = Some(spawn_cached_rlm_bridge_process(key).await?);
+    }
+
+    Ok(cached)
+}
+
+#[cfg(feature = "rlm")]
+fn rlm_bridge_planner_summary(
+    protocol_version: Option<u32>,
+    backend: Option<&str>,
+    session_mode: Option<&str>,
+    detail: Option<&str>,
+) -> Option<String> {
+    let mut parts = Vec::<String>::new();
+    if let Some(version) = protocol_version {
+        parts.push(format!("protocol_version={version}"));
+    }
+    if let Some(backend) = backend.filter(|value| !value.is_empty()) {
+        parts.push(format!("backend={backend}"));
+    }
+    if let Some(session_mode) = session_mode.filter(|value| !value.is_empty()) {
+        parts.push(format!("session_mode={session_mode}"));
+    }
+    if let Some(detail) = detail.map(str::trim).filter(|value| !value.is_empty()) {
+        parts.push(detail.to_string());
+    }
+    (!parts.is_empty()).then(|| parts.join("; "))
+}
+
+#[cfg(feature = "rlm")]
+fn bridge_failure_context_loop_result(
+    plan_request: PlanRequest,
+    output_steps: Vec<PlannerStep>,
+    stop_reason: &str,
+    planner_summary: Option<String>,
+) -> ContextLoopResult {
+    ContextLoopResult {
+        terminal_mode: TerminalMode::SourceUnavailable,
+        response_text: Some(super::finalize::response_text_for_terminal_mode(
+            TerminalMode::SourceUnavailable,
+        )),
+        planner_traces: vec![replay_planner_trace(
+            plan_request,
+            output_steps,
+            "rlm_bridge",
+            stop_reason,
+            true,
+            planner_summary,
+        )],
+        evidence_refs: Vec::new(),
+        evidence_units: Vec::new(),
+        operator_calls_used: 0,
+        bytes_used: 0,
+        depth_used: 0,
+    }
+}
+
 fn recovery_plan_request_for_query(
     query: &str,
     budget: &Budget,
@@ -3380,8 +3599,12 @@ pub(super) async fn run_context_loop_rlm(
     let mut operator_calls_used: u32 = 0;
     let mut bytes_used: u64 = 0;
     let mut depth_used: u32 = 0;
-    let mut stop_reason: Option<&'static str> = None;
+    let mut stop_reason: Option<String> = None;
     let mut budget_violation = false;
+    let mut bridge_protocol_version: Option<u32> = None;
+    let mut bridge_backend: Option<String> = None;
+    let mut bridge_session_mode: Option<String> = None;
+    let mut bridge_detail: Option<String> = None;
 
     let mut evidence_refs = Vec::<EvidenceUnitRef>::new();
     let mut evidence_units = Vec::<EvidenceUnit>::new();
@@ -3432,99 +3655,22 @@ pub(super) async fn run_context_loop_rlm(
         });
     }
 
-    let python = std::env::var("PECR_RLM_PYTHON")
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| {
-            if cfg!(windows) {
-                "python".to_string()
-            } else {
-                "python3".to_string()
-            }
-        });
-
-    let script_path = explicit_script_path
-        .or_else(|| {
-            let candidates = [
-                PathBuf::from("/usr/local/share/pecr/pecr_rlm_bridge.py"),
-                PathBuf::from("scripts/rlm/pecr_rlm_bridge.py"),
-            ];
-            candidates.into_iter().find(|p| p.exists())
-        })
-        .ok_or_else(|| {
-            json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "ERR_RLM_BRIDGE_SCRIPT_NOT_FOUND",
-                "rlm bridge script not found; set PECR_RLM_SCRIPT_PATH or ensure scripts/rlm/pecr_rlm_bridge.py is present"
-                    .to_string(),
-                TerminalMode::SourceUnavailable,
-                false,
-            )
-        })?;
-
-    let mut child = tokio::process::Command::new(&python)
-        .arg(&script_path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|_| {
-            json_error(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "ERR_RLM_BRIDGE_SPAWN_FAILED",
-                format!(
-                    "failed to spawn rlm bridge (python={}, script={})",
-                    python,
-                    script_path.display()
-                ),
-                TerminalMode::SourceUnavailable,
-                false,
-            )
-        })?;
-
-    let mut child_stdin = child.stdin.take().ok_or_else(|| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ERR_RLM_BRIDGE_INTERNAL",
-            "failed to open rlm bridge stdin".to_string(),
-            TerminalMode::SourceUnavailable,
-            false,
-        )
-    })?;
-    let child_stdout = child.stdout.take().ok_or_else(|| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ERR_RLM_BRIDGE_INTERNAL",
-            "failed to open rlm bridge stdout".to_string(),
-            TerminalMode::SourceUnavailable,
-            false,
-        )
-    })?;
-    let child_stderr = child.stderr.take().ok_or_else(|| {
-        json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ERR_RLM_BRIDGE_INTERNAL",
-            "failed to open rlm bridge stderr".to_string(),
-            TerminalMode::SourceUnavailable,
-            false,
-        )
-    })?;
-
-    let trace_id = ctx.trace_id.to_string();
-    let request_id = ctx.request_id.to_string();
-    tokio::spawn(async move {
-        let mut lines = tokio::io::BufReader::new(child_stderr).lines();
-        while let Ok(Some(line)) = lines.next_line().await {
-            tracing::warn!(
-                trace_id = %trace_id,
-                request_id = %request_id,
-                line = %line,
-                "rlm.bridge.stderr"
-            );
+    let mut bridge_process = match ensure_cached_rlm_bridge_process(
+        &state.rlm_bridge_runtime,
+        explicit_script_path.clone(),
+    )
+    .await
+    {
+        Ok(guard) => guard,
+        Err(err) => {
+            return Ok(bridge_failure_context_loop_result(
+                plan_request,
+                Vec::new(),
+                err.stop_reason,
+                Some(err.message),
+            ));
         }
-    });
-
+    };
     let planner_hints = plan_request.planner_hints.clone();
     let mut planner_output_steps = Vec::<PlannerStep>::new();
     let start_msg = serde_json::json!({
@@ -3547,7 +3693,10 @@ pub(super) async fn run_context_loop_rlm(
             false,
         )
     })?;
-    child_stdin
+    bridge_process
+        .as_mut()
+        .expect("cached bridge process should exist")
+        .stdin
         .write_all(format!("{}\n", start_line).as_bytes())
         .await
         .map_err(|_| {
@@ -3560,87 +3709,117 @@ pub(super) async fn run_context_loop_rlm(
             )
         })?;
 
-    let mut stdout_lines = tokio::io::BufReader::new(child_stdout).lines();
     let mut response_text: Option<String> = None;
     let mut operator_summaries = Vec::<String>::new();
     let mut pending_msg: Option<serde_json::Value> = None;
 
     if let Some(timeout) = scheduler.remaining_wallclock() {
-        let next_line = tokio::time::timeout(timeout, stdout_lines.next_line()).await;
+        let next_line = tokio::time::timeout(
+            timeout,
+            bridge_process
+                .as_mut()
+                .expect("cached bridge process should exist")
+                .stdout_lines
+                .next_line(),
+        )
+        .await;
         let first_line = match next_line {
             Ok(Ok(Some(line))) => line,
             Ok(Ok(None)) => {
-                stop_reason = Some("bridge_eof");
+                stop_reason = Some("bridge_eof".to_string());
                 String::new()
             }
             Ok(Err(_)) => {
-                stop_reason = Some("bridge_read_error");
+                stop_reason = Some("bridge_read_error".to_string());
                 String::new()
             }
             Err(_) => {
-                stop_reason = Some(BudgetStopReason::WallclockMs.as_str());
+                stop_reason = Some(BudgetStopReason::WallclockMs.as_str().to_string());
                 budget_violation = true;
                 String::new()
             }
         };
 
         if stop_reason.is_none() {
-            let first_msg =
-                serde_json::from_str::<serde_json::Value>(&first_line).map_err(|_| {
-                    json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "ERR_RLM_BRIDGE_PROTOCOL",
-                        "rlm bridge emitted invalid json".to_string(),
-                        TerminalMode::SourceUnavailable,
-                        false,
-                    )
-                })?;
+            let first_msg = match serde_json::from_str::<serde_json::Value>(&first_line) {
+                Ok(msg) => msg,
+                Err(_) => {
+                    stop_reason = Some("bridge_invalid_json".to_string());
+                    bridge_detail = Some("rlm bridge emitted invalid json".to_string());
+                    serde_json::Value::Null
+                }
+            };
             let first_msg_type = first_msg
                 .get("type")
                 .and_then(|v| v.as_str())
                 .unwrap_or_default();
             if first_msg_type == "start_ack" {
-                let version = first_msg
+                let version = match first_msg
                     .get("protocol_version")
                     .and_then(|v| v.as_u64())
-                    .ok_or_else(|| {
-                        json_error(
-                            StatusCode::INTERNAL_SERVER_ERROR,
-                            "ERR_RLM_BRIDGE_PROTOCOL",
-                            "rlm bridge start_ack missing protocol_version".to_string(),
-                            TerminalMode::SourceUnavailable,
-                            false,
-                        )
-                    })? as u32;
-                if !(RLM_BRIDGE_PROTOCOL_MIN_VERSION..=RLM_BRIDGE_PROTOCOL_MAX_VERSION)
-                    .contains(&version)
+                    .map(|value| value as u32)
                 {
-                    return Err(json_error(
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        "ERR_RLM_BRIDGE_PROTOCOL",
-                        format!(
+                    Some(version) => version,
+                    None => {
+                        stop_reason = Some("bridge_protocol_missing_version".to_string());
+                        bridge_detail =
+                            Some("rlm bridge start_ack missing protocol_version".to_string());
+                        0
+                    }
+                };
+                if stop_reason.is_some() {
+                    // Keep the request replay-visible and let the main loop degrade cleanly.
+                } else {
+                    bridge_protocol_version = Some(version);
+                    bridge_backend = first_msg
+                        .get("backend")
+                        .and_then(|v| v.as_str())
+                        .map(|value| value.to_string());
+                    bridge_session_mode = first_msg
+                        .get("session_mode")
+                        .and_then(|v| v.as_str())
+                        .map(|value| value.to_string());
+                    if !(RLM_BRIDGE_PROTOCOL_MIN_VERSION..=RLM_BRIDGE_PROTOCOL_MAX_VERSION)
+                        .contains(&version)
+                    {
+                        stop_reason = Some("bridge_protocol_version_unsupported".to_string());
+                        bridge_detail = Some(format!(
                             "unsupported rlm bridge protocol_version={} (supported {}-{})",
                             version,
                             RLM_BRIDGE_PROTOCOL_MIN_VERSION,
                             RLM_BRIDGE_PROTOCOL_MAX_VERSION
-                        ),
-                        TerminalMode::SourceUnavailable,
-                        false,
-                    ));
+                        ));
+                    }
                 }
+            } else if first_msg_type == "error" {
+                terminal_mode = TerminalMode::SourceUnavailable;
+                response_text = Some(super::finalize::response_text_for_terminal_mode(
+                    TerminalMode::SourceUnavailable,
+                ));
+                stop_reason = Some(
+                    first_msg
+                        .get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("bridge_error")
+                        .to_string(),
+                );
+                bridge_detail = first_msg
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(|value| value.to_string());
             } else {
                 // Backward compatibility: older bridges start directly with protocol messages.
                 pending_msg = Some(first_msg);
             }
         }
     } else {
-        stop_reason = Some(BudgetStopReason::WallclockMs.as_str());
+        stop_reason = Some(BudgetStopReason::WallclockMs.as_str().to_string());
         budget_violation = true;
     }
 
     while stop_reason.is_none() {
         let Some(timeout) = scheduler.remaining_wallclock() else {
-            stop_reason = Some(BudgetStopReason::WallclockMs.as_str());
+            stop_reason = Some(BudgetStopReason::WallclockMs.as_str().to_string());
             budget_violation = true;
             break;
         };
@@ -3648,32 +3827,39 @@ pub(super) async fn run_context_loop_rlm(
         let msg = if let Some(msg) = pending_msg.take() {
             msg
         } else {
-            let next_line = tokio::time::timeout(timeout, stdout_lines.next_line()).await;
+            let next_line = tokio::time::timeout(
+                timeout,
+                bridge_process
+                    .as_mut()
+                    .expect("cached bridge process should exist")
+                    .stdout_lines
+                    .next_line(),
+            )
+            .await;
             let line = match next_line {
                 Ok(Ok(Some(line))) => line,
                 Ok(Ok(None)) => {
-                    stop_reason = Some("bridge_eof");
+                    stop_reason = Some("bridge_eof".to_string());
                     break;
                 }
                 Ok(Err(_)) => {
-                    stop_reason = Some("bridge_read_error");
+                    stop_reason = Some("bridge_read_error".to_string());
                     break;
                 }
                 Err(_) => {
-                    stop_reason = Some(BudgetStopReason::WallclockMs.as_str());
+                    stop_reason = Some(BudgetStopReason::WallclockMs.as_str().to_string());
                     budget_violation = true;
                     break;
                 }
             };
-            serde_json::from_str::<serde_json::Value>(&line).map_err(|_| {
-                json_error(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    "ERR_RLM_BRIDGE_PROTOCOL",
-                    "rlm bridge emitted invalid json".to_string(),
-                    TerminalMode::SourceUnavailable,
-                    false,
-                )
-            })?
+            match serde_json::from_str::<serde_json::Value>(&line) {
+                Ok(msg) => msg,
+                Err(_) => {
+                    stop_reason = Some("bridge_invalid_json".to_string());
+                    bridge_detail = Some("rlm bridge emitted invalid json".to_string());
+                    break;
+                }
+            }
         };
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or_default();
         let bridge_depth = msg.get("depth").and_then(|v| v.as_u64()).unwrap_or(0) as u32;
@@ -3718,11 +3904,11 @@ pub(super) async fn run_context_loop_rlm(
                 let params = msg.get("params").cloned().unwrap_or(serde_json::json!({}));
 
                 if id.is_empty() {
-                    stop_reason = Some("bridge_invalid_message");
+                    stop_reason = Some("bridge_invalid_message".to_string());
                     break;
                 }
                 if let Err(reason) = scheduler_span.in_scope(|| scheduler.check_depth(depth)) {
-                    stop_reason = Some(reason.as_str());
+                    stop_reason = Some(reason.as_str().to_string());
                     budget_violation = true;
                     break;
                 }
@@ -3731,13 +3917,8 @@ pub(super) async fn run_context_loop_rlm(
                 if let Err(reason) =
                     scheduler_span.in_scope(|| scheduler.check_operator_calls(operator_calls_used))
                 {
-                    stop_reason = Some(reason.as_str());
+                    stop_reason = Some(reason.as_str().to_string());
                     budget_violation = true;
-                    break;
-                }
-
-                if !allowed_operator(op_name.as_str()) {
-                    stop_reason = Some("bridge_operator_not_allowlisted");
                     break;
                 }
 
@@ -3745,6 +3926,16 @@ pub(super) async fn run_context_loop_rlm(
                     op_name: op_name.clone(),
                     params: params.clone(),
                 });
+
+                if !allowed_operator(op_name.as_str()) {
+                    stop_reason = Some("bridge_invalid_tool_request".to_string());
+                    bridge_detail = Some(format!(
+                        "bridge requested disallowed operator '{}'",
+                        op_name
+                    ));
+                    break;
+                }
+
                 let outcome = call_operator(state, ctx, op_name.as_str(), params, timeout).await?;
                 operator_calls_used = operator_calls_used.saturating_add(1);
                 bytes_used = bytes_used.saturating_add(outcome.bytes_len as u64);
@@ -3755,6 +3946,9 @@ pub(super) async fn run_context_loop_rlm(
                         body.result_summary.as_deref(),
                     );
                     let terminal_mode_for_resp = body.terminal_mode;
+                    if terminal_mode_for_resp == TerminalMode::Supported {
+                        terminal_mode = TerminalMode::Supported;
+                    }
                     let result = body.result;
                     record_operator_result(
                         op_name.as_str(),
@@ -3780,7 +3974,10 @@ pub(super) async fn run_context_loop_rlm(
                             false,
                         )
                     })?;
-                    child_stdin
+                    bridge_process
+                        .as_mut()
+                        .expect("cached bridge process should exist")
+                        .stdin
                         .write_all(format!("{}\n", resp_line).as_bytes())
                         .await
                         .map_err(|_| {
@@ -3794,7 +3991,7 @@ pub(super) async fn run_context_loop_rlm(
                         })?;
                 } else {
                     terminal_mode = outcome.terminal_mode_hint;
-                    stop_reason = Some("operator_error");
+                    stop_reason = Some("operator_error".to_string());
 
                     let resp = serde_json::json!({
                         "type": "operator_result",
@@ -3813,14 +4010,17 @@ pub(super) async fn run_context_loop_rlm(
                             false,
                         )
                     })?;
-                    let _ = child_stdin
+                    let _ = bridge_process
+                        .as_mut()
+                        .expect("cached bridge process should exist")
+                        .stdin
                         .write_all(format!("{}\n", resp_line).as_bytes())
                         .await;
                     break;
                 }
 
                 if let Err(reason) = scheduler_span.in_scope(|| scheduler.check_bytes(bytes_used)) {
-                    stop_reason = Some(reason.as_str());
+                    stop_reason = Some(reason.as_str().to_string());
                     budget_violation = true;
                     break;
                 }
@@ -3839,11 +4039,11 @@ pub(super) async fn run_context_loop_rlm(
                     .unwrap_or_default();
 
                 if id.is_empty() || calls.is_empty() {
-                    stop_reason = Some("bridge_invalid_message");
+                    stop_reason = Some("bridge_invalid_message".to_string());
                     break;
                 }
                 if let Err(reason) = scheduler_span.in_scope(|| scheduler.check_depth(depth)) {
-                    stop_reason = Some(reason.as_str());
+                    stop_reason = Some(reason.as_str().to_string());
                     budget_violation = true;
                     break;
                 }
@@ -3857,30 +4057,34 @@ pub(super) async fn run_context_loop_rlm(
                         if let Err(reason) = scheduler_span
                             .in_scope(|| scheduler.check_operator_calls(operator_calls_used))
                         {
-                            stop_reason = Some(reason.as_str());
+                            stop_reason = Some(reason.as_str().to_string());
                             budget_violation = true;
                             break_outer = true;
                             break;
                         }
 
                         let op_name = call.op_name.trim();
+                        planner_output_steps.push(PlannerStep::Operator {
+                            op_name: op_name.to_string(),
+                            params: call.params.clone(),
+                        });
                         if op_name.is_empty() || !allowed_operator(op_name) {
-                            stop_reason = Some("bridge_operator_not_allowlisted");
+                            stop_reason = Some("bridge_invalid_tool_request".to_string());
+                            bridge_detail = Some(format!(
+                                "bridge requested disallowed operator '{}'",
+                                op_name
+                            ));
                             break_outer = true;
                             break;
                         }
 
                         let Some(timeout) = scheduler.remaining_wallclock() else {
-                            stop_reason = Some(BudgetStopReason::WallclockMs.as_str());
+                            stop_reason = Some(BudgetStopReason::WallclockMs.as_str().to_string());
                             budget_violation = true;
                             break_outer = true;
                             break;
                         };
 
-                        planner_output_steps.push(PlannerStep::Operator {
-                            op_name: op_name.to_string(),
-                            params: call.params.clone(),
-                        });
                         let outcome =
                             call_operator(state, ctx, op_name, call.params.clone(), timeout)
                                 .await?;
@@ -3893,6 +4097,9 @@ pub(super) async fn run_context_loop_rlm(
                                 body.result_summary.as_deref(),
                             );
                             let terminal_mode_for_resp = body.terminal_mode;
+                            if terminal_mode_for_resp == TerminalMode::Supported {
+                                terminal_mode = TerminalMode::Supported;
+                            }
                             let result = body.result;
                             record_operator_result(
                                 op_name,
@@ -3909,7 +4116,7 @@ pub(super) async fn run_context_loop_rlm(
                             });
                         } else {
                             terminal_mode = outcome.terminal_mode_hint;
-                            stop_reason = Some("operator_error");
+                            stop_reason = Some("operator_error".to_string());
                             batch_results[idx] = serde_json::json!({
                                 "ok": false,
                                 "op_name": op_name,
@@ -3924,7 +4131,7 @@ pub(super) async fn run_context_loop_rlm(
                         if let Err(reason) =
                             scheduler_span.in_scope(|| scheduler.check_bytes(bytes_used))
                         {
-                            stop_reason = Some(reason.as_str());
+                            stop_reason = Some(reason.as_str().to_string());
                             budget_violation = true;
                             break_outer = true;
                             break;
@@ -3939,8 +4146,16 @@ pub(super) async fn run_context_loop_rlm(
 
                     for (idx, call) in calls.iter().enumerate() {
                         let op_name = call.op_name.trim();
+                        planner_output_steps.push(PlannerStep::Operator {
+                            op_name: op_name.to_string(),
+                            params: call.params.clone(),
+                        });
                         if op_name.is_empty() || !allowed_operator(op_name) {
-                            stop_reason = Some("bridge_operator_not_allowlisted");
+                            stop_reason = Some("bridge_invalid_tool_request".to_string());
+                            bridge_detail = Some(format!(
+                                "bridge requested disallowed operator '{}'",
+                                op_name
+                            ));
                             break_outer = true;
                             break;
                         }
@@ -3972,7 +4187,7 @@ pub(super) async fn run_context_loop_rlm(
                         break;
                     }
                     if fairness_ring.is_empty() {
-                        stop_reason = Some("bridge_invalid_message");
+                        stop_reason = Some("bridge_invalid_message".to_string());
                         break;
                     }
 
@@ -3993,7 +4208,7 @@ pub(super) async fn run_context_loop_rlm(
                                     scheduled_calls,
                                 )
                             }) {
-                                stop_reason = Some(reason.as_str());
+                                stop_reason = Some(reason.as_str().to_string());
                                 budget_violation = true;
                                 break_outer = true;
                                 break 'batch_loop;
@@ -4015,17 +4230,14 @@ pub(super) async fn run_context_loop_rlm(
                             };
 
                             let Some(timeout) = scheduler.remaining_wallclock() else {
-                                stop_reason = Some(BudgetStopReason::WallclockMs.as_str());
+                                stop_reason =
+                                    Some(BudgetStopReason::WallclockMs.as_str().to_string());
                                 budget_violation = true;
                                 break_outer = true;
                                 break 'batch_loop;
                             };
 
                             scheduled_calls = scheduled_calls.saturating_add(1);
-                            planner_output_steps.push(PlannerStep::Operator {
-                                op_name: op_name.clone(),
-                                params: params.clone(),
-                            });
                             let queued_at = Instant::now();
                             in_flight.push(async move {
                                 crate::metrics::observe_operator_queue_wait(queued_at.elapsed());
@@ -4044,7 +4256,7 @@ pub(super) async fn run_context_loop_rlm(
                             if !has_pending_calls {
                                 break;
                             }
-                            stop_reason = Some("bridge_invalid_message");
+                            stop_reason = Some("bridge_invalid_message".to_string());
                             break_outer = true;
                             break;
                         }
@@ -4067,6 +4279,9 @@ pub(super) async fn run_context_loop_rlm(
                                 body.result_summary.as_deref(),
                             );
                             let terminal_mode_for_resp = body.terminal_mode;
+                            if terminal_mode_for_resp == TerminalMode::Supported {
+                                terminal_mode = TerminalMode::Supported;
+                            }
                             let result = body.result;
                             record_operator_result(
                                 op_name.as_str(),
@@ -4083,7 +4298,7 @@ pub(super) async fn run_context_loop_rlm(
                             });
                         } else {
                             terminal_mode = outcome.terminal_mode_hint;
-                            stop_reason = Some("operator_error");
+                            stop_reason = Some("operator_error".to_string());
                             batch_results[idx] = serde_json::json!({
                                 "ok": false,
                                 "op_name": op_name,
@@ -4098,7 +4313,7 @@ pub(super) async fn run_context_loop_rlm(
                         if let Err(reason) =
                             scheduler_span.in_scope(|| scheduler.check_bytes(bytes_used))
                         {
-                            stop_reason = Some(reason.as_str());
+                            stop_reason = Some(reason.as_str().to_string());
                             budget_violation = true;
                             break_outer = true;
                             break;
@@ -4124,7 +4339,10 @@ pub(super) async fn run_context_loop_rlm(
                         false,
                     )
                 })?;
-                child_stdin
+                bridge_process
+                    .as_mut()
+                    .expect("cached bridge process should exist")
+                    .stdin
                     .write_all(format!("{}\n", resp_line).as_bytes())
                     .await
                     .map_err(|_| {
@@ -4142,11 +4360,63 @@ pub(super) async fn run_context_loop_rlm(
                     .get("final_answer")
                     .and_then(|v| v.as_str())
                     .map(|s| s.to_string());
-                stop_reason = Some("rlm_done");
+                stop_reason = Some(
+                    msg.get("stop_reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("rlm_done")
+                        .to_string(),
+                );
+                bridge_detail = msg
+                    .get("planner_summary")
+                    .and_then(|v| v.as_str())
+                    .map(|value| value.to_string())
+                    .or(bridge_detail);
+                if bridge_protocol_version.is_none() {
+                    bridge_protocol_version = msg
+                        .get("protocol_version")
+                        .and_then(|v| v.as_u64())
+                        .map(|value| value as u32);
+                }
+                if let Some(stop_reason_value) = stop_reason.as_deref()
+                    && stop_reason_value.starts_with("rlm_")
+                {
+                    bridge_backend = bridge_backend.or_else(|| {
+                        stop_reason_value
+                            .strip_prefix("rlm_")
+                            .and_then(|value| value.strip_suffix("_done"))
+                            .map(|value| value.to_string())
+                    });
+                }
+                break;
+            }
+            "error" => {
+                terminal_mode = TerminalMode::SourceUnavailable;
+                response_text = Some(super::finalize::response_text_for_terminal_mode(
+                    TerminalMode::SourceUnavailable,
+                ));
+                stop_reason = Some(
+                    msg.get("reason")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("bridge_error")
+                        .to_string(),
+                );
+                bridge_detail = msg
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .map(|value| value.to_string());
+                if bridge_protocol_version.is_none() {
+                    bridge_protocol_version = msg
+                        .get("protocol_version")
+                        .and_then(|v| v.as_u64())
+                        .map(|value| value as u32);
+                }
                 break;
             }
             _ => {
-                stop_reason = Some("bridge_unknown_message");
+                stop_reason = Some("bridge_unknown_message".to_string());
+                bridge_detail = Some(format!(
+                    "rlm bridge emitted unsupported message type '{msg_type}'"
+                ));
                 break;
             }
         }
@@ -4156,18 +4426,27 @@ pub(super) async fn run_context_loop_rlm(
         crate::metrics::inc_budget_violation();
     }
 
-    let stop_reason = stop_reason.unwrap_or("unknown");
-    crate::metrics::observe_budget_stop_reason(stop_reason);
+    let stop_reason = stop_reason.unwrap_or_else(|| "unknown".to_string());
+    crate::metrics::observe_budget_stop_reason(stop_reason.as_str());
     if response_text.is_none() && terminal_mode == TerminalMode::Supported {
         response_text = render_operator_summaries_response_text(&operator_summaries);
     }
     let stop_is_bridge_failure = matches!(
-        stop_reason,
+        stop_reason.as_str(),
         "bridge_eof"
             | "bridge_read_error"
+            | "bridge_invalid_json"
             | "bridge_invalid_message"
-            | "bridge_operator_not_allowlisted"
+            | "bridge_invalid_tool_request"
             | "bridge_unknown_message"
+            | "bridge_invalid_request"
+            | "bridge_protocol_missing_version"
+            | "bridge_protocol_version_unsupported"
+            | "bridge_script_not_found"
+            | "bridge_spawn_failed"
+            | "bridge_internal"
+            | "bridge_backend_unavailable"
+            | "bridge_backend_runtime_error"
     );
     if !stop_is_bridge_failure
         && !budget_violation
@@ -4179,26 +4458,34 @@ pub(super) async fn run_context_loop_rlm(
         response_text =
             policy_aware_narrowing_guidance(state, ctx, query_trimmed, plan_intent).await;
     }
-
-    let status = if stop_reason == "rlm_done" {
-        tokio::time::timeout(Duration::from_millis(250), child.wait())
-            .await
-            .ok()
-            .and_then(Result::ok)
-    } else {
-        let _ = child.kill().await;
-        let _ = tokio::time::timeout(Duration::from_millis(250), child.wait()).await;
-        None
-    };
-
-    if stop_is_bridge_failure || status.is_some_and(|s| !s.success()) {
-        return Err(json_error(
-            StatusCode::INTERNAL_SERVER_ERROR,
-            "ERR_RLM_BRIDGE_FAILED",
-            format!("rlm bridge failed (reason={})", stop_reason),
+    let planner_summary = rlm_bridge_planner_summary(
+        bridge_protocol_version,
+        bridge_backend.as_deref(),
+        bridge_session_mode.as_deref(),
+        bridge_detail.as_deref(),
+    );
+    if stop_is_bridge_failure {
+        terminal_mode = TerminalMode::SourceUnavailable;
+        if response_text.is_none() {
+            response_text = Some(super::finalize::response_text_for_terminal_mode(
+                TerminalMode::SourceUnavailable,
+            ));
+        }
+        reset_cached_rlm_bridge_process(&mut bridge_process).await;
+    } else if let Some(status) = bridge_process
+        .as_mut()
+        .expect("cached bridge process should exist")
+        .child
+        .try_wait()
+        .ok()
+        .flatten()
+        && !status.success()
+    {
+        terminal_mode = TerminalMode::SourceUnavailable;
+        response_text = Some(super::finalize::response_text_for_terminal_mode(
             TerminalMode::SourceUnavailable,
-            false,
         ));
+        reset_cached_rlm_bridge_process(&mut bridge_process).await;
     }
 
     tracing::info!(
@@ -4219,9 +4506,9 @@ pub(super) async fn run_context_loop_rlm(
         plan_request,
         planner_output_steps,
         "rlm_bridge",
-        stop_reason,
+        stop_reason.as_str(),
         true,
-        None,
+        planner_summary,
     )];
 
     Ok(ContextLoopResult {

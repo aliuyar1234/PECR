@@ -78,6 +78,43 @@ Replay/eval knobs:
 - `PECR_REPLAY_RETENTION_DAYS` (default: `30`; `0` disables cleanup).
 - `PECR_REPLAY_LIST_LIMIT` (default: `200`).
 
+## RLM backend envelope (Phase 0 decision)
+
+The first supported real RLM backend is defined in `docs/architecture/rlm_runtime_envelope.md`.
+
+Operator summary:
+
+- local docker compose remains baseline plus mock by default
+- the first real RLM backend is an opt-in controller-side bridge configuration, not a default local dependency
+- the initial real bridge seam currently supports `PECR_RLM_BACKEND=openai`
+- do not treat `PECR_MODEL_PROVIDER=external` as ready; controller startup still refuses it today
+- the first real backend should be implemented behind the Python RLM bridge, then proven in replay, e2e, finalize, and perf lanes before becoming a default path
+
+Until Phase 1 lands, the honest local story is:
+
+- default local product demo: `baseline` plus mock/runtime fixtures
+- opt-in RLM experimentation: `rlm` engine with explicit sandbox acknowledgement
+- no default compose dependency on external model credentials
+
+Initial opt-in envs for the real bridge seam:
+
+- `PECR_CONTROLLER_ENGINE=rlm`
+- `PECR_RLM_SANDBOX_ACK=1`
+- `PECR_RLM_BACKEND=openai`
+- `PECR_RLM_MODEL_NAME=<model>`
+- `OPENAI_API_KEY=<key>` or `PECR_RLM_API_KEY=<key>`
+- optional `PECR_RLM_BASE_URL=<openai-compatible-endpoint>`
+
+Manual live smoke command for the real bridge seam:
+
+- `python3 -B scripts/rlm/openai_bridge_smoke.py`
+
+Manual GitHub Actions lane:
+
+- `.github/workflows/rlm-real-backend-smoke.yml`
+- configure repo variable `PECR_RLM_OPENAI_MODEL_NAME`
+- configure secret `OPENAI_API_KEY`
+
 ## Replay/Eval developer commands
 
 - List replay metadata:
@@ -210,12 +247,19 @@ RLM bridge/protocol failures (`ERR_RLM_BRIDGE_*`):
   - `python3 scripts/rlm/verify_vendor_rlm.py`
 - Check protocol compatibility:
   - Controller currently supports bridge protocol version range `1..=1`.
-  - Bridge emits `start_ack` with `protocol_version`; mismatches fail closed.
+  - Bridge emits `start_ack` with `protocol_version`, backend, and session mode; mismatches degrade cleanly and stay replay-visible.
+- Check controller bridge runtime behavior:
+  - The controller now reuses a cached persistent bridge worker and respawns it only after protocol/process failure.
 - Inspect controller logs for stop reasons:
-  - `bridge_eof`, `bridge_read_error`, `bridge_invalid_message`, `bridge_unknown_message`, `bridge_operator_not_allowlisted`
+  - `bridge_eof`, `bridge_read_error`, `bridge_invalid_json`, `bridge_invalid_message`, `bridge_unknown_message`, `bridge_invalid_tool_request`, `bridge_protocol_version_unsupported`, `bridge_backend_unavailable`
 - Recovery:
   - Re-sync vendored bridge/runtime: `python3 scripts/rlm/sync_vendor_rlm.py`
   - Rebuild controller with RLM feature and re-run CI: `bash scripts/ci.sh`
+
+Real backend rollout note:
+
+- if the failure occurred on a future real-backend lane, first confirm whether the issue is bridge protocol, backend credentials, backend latency, or finalize downgrade drift
+- do not paper over backend instability by weakening finalize or hiding bridge failures
 
 ## Module ownership and coupling checklist
 

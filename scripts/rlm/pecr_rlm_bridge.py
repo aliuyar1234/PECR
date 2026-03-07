@@ -44,13 +44,13 @@ def ensure_vendor_rlm_on_path() -> None:
 def read_json_line() -> dict[str, Any]:
     line = sys.stdin.readline()
     if line == "":
-        raise SystemExit("stdin closed")
+        raise EOFError("stdin closed")
     try:
         msg = json.loads(line)
     except json.JSONDecodeError as exc:
-        raise SystemExit(f"invalid json from stdin: {exc}") from exc
+        raise ValueError(f"invalid json from stdin: {exc}") from exc
     if not isinstance(msg, dict):
-        raise SystemExit("expected JSON object message")
+        raise ValueError("expected JSON object message")
     return msg
 
 
@@ -133,7 +133,7 @@ class Bridge:
         )
         resp = read_json_line()
         if resp.get("type") != "operator_result" or resp.get("id") != call_id:
-            raise SystemExit(f"protocol error: expected operator_result for id={call_id}")
+            raise ValueError(f"protocol error: expected operator_result for id={call_id}")
         return resp
 
     def call_operator_batch(self, *, depth: int, calls: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -148,10 +148,10 @@ class Bridge:
         )
         resp = read_json_line()
         if resp.get("type") != "operator_batch_result" or resp.get("id") != call_id:
-            raise SystemExit(f"protocol error: expected operator_batch_result for id={call_id}")
+            raise ValueError(f"protocol error: expected operator_batch_result for id={call_id}")
         results = resp.get("results")
         if not isinstance(results, list):
-            raise SystemExit(f"protocol error: expected list results for id={call_id}")
+            raise ValueError(f"protocol error: expected list results for id={call_id}")
         return [r for r in results if isinstance(r, dict)]
 
 
@@ -235,6 +235,243 @@ def planner_steps_for_run(query: str, planner_hints: dict[str, Any] | None) -> l
     return default_mock_plan(query)
 
 
+def normalize_operator_response(resp: dict[str, Any]) -> Any:
+    if not isinstance(resp, dict):
+        return {"error": "invalid_operator_response"}
+    if resp.get("ok") is False:
+        return {
+            "error": {
+                "terminal_mode": resp.get("terminal_mode"),
+                "result": resp.get("result"),
+            }
+        }
+    result = resp.get("result")
+    return result if result is not None else {}
+
+
+def parse_bool_env(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def parse_positive_int_env(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None or not raw.strip():
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
+def build_openai_backend_kwargs() -> dict[str, Any]:
+    model_name = os.getenv("PECR_RLM_MODEL_NAME", "").strip()
+    if not model_name:
+        raise ValueError("PECR_RLM_MODEL_NAME is required when PECR_RLM_BACKEND=openai")
+
+    kwargs: dict[str, Any] = {"model_name": model_name}
+    base_url = os.getenv("PECR_RLM_BASE_URL", "").strip()
+    if base_url:
+        kwargs["base_url"] = base_url
+
+    api_key = os.getenv("PECR_RLM_API_KEY", "").strip() or os.getenv("OPENAI_API_KEY", "").strip()
+    if not api_key:
+        raise ValueError(
+            "OPENAI_API_KEY or PECR_RLM_API_KEY is required when PECR_RLM_BACKEND=openai"
+        )
+    kwargs["api_key"] = api_key
+
+    return kwargs
+
+
+def load_rlm_class():
+    try:
+        from rlm import RLM
+    except Exception as exc:  # pragma: no cover - import error path depends on env
+        raise RuntimeError(f"failed to import vendored RLM runtime: {exc}") from exc
+    return RLM
+
+
+def build_pecr_context(
+    query: str,
+    budget: Budget,
+    planner_hints: dict[str, Any] | None,
+    plan_request: dict[str, Any] | None,
+) -> str:
+    payload = {
+        "query": query,
+        "planner_hints": planner_hints or {},
+        "budget": {
+            "max_operator_calls": budget.max_operator_calls,
+            "max_bytes": budget.max_bytes,
+            "max_wallclock_ms": budget.max_wallclock_ms,
+            "max_recursion_depth": budget.max_recursion_depth,
+            "max_parallelism": budget.max_parallelism,
+        },
+        "available_operator_names": (
+            plan_request.get("available_operator_names", []) if isinstance(plan_request, dict) else []
+        ),
+        "recommended_path": (
+            planner_hints.get("recommended_path", []) if isinstance(planner_hints, dict) else []
+        ),
+        "instructions": [
+            "Use only PECR operator tools to inspect sources.",
+            "Prefer evidence-backed answers over guesses.",
+            "If evidence is insufficient, answer with UNKNOWN: insufficient evidence to answer the query.",
+        ],
+    }
+    return json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def build_custom_tools(
+    bridge: Bridge,
+    *,
+    budget: Budget,
+    query: str,
+    planner_hints: dict[str, Any] | None,
+    plan_request: dict[str, Any] | None,
+) -> tuple[dict[str, Any], dict[str, int]]:
+    tool_state = {"operator_calls_used": 0, "depth_used": 0}
+    available_operator_names = []
+    if isinstance(plan_request, dict):
+        raw_names = plan_request.get("available_operator_names")
+        if isinstance(raw_names, list):
+            available_operator_names = [
+                name.strip() for name in raw_names if isinstance(name, str) and name.strip()
+            ]
+
+    def note_call(call_count: int) -> None:
+        tool_state["operator_calls_used"] += call_count
+        if call_count > 0:
+            tool_state["depth_used"] = max(tool_state["depth_used"], 1)
+
+    def call_operator(op_name: str, **params: Any) -> Any:
+        note_call(1)
+        return normalize_operator_response(
+            bridge.call_operator(depth=0, op_name=op_name, params=params)
+        )
+
+    def call_operator_batch(calls: list[dict[str, Any]]) -> list[Any]:
+        note_call(len(calls))
+        results = bridge.call_operator_batch(depth=0, calls=calls)
+        return [normalize_operator_response(result) for result in results]
+
+    def search_ref_fetch_span(refs: list[dict[str, Any]], max_refs: int = 2) -> list[Any]:
+        calls: list[dict[str, Any]] = []
+        if not isinstance(refs, list):
+            return []
+        for raw_ref in refs[: max(0, int(max_refs))]:
+            if not isinstance(raw_ref, dict):
+                continue
+            object_id = raw_ref.get("object_id")
+            if not isinstance(object_id, str) or not object_id.strip():
+                continue
+            params: dict[str, Any] = {"object_id": object_id}
+            start_byte = raw_ref.get("start_byte")
+            end_byte = raw_ref.get("end_byte")
+            if isinstance(start_byte, int):
+                params["start_byte"] = start_byte
+            if isinstance(end_byte, int):
+                params["end_byte"] = end_byte
+            calls.append({"op_name": "fetch_span", "params": params})
+        if not calls:
+            return []
+        return call_operator_batch(calls)
+
+    custom_tools: dict[str, Any] = {
+        "call_operator": {
+            "tool": call_operator,
+            "description": (
+                "Call a PECR gateway operator by name. Pass keyword arguments that match the operator params. "
+                "Use only names from AVAILABLE_OPERATORS."
+            ),
+        },
+        "call_operator_batch": {
+            "tool": call_operator_batch,
+            "description": (
+                "Call multiple PECR operators concurrently. Pass a list of dicts shaped like "
+                "{'op_name': 'search', 'params': {...}}."
+            ),
+        },
+        "search_ref_fetch_span": {
+            "tool": search_ref_fetch_span,
+            "description": (
+                "Given search refs, fetch the referenced spans through batched fetch_span calls. "
+                "Useful after search returns refs."
+            ),
+        },
+        "AVAILABLE_OPERATORS": {
+            "tool": available_operator_names,
+            "description": "Allowlisted PECR operators available for this run.",
+        },
+        "PECR_QUERY": {
+            "tool": query,
+            "description": "The original user query for this run.",
+        },
+        "PECR_PLANNER_HINTS": {
+            "tool": planner_hints or {},
+            "description": "Controller-provided planner hints and recommended path.",
+        },
+    }
+
+    for op_name in available_operator_names:
+        def op_tool(_op_name: str = op_name, **kwargs: Any) -> Any:
+            return call_operator(_op_name, **kwargs)
+
+        custom_tools[op_name] = {
+            "tool": op_tool,
+            "description": (
+                f"Call the PECR '{op_name}' operator directly. Keyword arguments become the operator params."
+            ),
+        }
+
+    return custom_tools, tool_state
+
+
+def run_openai(
+    bridge: Bridge,
+    query: str,
+    budget: Budget,
+    planner_hints: dict[str, Any] | None = None,
+    plan_request: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    RLM = load_rlm_class()
+    backend_kwargs = build_openai_backend_kwargs()
+    custom_tools, tool_state = build_custom_tools(
+        bridge,
+        budget=budget,
+        query=query,
+        planner_hints=planner_hints,
+        plan_request=plan_request,
+    )
+    context = build_pecr_context(query, budget, planner_hints, plan_request)
+
+    rlm = RLM(
+        backend="openai",
+        backend_kwargs=backend_kwargs,
+        environment="local",
+        max_depth=parse_positive_int_env("PECR_RLM_MAX_DEPTH", 1),
+        max_iterations=parse_positive_int_env("PECR_RLM_MAX_ITERATIONS", 8),
+        max_timeout=budget.max_wallclock_ms / 1000.0 if budget.max_wallclock_ms > 0 else None,
+        verbose=parse_bool_env("PECR_RLM_VERBOSE", False),
+        custom_tools=custom_tools,
+    )
+    completion = rlm.completion(context, root_prompt=query)
+    final_answer = completion.response.strip()
+    if not final_answer:
+        final_answer = "UNKNOWN: insufficient evidence to answer the query."
+
+    return {
+        "final_answer": final_answer,
+        "stop_reason": "rlm_openai_done",
+        "operator_calls_used": tool_state["operator_calls_used"],
+        "depth_used": tool_state["depth_used"],
+    }
+
+
 def run_mock(
     bridge: Bridge,
     query: str,
@@ -312,43 +549,86 @@ def run_mock(
     }
 
 
-def main() -> int:
-    ensure_vendor_rlm_on_path()
+def emit_error(
+    *,
+    protocol_version: int | None,
+    reason: str,
+    code: str,
+    message: str,
+    retryable: bool,
+) -> None:
+    payload: dict[str, Any] = {
+        "type": "error",
+        "reason": reason,
+        "code": code,
+        "message": message,
+        "retryable": retryable,
+    }
+    if protocol_version is not None:
+        payload["protocol_version"] = protocol_version
+    write_json_line(payload)
 
-    start = read_json_line()
+
+def run_backend(
+    backend: str,
+    bridge: Bridge,
+    query: str,
+    budget: Budget,
+    planner_hints: dict[str, Any] | None,
+    plan_request: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if backend == "mock":
+        return run_mock(bridge, query, budget, planner_hints=planner_hints)
+    if backend == "openai":
+        return run_openai(
+            bridge,
+            query,
+            budget,
+            planner_hints=planner_hints,
+            plan_request=plan_request,
+        )
+    raise ValueError("supported PECR_RLM_BACKEND values in this build: mock, openai")
+
+
+def handle_start_message(start: dict[str, Any], backend: str) -> None:
     if start.get("type") != "start":
-        eprint("expected start message")
-        return 2
+        raise ValueError("expected start message")
 
     query = start.get("query")
     if not isinstance(query, str):
-        eprint("start.query must be a string")
-        return 2
+        raise ValueError("start.query must be a string")
 
     budget_raw = start.get("budget")
     if not isinstance(budget_raw, dict):
-        eprint("start.budget must be an object")
-        return 2
+        raise ValueError("start.budget must be an object")
     budget = Budget.from_json(budget_raw)
 
-    try:
-        protocol_version = negotiate_protocol_version(start)
-    except ValueError as exc:
-        eprint(str(exc))
-        return 2
-    write_json_line({"type": "start_ack", "protocol_version": protocol_version})
-
-    backend = os.getenv("PECR_RLM_BACKEND", "mock").strip().lower() or "mock"
-    if backend != "mock":
-        eprint("only PECR_RLM_BACKEND=mock is supported in this build")
-        return 3
+    protocol_version = negotiate_protocol_version(start)
+    write_json_line(
+        {
+            "type": "start_ack",
+            "protocol_version": protocol_version,
+            "backend": backend,
+            "session_mode": "persistent_worker",
+        }
+    )
 
     bridge = Bridge()
     planner_hints = start.get("planner_hints")
     if not isinstance(planner_hints, dict):
         planner_hints = None
+    plan_request = start.get("plan_request")
+    if not isinstance(plan_request, dict):
+        plan_request = None
 
-    result = run_mock(bridge, query, budget, planner_hints=planner_hints)
+    result = run_backend(
+        backend,
+        bridge,
+        query,
+        budget,
+        planner_hints=planner_hints,
+        plan_request=plan_request,
+    )
     write_json_line(
         {
             "type": "done",
@@ -359,7 +639,47 @@ def main() -> int:
             "depth_used": result["depth_used"],
         }
     )
-    return 0
+
+
+def main() -> int:
+    ensure_vendor_rlm_on_path()
+    backend = os.getenv("PECR_RLM_BACKEND", "mock").strip().lower() or "mock"
+
+    while True:
+        try:
+            start = read_json_line()
+        except EOFError:
+            return 0
+        except ValueError as exc:
+            eprint(str(exc))
+            return 2
+
+        try:
+            handle_start_message(start, backend)
+        except ValueError as exc:
+            emit_error(
+                protocol_version=None,
+                reason="bridge_invalid_request",
+                code="ERR_RLM_BRIDGE_PROTOCOL",
+                message=str(exc),
+                retryable=False,
+            )
+        except RuntimeError as exc:
+            emit_error(
+                protocol_version=SUPPORTED_PROTOCOL_VERSION,
+                reason="bridge_backend_unavailable",
+                code="ERR_RLM_BACKEND_UNAVAILABLE",
+                message=str(exc),
+                retryable=True,
+            )
+        except Exception as exc:  # pragma: no cover - depends on runtime/backend availability
+            emit_error(
+                protocol_version=SUPPORTED_PROTOCOL_VERSION,
+                reason="bridge_backend_runtime_error",
+                code="ERR_RLM_BACKEND_RUNTIME",
+                message=f"PECR_RLM_BACKEND={backend} failed: {exc}",
+                retryable=True,
+            )
 
 
 if __name__ == "__main__":

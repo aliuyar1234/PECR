@@ -368,6 +368,36 @@ fn finalize_gate_budget_violation_forces_insufficient_evidence() {
 }
 
 #[test]
+fn finalize_gate_preserves_source_unavailable_when_no_supported_claims_exist() {
+    let session = make_session(
+        &[],
+        0,
+        0,
+        Budget {
+            max_operator_calls: 10,
+            max_bytes: 1024,
+            max_wallclock_ms: 1000,
+            max_recursion_depth: 1,
+            max_parallelism: None,
+        },
+    );
+
+    let claim_map = make_claim_map(
+        vec![pecr_contracts::Claim {
+            claim_id: "not_a_hash".to_string(),
+            claim_text: "required sources were unavailable".to_string(),
+            status: ClaimStatus::Unknown,
+            evidence_unit_ids: Vec::new(),
+            evidence_snippets: Vec::new(),
+        }],
+        TerminalMode::SourceUnavailable,
+    );
+
+    let out = finalize_gate(&session, claim_map, 0.95).expect("gate should succeed");
+    assert_eq!(out.terminal_mode, TerminalMode::SourceUnavailable);
+}
+
+#[test]
 fn field_redaction_parse_allows_and_denies() {
     let allow = parse_field_redaction(Some(&serde_json::json!({
         "allow_fields": ["b", "a", "a"]

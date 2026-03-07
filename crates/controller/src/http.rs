@@ -44,6 +44,8 @@ pub struct AppState {
     rate_limiter: RateLimiter,
     replay_store: ReplayStore,
     replay_persist_queue: ReplayPersistQueue,
+    #[cfg(feature = "rlm")]
+    rlm_bridge_runtime: self::orchestration::RlmBridgeRuntime,
 }
 
 type ApiError = (StatusCode, Json<ErrorResponse>);
@@ -91,6 +93,8 @@ pub async fn router(config: ControllerConfig) -> Result<Router, StartupError> {
         rate_limiter,
         replay_store,
         replay_persist_queue,
+        #[cfg(feature = "rlm")]
+        rlm_bridge_runtime: self::orchestration::RlmBridgeRuntime::default(),
     };
 
     Ok(Router::new()

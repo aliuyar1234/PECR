@@ -39,11 +39,22 @@ chooses whether to use that fallback and still enforces all budgets and operator
 - The Rust controller already emits `plan_request` to the existing RLM bridge.
 - The legacy top-level `query`, `budget`, and `planner_hints` fields remain for backward compatibility.
 - The current bridge may ignore `plan_request`; future shadow planners should prefer it.
+- The bridge protocol is explicitly versioned around JSON message types:
+  - `start`
+  - `start_ack`
+  - `call_operator`
+  - `operator_result`
+  - `call_operator_batch`
+  - `operator_batch_result`
+  - `done`
+  - `error`
+- The controller now preserves bridge `stop_reason`, backend metadata, and failure detail in replay-visible planner summaries.
+- The controller reuses a persistent bridge worker process across requests, rather than spawning a fresh bridge process for every `/v1/run`.
 
 ## Guardrails
 
 - Planner output must stay within controller-enforced budgets.
 - Planner output must use gateway operators only.
 - Planner output must not bypass policy checks, evidence capture, or finalize.
-- Planner failure must degrade to Rust-owned planner behavior, not outage.
+- Planner failure must degrade cleanly into replay-visible terminal modes, not opaque outage-only behavior.
 - Recovery planning may suggest another path, but it must never talk to source systems directly.

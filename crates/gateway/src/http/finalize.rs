@@ -119,6 +119,8 @@ pub(super) fn finalize_gate(
         && claim_map.coverage_observed >= coverage_threshold
     {
         TerminalMode::Supported
+    } else if supported_claims == 0 && claim_map.terminal_mode != TerminalMode::Supported {
+        claim_map.terminal_mode
     } else {
         TerminalMode::InsufficientEvidence
     };

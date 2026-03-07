@@ -6,13 +6,24 @@
 [![Latest Release](https://img.shields.io/github/v/release/aliuyar1234/pecr?display_name=tag&label=release&style=flat-square)](https://github.com/aliuyar1234/PECR/releases/latest)
 [![License](https://img.shields.io/github/license/aliuyar1234/PECR?style=flat-square)](LICENSE)
 
-PECR is a governance runtime for AI context retrieval.
+PECR is an RLM-first governance runtime for AI retrieval and reasoning.
 It keeps orchestration non-privileged, enforces policy at every data access boundary, and returns deterministic outcomes with auditable evidence.
+
+## Product Direction
+
+PECR is moving toward one clear product shape:
+
+- RLM should be the primary reasoning and planning runtime.
+- the controller and gateway should remain the trust, policy, evidence, and finalize boundary.
+- baseline and other planner paths should exist only as migration, shadow, evaluation, or fallback tools until the RLM-first rollout is complete.
+
+The working migration plan for that direction lives in `RLM_FIRST_MIGRATION_PLAN.md`.
+The first supported real backend shape for that migration is defined in `docs/architecture/rlm_runtime_envelope.md`.
 
 ## What PECR Solves
 
-Plain RAG pipelines usually leave hard governance gaps around policy, provenance, and deterministic failure handling.
-PECR adds those missing controls by design:
+Plain RAG pipelines and agentic retrieval loops usually leave hard governance gaps around policy, provenance, and deterministic failure handling.
+PECR adds those missing controls while aiming for more capable RLM-style planning and long-context synthesis:
 
 - Policy-first execution through OPA decisions.
 - Immutable, hash-stable EvidenceUnits with provenance metadata.
@@ -22,7 +33,8 @@ PECR adds those missing controls by design:
 
 ## High-Level Architecture
 
-PECR is an AI runtime with two orchestration paths (baseline and RLM), wrapped by a policy/evidence governance plane.
+PECR is an RLM-first AI runtime wrapped by a policy/evidence governance plane.
+Today the repo still contains baseline and BEAM-era paths for reference, shadow evaluation, and migration safety, but the intended product shape is one primary RLM reasoning path over one governance plane.
 
 ```mermaid
 flowchart LR
@@ -30,7 +42,7 @@ flowchart LR
 
     subgraph AIPlane["AI Execution Plane - Non Privileged"]
       Controller["PECR Controller API"]
-      Baseline["Baseline Planner Loop"]
+      Baseline["Baseline Shadow / Reference Loop"]
       RLM["RLM Planner Bridge (vendored upstream rlm)"]
       Scheduler["Budget Scheduler + Batch Executor"]
       Replay["Replay Store + Evaluation APIs"]
@@ -57,10 +69,10 @@ flowchart LR
     end
 
     Client -->|POST /v1/run| Controller
-    Controller --> Baseline
-    Controller --> RLM
+    Controller -->|shadow/reference during migration| Baseline
+    Controller -->|primary reasoning direction| RLM
     Baseline --> Scheduler
-    RLM -->|call_operator_batch plan| Scheduler
+    RLM -->|plan, replan, batch, recover| Scheduler
 
     Scheduler -->|typed operator calls| Gateway
     Gateway -->|authz decisions| OPA
@@ -83,14 +95,17 @@ flowchart LR
 ```
 
 Controller remains non-privileged: it never reads systems of record directly and only uses typed, policy-enforced gateway operations.
+RLM is meant to own reasoning behavior, not privileged access.
 
 ## Request Lifecycle
 
 1. Client starts a request (or full `/v1/run`) with principal identity.
-2. Controller executes a budgeted loop and calls only allowlisted gateway operators.
+2. Controller executes a budgeted RLM-driven loop and calls only allowlisted gateway operators.
 3. Gateway enforces policy, applies redaction, and emits evidence.
 4. Controller submits response text plus claim map to finalize.
 5. Gateway validates claim-to-evidence coverage and returns terminal mode.
+
+During migration, a baseline/reference path may still run for shadowing or fallback, but it is not the intended long-term product center.
 
 ## API Surface (v1)
 
@@ -189,12 +204,12 @@ SUITE7_SKIP_FAULTS=1 bash scripts/perf/suite7.sh
 
 Outputs: `target/perf/`
 
-## Baseline vs RLM Execution Paths
+## Execution Modes (Transition State)
 
 | Path | Engine | Enablement | Typical use |
 |---|---|---|---|
-| Baseline | `baseline` | Default (`PECR_CONTROLLER_ENGINE` unset or `baseline`) | Deterministic default production path |
-| RLM | `rlm` | `PECR_CONTROLLER_ENGINE=rlm` and `PECR_RLM_SANDBOX_ACK=1` (controller built with `--features rlm`) | Higher-capability planning with adaptive/batch controls |
+| Baseline | `baseline` | Current default when `PECR_CONTROLLER_ENGINE` is unset or `baseline` | Reference, shadow, migration safety, and fallback lane while RLM-first rollout completes |
+| RLM | `rlm` | `PECR_CONTROLLER_ENGINE=rlm` and `PECR_RLM_SANDBOX_ACK=1` (controller built with `--features rlm`) | Primary target product path with adaptive planning, batching, and recovery behavior |
 
 Perf harness commands:
 
@@ -262,9 +277,13 @@ PECR returns `response_text` as the main user-facing answer, then uses `response
 
 For concrete payload examples, see `docs/client_integration.md` and the `/v1/run` examples in `docs/openapi/pecr.v1.yaml`.
 
-## RLM Engine (Optional, Experimental)
+## RLM Runtime Direction
 
-PECR includes an optional RLM-style controller engine behind explicit runtime guards.
+PECR is moving toward an RLM-first controller path.
+Today the RLM runtime remains behind explicit runtime guards while the migration in `RLM_FIRST_MIGRATION_PLAN.md` completes.
+
+The first supported real backend envelope is documented in `docs/architecture/rlm_runtime_envelope.md`.
+Important current truth: the controller still rejects `PECR_MODEL_PROVIDER=external`, so the real RLM backend must land through the bridge/runtime path first rather than through the current Rust model-provider switch. The bridge now supports an initial opt-in `openai` backend seam, but it is not yet the default runtime.
 
 Enable RLM mode:
 
@@ -274,10 +293,36 @@ Enable RLM mode:
   - `PECR_RLM_SANDBOX_ACK=1`
 
 Useful knobs:
+- `PECR_RLM_BACKEND` (`mock` or `openai`)
+- `PECR_RLM_MODEL_NAME`
+- `PECR_RLM_API_KEY` or standard `OPENAI_API_KEY`
+- `PECR_RLM_BASE_URL`
 - `PECR_CONTROLLER_ADAPTIVE_PARALLELISM_ENABLED`
 - `PECR_CONTROLLER_BATCH_MODE_ENABLED`
 - `PECR_OPERATOR_CONCURRENCY_POLICIES`
 - `PECR_RLM_SCRIPT_PATH`
+- the controller now keeps a persistent bridge worker alive across requests and records bridge backend/stop-reason detail in replay-visible planner traces
+
+Current transition note:
+
+- `baseline` still exists as the current default and as a reference/shadow lane.
+- `rlm` is the intended primary runtime once the rollout gates in `RLM_FIRST_MIGRATION_PLAN.md` are met.
+- the bridge-backed real backend seam currently starts with `PECR_RLM_BACKEND=openai` plus `PECR_RLM_MODEL_NAME` and `OPENAI_API_KEY` or `PECR_RLM_API_KEY`.
+- the governance model does not change: gateway policy, evidence capture, and finalize remain authoritative for every engine path.
+
+Manual live smoke for the real bridge seam:
+
+```bash
+PECR_RLM_BACKEND=openai \
+PECR_RLM_MODEL_NAME=<model> \
+OPENAI_API_KEY=<key> \
+python3 -B scripts/rlm/openai_bridge_smoke.py
+```
+
+Manual Actions lane:
+- `.github/workflows/rlm-real-backend-smoke.yml`
+- configure repo variable `PECR_RLM_OPENAI_MODEL_NAME`
+- configure secret `OPENAI_API_KEY`
 
 Vendored upstream sync:
 
@@ -303,6 +348,10 @@ Controller minimum:
 - `PECR_GATEWAY_URL`
 - `PECR_MODEL_PROVIDER` (`mock` for local)
 - `PECR_BUDGET_DEFAULTS` (JSON)
+
+RLM migration note:
+- keep `PECR_MODEL_PROVIDER=mock` as the honest default until the real bridge-backed RLM backend is implemented
+- use `docs/architecture/rlm_runtime_envelope.md` as the source of truth for the first real backend shape
 
 Auth modes:
 - `PECR_AUTH_MODE=local` (default)
@@ -348,6 +397,7 @@ Operational runbook: `RUNBOOK.md`
 - `opa/bundle`: OPA policy bundle
 - `scripts`: CI, replay/eval, perf/fault, and security tooling
 - `vendor/rlm`: vendored upstream RLM integration source
+- `RLM_FIRST_MIGRATION_PLAN.md`: phased roadmap to make PECR RLM-first
 
 ## Development
 
@@ -366,6 +416,8 @@ pwsh -File scripts/verify.ps1
   - `docs/architecture/controller_state_machine.md`
   - `docs/architecture/request_path_blocking_audit.md`
   - `docs/architecture/invariants.md`
+  - `docs/architecture/rlm_runtime_envelope.md`
+  - `RLM_FIRST_MIGRATION_PLAN.md`
 - Runbook:
   - `RUNBOOK.md`
   - `docs/observability/baselines.md`

@@ -1,3 +1,5 @@
+#![allow(clippy::await_holding_lock)]
+
 use super::*;
 
 use axum::extract::{Path, Query, State};
@@ -1514,9 +1516,14 @@ async fn spawn_run_gateway() -> (SocketAddr, oneshot::Sender<()>, tokio::task::J
             covered_supported_claims as f64 / supported_claims as f64
         };
         let terminal_mode = if supported_claims > 0 && coverage_observed >= 0.95 {
-            "SUPPORTED"
+            "SUPPORTED".to_string()
         } else {
-            "INSUFFICIENT_EVIDENCE"
+            claim_map
+                .get("terminal_mode")
+                .and_then(|value| value.as_str())
+                .filter(|value| *value != "SUPPORTED")
+                .unwrap_or("INSUFFICIENT_EVIDENCE")
+                .to_string()
         };
         if let Some(obj) = claim_map.as_object_mut() {
             obj.insert("coverage_threshold".to_string(), serde_json::json!(0.95));
@@ -1810,6 +1817,8 @@ fn controller_state(
         rate_limiter: RateLimiter::new(Duration::from_secs(60), 1024),
         replay_store,
         replay_persist_queue,
+        #[cfg(feature = "rlm")]
+        rlm_bridge_runtime: crate::http::orchestration::RlmBridgeRuntime::default(),
     }
 }
 
@@ -2443,6 +2452,133 @@ sys.stdout.flush()
             .claims
             .iter()
             .all(|claim| claim.status != ClaimStatus::Supported)
+    );
+}
+
+#[cfg(feature = "rlm")]
+#[tokio::test]
+async fn run_persists_replay_when_rlm_bridge_degrades_to_source_unavailable() {
+    let _env_lock = RLM_SCRIPT_ENV_LOCK
+        .lock()
+        .expect("rlm script env lock should not be poisoned");
+    let script_path = write_temp_bridge_script(
+        r#"#!/usr/bin/env python3
+import json
+import sys
+
+while True:
+    line = sys.stdin.readline()
+    if line == "":
+        break
+    start = json.loads(line)
+    if start.get("type") != "start":
+        raise SystemExit("expected start")
+
+    sys.stdout.write(json.dumps({
+        "type": "start_ack",
+        "protocol_version": 1,
+        "backend": "test",
+        "session_mode": "persistent_worker"
+    }) + "\n")
+    sys.stdout.flush()
+    sys.stdout.write(json.dumps({
+        "type": "error",
+        "protocol_version": 1,
+        "reason": "bridge_backend_unavailable",
+        "message": "simulated backend outage",
+        "retryable": True
+    }) + "\n")
+    sys.stdout.flush()
+"#,
+    );
+
+    let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+    // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+    unsafe {
+        std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+    }
+
+    let budget = Budget {
+        max_operator_calls: 10,
+        max_bytes: 1024 * 1024,
+        max_wallclock_ms: 10_000,
+        max_recursion_depth: 10,
+        max_parallelism: Some(2),
+    };
+    let (gateway_addr, shutdown, task) = spawn_run_gateway().await;
+    let mut state = controller_state(
+        gateway_addr,
+        budget.clone(),
+        crate::config::default_baseline_plan(),
+    );
+    state.config.controller_engine = crate::config::ControllerEngine::Rlm;
+    let persisted_state = state.clone();
+
+    let mut headers = HeaderMap::new();
+    headers.insert("x-pecr-principal-id", HeaderValue::from_static("dev"));
+    headers.insert(
+        "x-pecr-request-id",
+        HeaderValue::from_static("req-rlm-bridge-failure"),
+    );
+    headers.insert(
+        "x-pecr-trace-id",
+        HeaderValue::from_static("trace-rlm-bridge-failure"),
+    );
+
+    let response = run(
+        State(state),
+        headers,
+        Json(RunRequest {
+            query: "What is the customer status and plan tier?".to_string(),
+            budget: Some(budget),
+        }),
+    )
+    .await
+    .expect("run should degrade cleanly");
+
+    let principal_hash = hash_principal_id("dev");
+    let replays = wait_for_replays(&persisted_state, &principal_hash, 1).await;
+    let replay = persisted_state
+        .replay_store
+        .load_replay(&principal_hash, &replays[0].run_id)
+        .expect("replay load should succeed")
+        .expect("replay bundle should exist");
+
+    shutdown.send(()).ok();
+    let _ = task.await;
+    if let Some(previous) = previous_script_path {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+        }
+    } else {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+        }
+    }
+    let _ = fs::remove_file(&script_path);
+
+    assert_eq!(response.0.terminal_mode, TerminalMode::SourceUnavailable);
+    assert_eq!(
+        response.0.response_text,
+        "UNKNOWN: required sources were unavailable within budget."
+    );
+    assert_eq!(replay.loop_terminal_mode, TerminalMode::SourceUnavailable);
+    assert!(
+        replay.planner_traces.iter().any(|trace| {
+            trace.decision_summary.planner_source == "rlm_bridge"
+                && trace.decision_summary.stop_reason == "bridge_backend_unavailable"
+                && trace
+                    .decision_summary
+                    .planner_summary
+                    .as_deref()
+                    .is_some_and(|summary| {
+                        summary.contains("backend=test")
+                            && summary.contains("simulated backend outage")
+                    })
+        }),
+        "bridge failure should stay replay-visible with structured detail"
     );
 }
 
@@ -4803,7 +4939,123 @@ sys.stdout.flush()
 
 #[cfg(feature = "rlm")]
 #[tokio::test]
-async fn rlm_loop_rejects_unsupported_bridge_protocol_version() {
+async fn rlm_loop_reuses_a_persistent_bridge_process_across_requests() {
+    let _env_lock = RLM_SCRIPT_ENV_LOCK
+        .lock()
+        .expect("rlm script env lock should not be poisoned");
+    let counter_path =
+        std::env::temp_dir().join(format!("pecr-rlm-bridge-starts-{}.txt", Ulid::new()));
+    let script_path = write_temp_bridge_script(&format!(
+        r#"#!/usr/bin/env python3
+import json
+import pathlib
+import sys
+
+counter_path = pathlib.Path(r"{counter_path}")
+count = 0
+if counter_path.exists():
+    count = int(counter_path.read_text(encoding="utf-8").strip() or "0")
+counter_path.write_text(str(count + 1), encoding="utf-8")
+
+while True:
+    line = sys.stdin.readline()
+    if line == "":
+        break
+    json.loads(line)
+    sys.stdout.write(json.dumps({{"type": "start_ack", "protocol_version": 1, "backend": "test", "session_mode": "persistent_worker"}}) + "\n")
+    sys.stdout.flush()
+    sys.stdout.write(json.dumps({{"type": "done", "final_answer": "UNKNOWN: persistent bridge", "stop_reason": "persistent_bridge_done"}}) + "\n")
+    sys.stdout.flush()
+"#,
+        counter_path = counter_path.display()
+    ));
+
+    let previous_script_path = std::env::var("PECR_RLM_SCRIPT_PATH").ok();
+    // Safety: this test scopes env var mutation to setup/teardown in the same thread.
+    unsafe {
+        std::env::set_var("PECR_RLM_SCRIPT_PATH", script_path.display().to_string());
+    }
+
+    let counter = Arc::new(AtomicUsize::new(0));
+    let (gateway_addr, shutdown, task) = spawn_mock_gateway(counter.clone()).await;
+    let budget = Budget {
+        max_operator_calls: 10,
+        max_bytes: 1024 * 1024,
+        max_wallclock_ms: 10_000,
+        max_recursion_depth: 10,
+        max_parallelism: Some(2),
+    };
+    let state = controller_state(
+        gateway_addr,
+        budget.clone(),
+        crate::config::default_baseline_plan(),
+    );
+
+    let result_one = run_context_loop_rlm(
+        &state,
+        GatewayCallContext {
+            principal_id: "dev",
+            authz_header: None,
+            local_auth_shared_secret: None,
+            request_id: "req_test_rlm_persistent_one",
+            trace_id: "trace_test_rlm_persistent_one",
+            session_token: "token",
+            session_id: "session",
+        },
+        "query one",
+        &budget,
+    )
+    .await
+    .expect("first request should succeed");
+    let result_two = run_context_loop_rlm(
+        &state,
+        GatewayCallContext {
+            principal_id: "dev",
+            authz_header: None,
+            local_auth_shared_secret: None,
+            request_id: "req_test_rlm_persistent_two",
+            trace_id: "trace_test_rlm_persistent_two",
+            session_token: "token",
+            session_id: "session",
+        },
+        "query two",
+        &budget,
+    )
+    .await
+    .expect("second request should reuse the same bridge process");
+
+    shutdown.send(()).ok();
+    let _ = task.await;
+    if let Some(previous) = previous_script_path {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::set_var("PECR_RLM_SCRIPT_PATH", previous);
+        }
+    } else {
+        // Safety: restoring the test-local env var mutation.
+        unsafe {
+            std::env::remove_var("PECR_RLM_SCRIPT_PATH");
+        }
+    }
+    let _ = fs::remove_file(&script_path);
+    let start_count = fs::read_to_string(&counter_path).expect("counter file should exist");
+    let _ = fs::remove_file(&counter_path);
+
+    assert_eq!(start_count.trim(), "1");
+    assert_eq!(
+        result_one.planner_traces[0].decision_summary.stop_reason,
+        "persistent_bridge_done"
+    );
+    assert_eq!(
+        result_two.planner_traces[0].decision_summary.stop_reason,
+        "persistent_bridge_done"
+    );
+    assert_eq!(counter.load(Ordering::Relaxed), 0);
+}
+
+#[cfg(feature = "rlm")]
+#[tokio::test]
+async fn rlm_loop_degrades_cleanly_for_unsupported_bridge_protocol_version() {
     let _env_lock = RLM_SCRIPT_ENV_LOCK
         .lock()
         .expect("rlm script env lock should not be poisoned");
@@ -4866,9 +5118,24 @@ sys.stdout.flush()
     }
     let _ = fs::remove_file(&script_path);
 
-    let err = result.expect_err("unsupported bridge protocol must fail");
-    assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
-    assert_eq!(err.1.0.code, "ERR_RLM_BRIDGE_PROTOCOL");
+    let result = result.expect("unsupported bridge protocol should degrade cleanly");
+    assert_eq!(result.terminal_mode, TerminalMode::SourceUnavailable);
+    assert_eq!(
+        result.response_text.as_deref(),
+        Some("UNKNOWN: required sources were unavailable within budget.")
+    );
+    assert!(
+        result.planner_traces.iter().any(|trace| {
+            trace.decision_summary.planner_source == "rlm_bridge"
+                && trace.decision_summary.stop_reason == "bridge_protocol_version_unsupported"
+                && trace
+                    .decision_summary
+                    .planner_summary
+                    .as_deref()
+                    .is_some_and(|summary| summary.contains("protocol_version=99"))
+        }),
+        "protocol drift should remain replay-visible"
+    );
 }
 
 #[test]

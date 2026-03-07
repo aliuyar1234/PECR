@@ -1,5 +1,14 @@
 # Repository Guidelines
 
+## Product Direction
+PECR is moving to an RLM-first product shape. Use `RLM_FIRST_MIGRATION_PLAN.md`, `PRODUCT_PRINCIPLES.md`, and `docs/architecture/rlm_runtime_envelope.md` as the source of truth for that direction.
+
+- Prefer work that strengthens the `rlm` path as the primary reasoning runtime.
+- Treat `baseline` and `beam_planner` as transition, shadow, evaluation, or fallback tools unless a task explicitly says otherwise.
+- Preserve the controller/gateway trust boundary, gateway policy enforcement, evidence emission, finalize semantics, and replay guarantees while making RLM more central.
+- Be willing to delete dead code, duplicate heuristics, stale env flags, and misleading product-facing surfaces when they no longer support the RLM-first migration.
+- Do not present baseline, BEAM, and RLM as equal long-term product bets in new docs or new code paths unless the repository direction changes intentionally.
+
 ## Project Structure & Module Organization
 `crates/` is the Cargo workspace and holds the main Rust services and libraries: `pecr-controller`, `pecr-gateway`, `pecr-policy`, `pecr-ledger`, `pecr-auth`, `pecr-adapters`, `pecr-boundary-check`, `pecr-contracts`, and `e2e_smoke`. Keep production code in each crate's `src/`; place integration tests in crate-local `tests/`. Use `db/init/` for SQL bootstrap files, `opa/` for policy assets, `docker/` plus `docker-compose.yml` for local runtime wiring, `scripts/` for CI/perf/replay/security automation, `perf/` for baselines and expectations, and `fixtures/` for deterministic test data. Treat `vendor/` as synced upstream code, not a casual edit target.
 
