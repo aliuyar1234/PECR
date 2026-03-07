@@ -1120,10 +1120,7 @@ fn best_fs_search_match(
             };
 
             match &best_match {
-                Some(current)
-                    if current.score > search_match.score
-                        || (current.score == search_match.score
-                            && current.start_byte <= search_match.start_byte) => {}
+                Some(current) if !should_replace_best_fs_search_match(current, &search_match) => {}
                 _ => best_match = Some(search_match),
             }
         }
@@ -1157,6 +1154,20 @@ fn best_fs_search_match(
     }
 
     best_match
+}
+
+fn should_replace_best_fs_search_match(current: &FsSearchMatch, candidate: &FsSearchMatch) -> bool {
+    if candidate.score != current.score {
+        return candidate.score > current.score;
+    }
+
+    let current_len = current.end_byte.saturating_sub(current.start_byte);
+    let candidate_len = candidate.end_byte.saturating_sub(candidate.start_byte);
+    if candidate_len != current_len {
+        return candidate_len > current_len;
+    }
+
+    candidate.start_byte < current.start_byte
 }
 
 fn abbreviate_search_preview(text: &str, max_chars: usize) -> String {
@@ -3129,6 +3140,26 @@ mod tests {
         assert!(refs[0].match_score.unwrap_or_default() > 0);
 
         let _ = tokio::fs::remove_dir_all(temp_dir).await;
+    }
+
+    #[test]
+    fn best_fs_search_match_prefers_more_informative_line_on_score_tie() {
+        let request = parse_fs_search_request(&serde_json::json!({
+            "query": "support policy",
+            "match_mode": "all"
+        }))
+        .expect("search request should parse");
+
+        let text = "Support policy for the PECR demo environment.\n\nSupport policy: the support team may inspect public documentation and approved safe-view records during business hours.\n";
+        let search_match = best_fs_search_match(text, "public/support_policy.txt", &request)
+            .expect("support policy fixture should match");
+
+        assert_eq!(search_match.line_start, 3);
+        assert!(
+            search_match.preview.contains("approved safe-view records"),
+            "expected informative preview, got {:?}",
+            search_match.preview
+        );
     }
 
     #[test]
