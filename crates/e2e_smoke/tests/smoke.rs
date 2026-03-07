@@ -3432,13 +3432,7 @@ async fn useful_beam_planner_real_stack_falls_back_cleanly_when_planner_is_unava
         evaluation_body
     );
 
-    let replay_dir = stack.replay_store_dir.join("replays");
-    let replay_path = std::fs::read_dir(&replay_dir)
-        .expect("replay directory should exist")
-        .filter_map(Result::ok)
-        .map(|entry| entry.path())
-        .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
-        .expect("replay bundle should be persisted");
+    let replay_path = wait_for_replay_bundle_path(&stack.replay_store_dir).await;
     let replay_bundle = serde_json::from_str::<serde_json::Value>(
         &std::fs::read_to_string(&replay_path).expect("replay bundle should be readable"),
     )
@@ -3994,6 +3988,27 @@ async fn wait_for_replay_list_contains_traces(
     panic!(
         "replay list did not contain trace ids {:?} at {}",
         trace_ids, url
+    );
+}
+
+async fn wait_for_replay_bundle_path(replay_store_dir: &Path) -> PathBuf {
+    let replay_dir = replay_store_dir.join("replays");
+
+    for _ in 0..50 {
+        if let Ok(entries) = std::fs::read_dir(&replay_dir)
+            && let Some(path) = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .find(|path| path.extension().and_then(|value| value.to_str()) == Some("json"))
+        {
+            return path;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+
+    panic!(
+        "replay bundle was not persisted under {}",
+        replay_dir.display()
     );
 }
 
